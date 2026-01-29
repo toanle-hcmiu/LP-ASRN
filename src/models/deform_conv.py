@@ -117,6 +117,9 @@ class DeformableConv2d(nn.Module):
         """
         Apply deformable convolution using grid sampling.
 
+        Uses per-kernel-position sampling with cuDNN-safe grid shapes (B, H_out, W_out, 2)
+        instead of the problematic massive-width pattern.
+
         Args:
             x: Input tensor (B, C, H, W)
             offset: Offset tensor (B, 2*k*k, H', W')
@@ -174,56 +177,68 @@ class DeformableConv2d(nn.Module):
         sample_y = 2.0 * sample_y / (H - 1) - 1.0
         sample_x = 2.0 * sample_x / (W - 1) - 1.0
 
-        # Stack for grid_sample: (B, H', W', k*k, 2)
-        sample_coords = torch.stack([sample_x, sample_y], dim=-1)
-        sample_coords = sample_coords.permute(0, 2, 3, 1, 4)  # (B, H', W', k*k, 2)
-        sample_coords = sample_coords.reshape(B, H_out * W_out * kernel_size * kernel_size, 2).contiguous()
+        # === NEW: Per-kernel-position sampling with cuDNN-safe grid shapes ===
+        # Instead of flattening all sample points into width (causing cuDNN crash),
+        # loop over kernel positions and use standard (B, H_out, W_out, 2) grid shapes.
 
-        # Expand input for vectorized sampling
-        # We need to sample each location for each channel
-        # Use repeat() instead of expand() to ensure contiguous memory
-        x_expanded = x.unsqueeze(1).repeat(
-            1, out_channels // self.groups, 1, 1, 1
-        )  # (B, out_C/g, C, H, W)
-        x_expanded = x_expanded.reshape(
-            B * out_channels // self.groups * C_in, H, W
-        ).contiguous()  # (B*out_C/g*C, H, W)
+        kernel_positions = kernel_size * kernel_size
+        sampled_list = []
 
-        # Resample for each output channel group
-        sample_coords_expanded = sample_coords.unsqueeze(1).repeat(
-            1, C_in * out_channels // self.groups, 1, 1
-        )  # (B, C*out_C/g, H'*W'*k*k, 2)
-        sample_coords_expanded = sample_coords_expanded.reshape(
-            B * out_channels // self.groups * C_in, H_out * W_out * kernel_size * kernel_size, 2
-        ).contiguous()
+        # Ensure input is float32 for stable grid_sample under AMP
+        x_float = x.float() if x.dtype != torch.float32 else x
 
-        # Sample from input
-        sampled = F.grid_sample(
-            x_expanded.unsqueeze(1).contiguous(),  # (B*C*out_C/g, 1, H, W)
-            sample_coords_expanded.unsqueeze(1).contiguous(),  # (B*C*out_C/g, 1, H'*W'*k*k, 2)
-            mode="bilinear",
-            padding_mode="zeros",
-            align_corners=True,
-        ).squeeze(1)  # (B*C*out_C/g, H'*W'*k*k)
+        for t in range(kernel_positions):
+            # Build grid_t with shape (B, H_out, W_out, 2) for this kernel position
+            # This is the cuDNN-safe grid pattern
+            grid_t = torch.stack([sample_x[:, t], sample_y[:, t]], dim=-1)  # (B, H', W', 2)
+            grid_t = grid_t.to(torch.float32)  # Ensure float32 for stability
 
-        # Reshape and apply weights
-        sampled = sampled.reshape(
-            B, out_channels // self.groups, C_in, H_out, W_out, kernel_size * kernel_size
-        )  # (B, out_C/g, C, H', W', k*k)
+            # Sample with AMP-safe dtype handling
+            # Use autocast(enabled=False) to prevent dtype issues under AMP
+            with torch.amp.autocast("cuda", enabled=False):
+                sampled_t = F.grid_sample(
+                    x_float,  # (B, C_in, H, W)
+                    grid_t,   # (B, H', W', 2)
+                    mode="bilinear",
+                    padding_mode="zeros",
+                    align_corners=True,
+                )  # (B, C_in, H', W')
 
-        # Transpose to combine with weight: (B, out_C/g, H', W', k*k, C)
-        sampled = sampled.permute(0, 1, 3, 4, 5, 2)
+            sampled_list.append(sampled_t)
 
-        # Reshape weight for multiplication: (out_C, in_C/g, k*k)
-        # Transpose to (out_C, k*k, in_C/g) for proper einsum alignment
-        weight_flat = weight.view(out_channels, C_in // self.groups, kernel_size * kernel_size).permute(0, 2, 1)
+        # Stack over kernel positions: (B, C_in, H_out, W_out, k*k)
+        sampled = torch.stack(sampled_list, dim=-1)
 
-        # Compute weighted sum
-        # sampled: (B, out_C/g, H', W', k*k, C_in)
-        # weight_flat: (out_C, k*k, C_in/g)
-        # For groups=1, we reshape weight to match
-        weight_for_einsum = weight_flat.reshape(out_channels // self.groups, self.groups, kernel_size * kernel_size, C_in // self.groups)
-        output = torch.einsum("bgxykc,gokc->bgoxy", sampled, weight_for_einsum)  # (B, out_C/g, H', W')
+        # Compute output via batched matrix multiplication
+        # sampled: (B, C_in, H_out, W_out, k*k)
+        # weight: (out_C, C_in/groups, k, k) -> reshape to (out_C, C_in/groups, k*k)
+
+        # Reshape weight: (out_C, C_in/g, k*k)
+        weight_flat = weight.view(out_channels, C_in // self.groups, kernel_positions)
+
+        # Reshape sampled to (B, C_in, K, H_out*W_out) for efficient computation
+        B2, C_in2, H_out2, W_out2, K2 = sampled.shape
+        sampled_flat = sampled.permute(0, 1, 4, 2, 3).reshape(B2, C_in2, K2, H_out2 * W_out2)
+
+        # Split into groups and compute
+        output_chunks = []
+        C_in_per_group = C_in // self.groups
+        out_channels_per_group = out_channels // self.groups
+
+        for g in range(self.groups):
+            # Get sampled features for this group: (B, C_in/g, K, H*W)
+            sampled_g = sampled_flat[:, g * C_in_per_group:(g + 1) * C_in_per_group, :, :]
+
+            # Get weights for this group: (out_C/g, C_in/g, K)
+            weight_g = weight_flat[g * out_channels_per_group:(g + 1) * out_channels_per_group, :, :]
+
+            # Compute: output[oc, b, hw] = sum_{cin, k} sampled[b, cin, k, hw] * weight[oc, cin, k]
+            output_g = torch.einsum("bckh,ock->obh", sampled_g, weight_g)
+            output_g = output_g.permute(1, 0, 2)  # (B, out_C/g, H*W)
+            output_chunks.append(output_g)
+
+        # Concatenate groups: (B, out_C, H*W)
+        output = torch.cat(output_chunks, dim=1)
         output = output.reshape(B, out_channels, H_out, W_out)
 
         # Add bias if needed
@@ -379,84 +394,93 @@ class ModulatedDeformableConv2d(nn.Module):
         weight: torch.Tensor,
         bias: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        """Basic deformable convolution (same as DeformableConv2d)."""
-        # Simplified implementation using regular conv with modified padding
-        # For full functionality, use DeformableConv2d class above
+        """
+        Basic deformable convolution using cuDNN-safe per-kernel-position sampling.
+
+        This mirrors the fixed DeformableConv2d implementation, avoiding the
+        massive-width grid pattern that causes cuDNN crashes.
+        """
         B, C_in, H, W = x.shape
         kernel_size = self.kernel_size
 
         H_out = (H + 2 * self.padding - self.dilation * (kernel_size - 1) - 1) // self.stride + 1
         W_out = (W + 2 * self.padding - self.dilation * (kernel_size - 1) - 1) // self.stride + 1
 
-        # Reshape offset
+        # Reshape offset: (B, 2*k*k, H', W') -> (B, k*k, 2, H', W')
         offset = offset.view(B, 2, kernel_size * kernel_size, H_out, W_out)
         offset_y, offset_x = offset[:, 0], offset[:, 1]
 
         # Create base grid
-        base_y = torch.arange(H_out, device=x.device).float()
-        base_x = torch.arange(W_out, device=x.device).float()
+        base_y = torch.arange(H_out, dtype=torch.float32, device=x.device)
+        base_x = torch.arange(W_out, dtype=torch.float32, device=x.device)
         base_y, base_x = torch.meshgrid(base_y, base_x, indexing="ij")
 
         # Scale to input coordinates
         base_y = base_y * self.stride - self.padding + (kernel_size // 2) * self.dilation
         base_x = base_x * self.stride - self.padding + (kernel_size // 2) * self.dilation
 
-        # Add offsets and reshape for grid_sample
-        sample_y = base_y.unsqueeze(0).unsqueeze(0) + offset_y  # (B, k*k, H', W')
-        sample_x = base_x.unsqueeze(0).unsqueeze(0) + offset_x
+        # Create kernel offsets
+        kernel_offsets = torch.arange(
+            -(kernel_size // 2), kernel_size // 2 + 1, dtype=torch.float32, device=x.device
+        )
+        kernel_y, kernel_x = torch.meshgrid(kernel_offsets, kernel_offsets, indexing="ij")
+        kernel_y = kernel_y.reshape(-1)
+        kernel_x = kernel_x.reshape(-1)
 
+        # Add offsets to get sampling coordinates
+        sample_y = base_y.unsqueeze(0).unsqueeze(0) + kernel_y.view(1, -1, 1, 1) + offset_y  # (B, k*k, H', W')
+        sample_x = base_x.unsqueeze(0).unsqueeze(0) + kernel_x.view(1, -1, 1, 1) + offset_x
+
+        # Normalize to [-1, 1] for grid_sample
         sample_y = 2.0 * sample_y / (H - 1) - 1.0
         sample_x = 2.0 * sample_x / (W - 1) - 1.0
 
-        # Stack: (B, k*k, H', W', 2)
-        grid = torch.stack([sample_x, sample_y], dim=-1)
+        # === NEW: Per-kernel-position sampling with cuDNN-safe grid shapes ===
+        kernel_positions = kernel_size * kernel_size
+        sampled_list = []
 
-        # Reshape for vectorized sampling
-        grid = grid.permute(0, 3, 4, 1, 2).reshape(
-            B, H_out * W_out * kernel_size * kernel_size, 2
-        ).contiguous()
+        # Ensure input is float32 for stable grid_sample under AMP
+        x_float = x.float() if x.dtype != torch.float32 else x
 
-        # Expand input - use repeat() instead of expand() for contiguous memory
-        x_expanded = x.unsqueeze(1).repeat(
-            1, self.out_channels // self.groups, 1, 1, 1
-        )
-        x_expanded = x_expanded.reshape(
-            B * self.out_channels // self.groups * C_in, H, W
-        ).contiguous()
+        for t in range(kernel_positions):
+            # Build grid_t with shape (B, H_out, W_out, 2) - cuDNN-safe pattern
+            grid_t = torch.stack([sample_x[:, t], sample_y[:, t]], dim=-1)  # (B, H', W', 2)
+            grid_t = grid_t.to(torch.float32)
 
-        grid_expanded = grid.unsqueeze(1).repeat(
-            1, C_in * self.out_channels // self.groups, 1, 1
-        ).reshape(
-            B * self.out_channels // self.groups * C_in,
-            H_out * W_out * kernel_size * kernel_size, 2
-        ).contiguous()
+            # Sample with AMP-safe dtype handling
+            with torch.amp.autocast("cuda", enabled=False):
+                sampled_t = F.grid_sample(
+                    x_float,
+                    grid_t,
+                    mode="bilinear",
+                    padding_mode="zeros",
+                    align_corners=True,
+                )  # (B, C_in, H', W')
 
-        # Sample
-        sampled = F.grid_sample(
-            x_expanded.unsqueeze(1).contiguous(),
-            grid_expanded.unsqueeze(1).contiguous(),
-            mode="bilinear",
-            padding_mode="zeros",
-            align_corners=True,
-        ).squeeze(1)
+            sampled_list.append(sampled_t)
 
-        # Reshape and apply weights
-        sampled = sampled.reshape(
-            B, self.out_channels // self.groups, C_in,
-            H_out, W_out, kernel_size * kernel_size
-        )
-        sampled = sampled.permute(0, 1, 3, 4, 5, 2)
+        # Stack: (B, C_in, H_out, W_out, k*k)
+        sampled = torch.stack(sampled_list, dim=-1)
 
-        # Reshape weight for multiplication: (out_C, in_C/g, k*k)
-        # Transpose to (out_C, k*k, in_C/g) for proper einsum alignment
-        weight_flat = weight.view(self.out_channels, C_in // self.groups, kernel_size * kernel_size).permute(0, 2, 1)
+        # Compute output via batched matrix multiplication (same as DeformableConv2d)
+        B2, C_in2, H_out2, W_out2, K2 = sampled.shape
+        sampled_flat = sampled.permute(0, 1, 4, 2, 3).reshape(B2, C_in2, K2, H_out2 * W_out2)
 
-        # Compute weighted sum
-        # sampled: (B, out_C/g, H', W', k*k, C_in)
-        # weight_flat: (out_C, k*k, C_in/g)
-        # For groups=1, we reshape weight to match
-        weight_for_einsum = weight_flat.reshape(self.out_channels // self.groups, self.groups, kernel_size * kernel_size, C_in // self.groups)
-        output = torch.einsum("bgxykc,gokc->bgoxy", sampled, weight_for_einsum)  # (B, out_C/g, H', W')
+        # Split into groups and compute
+        output_chunks = []
+        C_in_per_group = C_in // self.groups
+        out_channels_per_group = self.out_channels // self.groups
+        weight_flat = weight.view(self.out_channels, C_in // self.groups, kernel_positions)
+
+        for g in range(self.groups):
+            sampled_g = sampled_flat[:, g * C_in_per_group:(g + 1) * C_in_per_group, :, :]
+            weight_g = weight_flat[g * out_channels_per_group:(g + 1) * out_channels_per_group, :, :]
+
+            output_g = torch.einsum("bckh,ock->obh", sampled_g, weight_g)
+            output_g = output_g.permute(1, 0, 2)
+            output_chunks.append(output_g)
+
+        output = torch.cat(output_chunks, dim=1)
         output = output.reshape(B, self.out_channels, H_out, W_out)
 
         if bias is not None:
