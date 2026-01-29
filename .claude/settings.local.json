@@ -4,7 +4,10 @@
       "Bash(tree:*)",
       "Bash(python:*)",
       "Bash(pip install:*)",
-      "Bash(pip search:*)"
+      "Bash(pip search:*)",
+      "Bash(timeout:*)",
+      "Bash(CUDA_VISIBLE_DEVICES= python:*)",
+      "Bash(python.exe:*)"
     ]
   }
 }

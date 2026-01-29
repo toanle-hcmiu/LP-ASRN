@@ -177,7 +177,7 @@ class DeformableConv2d(nn.Module):
         # Stack for grid_sample: (B, H', W', k*k, 2)
         sample_coords = torch.stack([sample_x, sample_y], dim=-1)
         sample_coords = sample_coords.permute(0, 2, 3, 1, 4)  # (B, H', W', k*k, 2)
-        sample_coords = sample_coords.reshape(B, H_out * W_out * kernel_size * kernel_size, 2)
+        sample_coords = sample_coords.reshape(B, H_out * W_out * kernel_size * kernel_size, 2).contiguous()
 
         # Expand input for vectorized sampling
         # We need to sample each location for each channel
@@ -186,7 +186,7 @@ class DeformableConv2d(nn.Module):
         )  # (B, out_C/g, C, H, W)
         x_expanded = x_expanded.reshape(
             B * out_channels // self.groups * C_in, H, W
-        )  # (B*out_C/g*C, H, W)
+        ).contiguous()  # (B*out_C/g*C, H, W)
 
         # Resample for each output channel group
         sample_coords_expanded = sample_coords.unsqueeze(1).expand(
@@ -194,7 +194,7 @@ class DeformableConv2d(nn.Module):
         )  # (B, C*out_C/g, H'*W'*k*k, 2)
         sample_coords_expanded = sample_coords_expanded.reshape(
             B * out_channels // self.groups * C_in, H_out * W_out * kernel_size * kernel_size, 2
-        )
+        ).contiguous()
 
         # Sample from input
         sampled = F.grid_sample(
@@ -413,7 +413,7 @@ class ModulatedDeformableConv2d(nn.Module):
         # Reshape for vectorized sampling
         grid = grid.permute(0, 3, 4, 1, 2).reshape(
             B, H_out * W_out * kernel_size * kernel_size, 2
-        )
+        ).contiguous()
 
         # Expand input
         x_expanded = x.unsqueeze(1).expand(
@@ -421,14 +421,14 @@ class ModulatedDeformableConv2d(nn.Module):
         )
         x_expanded = x_expanded.reshape(
             B * self.out_channels // self.groups * C_in, H, W
-        )
+        ).contiguous()
 
         grid_expanded = grid.unsqueeze(1).expand(
             -1, C_in * self.out_channels // self.groups, -1, -1
         ).reshape(
             B * self.out_channels // self.groups * C_in,
             H_out * W_out * kernel_size * kernel_size, 2
-        )
+        ).contiguous()
 
         # Sample
         sampled = F.grid_sample(
@@ -446,11 +446,16 @@ class ModulatedDeformableConv2d(nn.Module):
         )
         sampled = sampled.permute(0, 1, 3, 4, 5, 2)
 
-        weight_flat = weight.view(
-            self.out_channels, C_in // self.groups, kernel_size * kernel_size
-        )
+        # Reshape weight for multiplication: (out_C, in_C/g, k*k)
+        # Transpose to (out_C, k*k, in_C/g) for proper einsum alignment
+        weight_flat = weight.view(self.out_channels, C_in // self.groups, kernel_size * kernel_size).permute(0, 2, 1)
 
-        output = torch.einsum("bgxykc,ogc->bgoxy", sampled, weight_flat)
+        # Compute weighted sum
+        # sampled: (B, out_C/g, H', W', k*k, C_in)
+        # weight_flat: (out_C, k*k, C_in/g)
+        # For groups=1, we reshape weight to match
+        weight_for_einsum = weight_flat.reshape(self.out_channels // self.groups, self.groups, kernel_size * kernel_size, C_in // self.groups)
+        output = torch.einsum("bgxykc,gokc->bgoxy", sampled, weight_for_einsum)  # (B, out_C/g, H', W')
         output = output.reshape(B, self.out_channels, H_out, W_out)
 
         if bias is not None:

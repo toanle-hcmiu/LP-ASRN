@@ -3,7 +3,9 @@
 
 model:
   # Number of RRDB-EA blocks in the deep feature extractor
-  num_rrdb_blocks: 16
+  # Reduced from 16 to 12 for stability and memory efficiency
+  # Still provides excellent performance
+  num_rrdb_blocks: 12
 
   # Number of feature channels
   num_filters: 64
