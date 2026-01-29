@@ -198,8 +198,8 @@ class DeformableConv2d(nn.Module):
 
         # Sample from input
         sampled = F.grid_sample(
-            x_expanded.unsqueeze(1),  # (B*C*out_C/g, 1, H, W)
-            sample_coords_expanded.unsqueeze(1),  # (B*C*out_C/g, 1, H'*W'*k*k, 2)
+            x_expanded.unsqueeze(1).contiguous(),  # (B*C*out_C/g, 1, H, W)
+            sample_coords_expanded.unsqueeze(1).contiguous(),  # (B*C*out_C/g, 1, H'*W'*k*k, 2)
             mode="bilinear",
             padding_mode="zeros",
             align_corners=True,
@@ -432,8 +432,8 @@ class ModulatedDeformableConv2d(nn.Module):
 
         # Sample
         sampled = F.grid_sample(
-            x_expanded.unsqueeze(1),
-            grid_expanded.unsqueeze(1),
+            x_expanded.unsqueeze(1).contiguous(),
+            grid_expanded.unsqueeze(1).contiguous(),
             mode="bilinear",
             padding_mode="zeros",
             align_corners=True,
