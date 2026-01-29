@@ -93,16 +93,40 @@ LP-ASRN uses SimpleCRNN for character recognition:
 
 - **Architecture**: CNN feature extractor + Bidirectional LSTM
 - **Vocabulary**: 36 characters (0-9, A-Z) optimized for license plates
-- **Training**: Jointly trained with the generator during progressive training
-- **No pre-training needed**: SimpleCRNN learns from scratch on license plate data
+- **Training**: Pretrained on HR images in Stage 0, then frozen for Stages 1-2
+- **Joint training**: OCR unfrozen in Stage 3 for co-adaptation
 
-The OCR is automatically trained during the progressive training stages - no separate fine-tuning step required.
+The OCR is automatically pretrained during Stage 0 before any super-resolution training begins.
 
 ---
 
 ## Progressive Training
 
-LP-ASRN uses a three-stage progressive training approach for stability and performance.
+LP-ASRN uses a four-stage progressive training approach for stability and performance.
+
+### Stage 0: OCR Pretraining
+
+**Purpose**: Train OCR model on high-resolution license plate images to establish
+baseline recognition capability before super-resolution training begins.
+
+**Configuration**:
+- Loss: CrossEntropy (character-level)
+- OCR: Unfrozen (being trained)
+- Learning Rate: 1e-4
+- Duration: 20 epochs
+
+**What happens**:
+- OCR learns to recognize license plates from HR images
+- Establishes baseline recognition accuracy (target: 80%+)
+- Saves pretrained OCR to checkpoints/lp_asrn/ocr_best.pth
+- OCR is frozen after this stage for Stages 1-2
+
+**Run standalone**:
+```bash
+python scripts/train_progressive.py \
+    --stage 0 \
+    --config configs/lp_asrn.yaml
+```
 
 ### Stage 1: Warm-up
 
@@ -389,7 +413,7 @@ Metrics reported:
 
 ### Common Mistakes
 
-1. **Skipping OCR Fine-tuning**: Results in poor LCOFL gradients
+1. **Skipping OCR Pretraining**: Results in poor LCOFL gradients (Stage 0 is essential)
 2. **Skipping Warm-up Stage**: Can cause early instability
 3. **Unfreezing OCR Too Early**: Wait until Stage 3
 4. **Monitoring Loss Instead of Recognition**: LCOFL optimizes for recognition, not pixel metrics

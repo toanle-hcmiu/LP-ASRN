@@ -14,7 +14,7 @@ LP-ASRN addresses the challenge of recognizing license plates from low-resolutio
 
 ### Key Features
 
-- **Progressive Three-Stage Training**: Warm-up → LCOFL → Fine-tuning for stability
+- **Progressive Four-Stage Training**: OCR Pretraining → Warm-up → LCOFL → Fine-tuning for stability
 - **Layout and Character Oriented Focal Loss (LCOFL)**: Penalizes character confusion and layout violations
 - **Enhanced Attention Module**: Deformable convolutions for adaptive character feature extraction
 - **TensorBoard Integration**: Real-time visualization of metrics, images, and confusion matrices
@@ -62,7 +62,7 @@ python scripts/evaluate.py --checkpoint checkpoints/lp_asrn/best.pth
 
 ### Progressive Training
 
-The progressive training approach consists of three stages:
+The progressive training approach consists of four stages:
 
 ```bash
 python scripts/train_progressive.py \
@@ -74,6 +74,9 @@ python scripts/train_progressive.py \
 Or train individual stages:
 
 ```bash
+# Stage 0: OCR Pretraining
+python scripts/train_progressive.py --stage 0 --config configs/lp_asrn.yaml
+
 # Stage 1: Warm-up (L1 loss only)
 python scripts/train_progressive.py --stage 1 --epochs 10
 
@@ -85,6 +88,12 @@ python scripts/train_progressive.py --stage 3 --resume checkpoints/stage2.pth
 ```
 
 ### Training Stages
+
+0. **Stage 0: OCR Pretraining**
+   - Loss: CrossEntropy (character recognition)
+   - Purpose: Train OCR on HR images before SR training
+   - Duration: 20 epochs
+   - OCR: Unfrozen (being trained)
 
 1. **Stage 1: Warm-up**
    - Loss: L1 (pixel reconstruction)
@@ -196,6 +205,9 @@ model:
   use_deformable: true
 
 progressive_training:
+  stage0:
+    epochs: 20
+    lr: 0.0001
   stage1:
     epochs: 10
     lr: 0.0001
@@ -205,6 +217,11 @@ progressive_training:
   stage3:
     epochs: 20
     lr: 0.00001
+
+loss:
+  lambda_lcofl: 1.0
+  lambda_layout: 0.5
+  lambda_ssim: 0.2
 
 tensorboard:
   enabled: true

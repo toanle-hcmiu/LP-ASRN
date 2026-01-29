@@ -69,7 +69,22 @@ def create_comparison_grid(
     if not MATPLOTLIB_AVAILABLE:
         raise ImportError("matplotlib is required for create_comparison_grid")
 
+    # Input validation
+    if lr_images.dim() != 4 or sr_images.dim() != 4 or hr_images.dim() != 4:
+        raise ValueError(
+            f"Expected 4D tensors (B, C, H, W), got shapes: "
+            f"lr={lr_images.shape}, sr={sr_images.shape}, hr={hr_images.shape}"
+        )
+
+    if lr_images.shape[0] == 0 or sr_images.shape[0] == 0 or hr_images.shape[0] == 0:
+        raise ValueError(
+            f"Empty batch detected: lr={lr_images.shape}, sr={sr_images.shape}, hr={hr_images.shape}"
+        )
+
     B = min(lr_images.shape[0], max_images)
+
+    if B <= 0:
+        raise ValueError(f"Batch size must be positive, got B={B}")
 
     # Get dimensions
     _, _, H_lr, W_lr = lr_images.shape
@@ -111,15 +126,24 @@ def create_comparison_grid(
 
     # Add text if available
     if gt_texts is not None or pred_texts is not None:
-        # Create text overlay using matplotlib
-        grid = add_text_to_grid(
-            grid,
-            gt_texts[:B] if gt_texts else None,
-            pred_texts[:B] if pred_texts else None,
-            H_hr,
-            W_hr,
-            padding,
-        )
+        try:
+            # Validate that gt_texts and pred_texts have at least B elements
+            gt_slice = gt_texts[:B] if gt_texts and len(gt_texts) >= B else None
+            pred_slice = pred_texts[:B] if pred_texts and len(pred_texts) >= B else None
+
+            if gt_slice is not None or pred_slice is not None:
+                # Create text overlay using matplotlib
+                grid = add_text_to_grid(
+                    grid,
+                    gt_slice,
+                    pred_slice,
+                    H_hr,
+                    W_hr,
+                    padding,
+                )
+        except Exception as e:
+            # If text overlay fails, return grid without text
+            print(f"Warning: Could not add text overlay to grid: {e}. Returning grid without text.")
 
     return grid
 
@@ -133,7 +157,23 @@ def add_text_to_grid(
     padding: int,
 ) -> torch.Tensor:
     """Add text overlay to the comparison grid."""
-    fig = plt.figure(figsize=(grid.shape[2] / 100, grid.shape[1] / 100), dpi=100)
+    # Validate input grid dimensions
+    if grid.dim() != 3:
+        raise ValueError(f"Expected 3D grid tensor (C, H, W), got shape: {grid.shape}")
+
+    grid_h, grid_w = grid.shape[1], grid.shape[2]
+
+    # Ensure grid dimensions are positive and valid for matplotlib
+    if grid_w <= 0 or grid_h <= 0:
+        raise ValueError(f"Invalid grid dimensions: H={grid_h}, W={grid_w}")
+
+    # Calculate figure size with minimum bounds to avoid invalid dimensions
+    # figsize is in inches, dpi determines the pixel dimensions
+    dpi = 100
+    figsize_w = max(grid_w / dpi, 1.0)  # Minimum 1 inch width
+    figsize_h = max(grid_h / dpi, 1.0)  # Minimum 1 inch height
+
+    fig = plt.figure(figsize=(figsize_w, figsize_h), dpi=dpi)
     ax = fig.add_axes([0, 0, 1, 1])
     ax.axis('off')
 
@@ -163,9 +203,30 @@ def add_text_to_grid(
     # Convert back to tensor
     fig.canvas.draw()
     width, height = fig.canvas.get_width_height()
+
+    # Validate canvas dimensions before conversion
+    if width <= 0 or height <= 0:
+        plt.close(fig)
+        raise ValueError(f"Invalid canvas dimensions: width={width}, height={height}")
+
     image_array = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
+
+    # Validate buffer size
+    expected_size = height * width * 3
+    if image_array.size != expected_size:
+        plt.close(fig)
+        raise ValueError(
+            f"Buffer size mismatch: got {image_array.size}, expected {expected_size} "
+            f"(height={height}, width={width})"
+        )
+
     image_array = image_array.reshape(height, width, 3)
     grid_with_text = torch.from_numpy(image_array).permute(2, 0, 1).float() / 255.0
+
+    # Validate output tensor dimensions
+    if grid_with_text.shape[1] <= 0 or grid_with_text.shape[2] <= 0:
+        plt.close(fig)
+        raise ValueError(f"Invalid output tensor dimensions: {grid_with_text.shape}")
 
     plt.close(fig)
     return grid_with_text

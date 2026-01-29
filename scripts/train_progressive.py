@@ -2,12 +2,13 @@
 """
 Progressive Training Script for LP-ASRN
 
-Implements three-stage progressive training with automatic TensorBoard startup.
+Implements four-stage progressive training with automatic TensorBoard startup.
 
 Usage:
     python scripts/train_progressive.py --stage all --config configs/lp_asrn.yaml
 
 Stages:
+    Stage 0 (pretrain): OCR pretraining on HR images, 20 epochs
     Stage 1 (warmup): L1 loss only, 5-10 epochs
     Stage 2 (lcofl): Full LCOFL training, 50+ epochs
     Stage 3 (finetune): Joint OCR optimization, 20+ epochs
@@ -113,12 +114,13 @@ def parse_args():
     parser.add_argument(
         "--stage",
         type=str,
-        choices=["1", "2", "3", "all", "warmup", "lcofl", "finetune"],
+        choices=["0", "1", "2", "3", "all", "pretrain", "warmup", "lcofl", "finetune"],
         default="all",
         help="Training stage to run",
     )
 
     # Epoch overrides
+    parser.add_argument("--pretrain-epochs", type=int, default=None)
     parser.add_argument("--warmup-epochs", type=int, default=None)
     parser.add_argument("--lcofl-epochs", type=int, default=None)
     parser.add_argument("--finetune-epochs", type=int, default=None)
@@ -166,12 +168,15 @@ def load_config(config_path: str, args) -> dict:
     if "progressive_training" not in config:
         config["progressive_training"] = {
             "enabled": True,
+            "stage0": {"epochs": 20, "lr": 1e-4},
             "stage1": {"epochs": 10, "lr": 1e-4},
             "stage2": {"epochs": 50, "lr": 1e-4},
             "stage3": {"epochs": 20, "lr": 1e-5},
         }
 
     # Apply epoch overrides
+    if args.pretrain_epochs:
+        config["progressive_training"]["stage0"]["epochs"] = args.pretrain_epochs
     if args.warmup_epochs:
         config["progressive_training"]["stage1"]["epochs"] = args.warmup_epochs
     if args.lcofl_epochs:
@@ -192,6 +197,7 @@ def load_config(config_path: str, args) -> dict:
     # Debug mode
     if args.debug:
         config["training"]["epochs"] = 1
+        config["progressive_training"]["stage0"]["epochs"] = 1
         config["progressive_training"]["stage1"]["epochs"] = 1
         config["progressive_training"]["stage2"]["epochs"] = 1
         config["progressive_training"]["stage3"]["epochs"] = 1
@@ -203,6 +209,8 @@ def load_config(config_path: str, args) -> dict:
 def map_stage_name(stage: str) -> TrainingStage:
     """Map string stage name to TrainingStage enum."""
     stage_map = {
+        "0": TrainingStage.PRETRAIN,
+        "pretrain": TrainingStage.PRETRAIN,
         "1": TrainingStage.WARMUP,
         "warmup": TrainingStage.WARMUP,
         "2": TrainingStage.LCOFL,

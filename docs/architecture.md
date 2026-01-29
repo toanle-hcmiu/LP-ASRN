@@ -227,7 +227,8 @@ In the GAN-inspired training paradigm:
 
 ### 1. Progressive Training
 
-Three stages prevent instability from complex loss landscapes:
+Four stages prevent instability from complex loss landscapes:
+- **Stage 0**: OCR Pretraining (train OCR on HR images)
 - **Stage 1**: Warm-up with simple L1 loss
 - **Stage 2**: Introduce LCOFL gradually
 - **Stage 3**: Joint optimization (if needed)

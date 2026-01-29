@@ -32,6 +32,7 @@ from src.utils.visualizer import create_comparison_grid
 
 class TrainingStage(Enum):
     """Training stages for progressive training."""
+    PRETRAIN = "pretrain"
     WARMUP = "warmup"
     LCOFL = "lcofl"
     FINETUNE = "finetune"
@@ -106,6 +107,14 @@ class ProgressiveTrainer:
 
         # Stage configurations
         self.stage_configs = {
+            TrainingStage.PRETRAIN: StageConfig(
+                name="pretrain",
+                epochs=self.progressive_config.get("stage0", {}).get("epochs", 20),
+                lr=self.progressive_config.get("stage0", {}).get("lr", 1e-4),
+                loss_components=["ocr"],
+                freeze_ocr=False,
+                update_confusion=False,
+            ),
             TrainingStage.WARMUP: StageConfig(
                 name="warmup",
                 epochs=self.progressive_config.get("stage1", {}).get("epochs", 10),
@@ -197,10 +206,12 @@ class ProgressiveTrainer:
                     pred_texts = self.ocr.predict(sr_images)
 
                 # Compute LCOFL
-                lcofl, _ = self.lcofl_loss(
+                lcofl, lcofl_info = self.lcofl_loss(
                     sr_images, hr_images, pred_logits, gt_texts, pred_texts
                 )
-                loss = loss + 0.1 * lcofl
+                # Use configurable lambda_lcofl weight (default 1.0 instead of 0.1)
+                lambda_lcofl = self.config.get("loss", {}).get("lambda_lcofl", 1.0)
+                loss = loss + lambda_lcofl * lcofl
                 total_lcofl += lcofl.item()
 
                 pred_texts_all.extend(pred_texts)
@@ -314,6 +325,129 @@ class ProgressiveTrainer:
             "sample_batch": sample_batch,
         }
 
+    def save_ocr_checkpoint(self, epoch: int, stage: TrainingStage):
+        """Save OCR model checkpoint."""
+        ocr_path = self.save_dir / f"ocr_stage_{stage.value}_epoch_{epoch}.pth"
+        self.ocr.save(str(ocr_path))
+        # Also save as default for later loading
+        default_path = self.save_dir / "ocr_best.pth"
+        self.ocr.save(str(default_path))
+
+    def train_pretrain_stage(self, stage_config: StageConfig) -> float:
+        """
+        Train OCR model on license plate data (Stage 0: Pretraining).
+
+        This stage trains only the OCR model on high-resolution license plate
+        images to establish a baseline recognition capability before the
+        super-resolution training begins.
+
+        Args:
+            stage_config: Configuration for this training stage
+
+        Returns:
+            Best word accuracy achieved during pretraining
+        """
+        import torch.nn as nn
+
+        # Unfreeze OCR for training
+        for param in self.ocr.parameters():
+            param.requires_grad = True
+
+        self.ocr.train()
+
+        # Create optimizer for OCR only
+        self.optimizer = optim.Adam(self.ocr.parameters(), lr=stage_config.lr)
+
+        best_word_acc = 0.0
+        self.epochs_without_improvement = 0
+        criterion = nn.CrossEntropyLoss(ignore_index=0)
+
+        print(f"\n{'='*60}")
+        print(f"OCR PRETRAINING STAGE")
+        print(f"{'='*60}")
+        print(f"Epochs: {stage_config.epochs}")
+        print(f"Learning Rate: {stage_config.lr}")
+        print(f"{'='*60}\n")
+
+        for epoch in range(stage_config.epochs):
+            total_loss = 0.0
+            correct = 0
+            total = 0
+
+            pbar = tqdm(self.train_loader, desc=f"OCR Pretrain Epoch {epoch+1}/{stage_config.epochs}")
+            for batch in pbar:
+                hr_images = batch["hr"].to(self.device)
+                gt_texts = batch["plate_text"]
+
+                # Encode ground truth texts
+                gt_indices = self.ocr.tokenizer.encode_batch(gt_texts).to(self.device)
+
+                # Forward pass
+                logits = self.ocr(hr_images, return_logits=True)
+
+                # Compute loss
+                B, K, C = logits.shape
+                logits_flat = logits.reshape(-1, C)
+                targets_flat = gt_indices.reshape(-1)
+
+                # Filter padding
+                mask = targets_flat > 0
+                if mask.sum() > 0:
+                    loss = criterion(logits_flat[mask], targets_flat[mask])
+                else:
+                    loss = torch.tensor(0.0, device=self.device)
+
+                # Backward pass
+                self.optimizer.zero_grad()
+                loss.backward()
+                self.optimizer.step()
+
+                total_loss += loss.item()
+                pbar.set_postfix({"loss": loss.item()})
+
+                # Character-level accuracy
+                pred_indices = logits.argmax(dim=-1)
+                correct += (pred_indices == gt_indices).sum().item()
+                total += gt_indices.numel()
+
+            avg_loss = total_loss / len(self.train_loader)
+            char_acc = correct / total if total > 0 else 0
+
+            # Validation
+            val_metrics = self.validate()
+
+            # Print results
+            print(f"\nOCR Pretrain Epoch {epoch+1}/{stage_config.epochs}:")
+            print(f"  Train Loss: {avg_loss:.4f}")
+            print(f"  Train Char Acc: {char_acc:.4f}")
+            print(f"  Val PSNR: {val_metrics['psnr']:.2f} dB")
+            print(f"  Val SSIM: {val_metrics['ssim']:.4f}")
+            print(f"  Val Word Acc: {val_metrics['word_acc']:.4f}")
+            print(f"  Val Char Acc: {val_metrics['char_acc']:.4f}")
+
+            # Save best model
+            if val_metrics['word_acc'] > best_word_acc:
+                best_word_acc = val_metrics['word_acc']
+                self.epochs_without_improvement = 0
+                self.save_ocr_checkpoint(epoch, TrainingStage.PRETRAIN)
+                print(f"  ✓ New best OCR: word_acc={val_metrics['word_acc']:.4f}")
+            else:
+                self.epochs_without_improvement += 1
+
+            # Early stopping
+            patience = self.config.get("training", {}).get("early_stop_patience", 20)
+            if self.epochs_without_improvement >= patience:
+                print(f"Early stopping after {patience} epochs without improvement")
+                break
+
+        # Freeze OCR after pretraining for subsequent stages
+        for param in self.ocr.parameters():
+            param.requires_grad = False
+
+        print(f"\nOCR Pretraining complete. Best word accuracy: {best_word_acc:.4f}\n")
+
+        return best_word_acc
+
     def log_to_tensorboard(
         self,
         train_metrics: Dict,
@@ -346,7 +480,15 @@ class ProgressiveTrainer:
                 )
                 self.logger.log_image_grid(f"comparison/epoch_{epoch}", grid, epoch)
             except Exception as e:
+                # Log detailed error information with tensor shapes
+                lr_shape = getattr(batch.get("lr"), "shape", "N/A")
+                sr_shape = getattr(batch.get("sr"), "shape", "N/A")
+                hr_shape = getattr(batch.get("hr"), "shape", "N/A")
+                gt_count = len(batch.get("gt_texts", []))
+                pred_count = len(val_metrics.get("pred_texts", []))
                 print(f"Warning: Could not log images: {e}")
+                print(f"  Tensor shapes - LR: {lr_shape}, SR: {sr_shape}, HR: {hr_shape}")
+                print(f"  Text counts - GT: {gt_count}, Pred: {pred_count}")
 
         # Log confusion matrix
         if epoch % 5 == 0 and self.current_stage in [TrainingStage.LCOFL, TrainingStage.FINETUNE]:
@@ -471,6 +613,15 @@ class ProgressiveTrainer:
         print("\n" + "=" * 60)
         print("PROGRESSIVE TRAINING START")
         print("=" * 60 + "\n")
+
+        # Stage 0: OCR Pretraining
+        print("\nStage 0: OCR Pretraining")
+        print("Purpose: Train OCR model on license plate data")
+        print("This ensures OCR can provide meaningful guidance to the generator")
+        best_acc_stage0 = self.train_pretrain_stage(
+            self.stage_configs[TrainingStage.PRETRAIN]
+        )
+        results["stage0_best_acc"] = best_acc_stage0
 
         # Stage 1: Warm-up
         print("\nStage 1: Warm-up (L1 loss only)")

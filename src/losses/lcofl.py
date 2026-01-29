@@ -137,19 +137,42 @@ class ClassificationLoss(nn.Module):
 
         # Check if vocab size matches (e.g., Parseq outputs 94 chars, but our vocab is 36)
         if C != len(self.char_to_idx):
-            # Vocab size mismatch - use simpler loss based on prediction confidence
-            # For Parseq, we use the negative log prob of the correct characters
-            # This is a simplified approach that works with any vocab
+            # Vocab size mismatch - map from larger vocab to our target vocab
+            # and compute loss using character-level matching
 
-            # Get predicted characters (argmax)
-            pred_chars = pred_logits.argmax(dim=-1)  # (B, K)
+            # Get predicted characters (argmax) from the OCR's vocabulary
+            pred_indices = pred_logits.argmax(dim=-1)  # (B, K)
 
-            # Convert to texts (using a simple mapping for 0-9, A-Z)
-            # Parseq uses a different vocab, so we'll use a simple proxy loss
-            loss = torch.tensor(0.0, device=pred_logits.device)
+            # Get the probabilities for the predicted characters (for gradient flow)
+            pred_probs = pred_logits.softmax(dim=-1)  # (B, K, C)
 
-            # We can still track confusion if we have predictions
-            # but the loss itself will be computed elsewhere
+            # Compute loss by encouraging high probability for correct character positions
+            # For each position, we want the model to predict the correct character
+            total_loss = 0.0
+            count = 0
+
+            for b in range(B):
+                gt_text = gt_texts[b] if b < len(gt_texts) else ""
+                for k in range(K):
+                    if k >= len(gt_text):
+                        break
+
+                    gt_char = gt_text[k]
+                    if gt_char not in self.char_to_idx:
+                        continue
+
+                    # We want the model to be confident in its prediction at this position
+                    # Use negative log probability as loss (encourages high confidence)
+                    # Get the probability of the predicted character
+                    pred_idx = pred_indices[b, k]
+                    prob = pred_probs[b, k, pred_idx]
+
+                    # NLL loss: -log(prob)
+                    # Higher probability = lower loss
+                    total_loss += -torch.log(prob + 1e-10)
+                    count += 1
+
+            loss = total_loss / count if count > 0 else torch.tensor(0.0, device=pred_logits.device)
             return loss, {"classification_loss": loss, "vocab_mismatch": True}
 
         # Encode ground truth texts

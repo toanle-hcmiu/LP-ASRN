@@ -74,6 +74,9 @@ training:
   save_dir: "checkpoints/lp_asrn"
 
 loss:
+  # Weight for LCOFL loss (character-driven loss)
+  lambda_lcofl: 1.0
+
   # Weight for layout penalty
   lambda_layout: 0.5
 
@@ -111,6 +114,17 @@ ocr:
 # Progressive Training Configuration
 progressive_training:
   enabled: true
+
+  # Stage 0: OCR Pretraining
+  # Purpose: Train OCR model on license plate data before SR training
+  # This ensures OCR can provide meaningful guidance to the generator
+  stage0:
+    name: "pretrain"
+    epochs: 20
+    lr: 0.0001
+    loss_components: ["ocr"]
+    freeze_ocr: false
+    update_confusion: false
 
   # Stage 1: Warm-up (L1 loss only)
   # Purpose: Stabilize network before introducing complex losses
