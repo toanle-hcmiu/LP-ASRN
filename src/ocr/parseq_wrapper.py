@@ -41,26 +41,47 @@ class ParseqTokenizer:
     Tokenizer for Parseq-style character encoding.
 
     Handles character-to-index and index-to-character conversions
-    for license plate text.
+    for license plate text. Uses Parseq's native vocabulary for
+    compatibility with the pretrained model.
     """
+
+    # Parseq's native vocabulary (95 characters)
+    PARSEQ_VOCAB = (
+        "0123456789"
+        "abcdefghijklmnopqrstuvwxyz"
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~"
+    )
 
     def __init__(
         self,
         vocab: str = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ",
         max_length: int = 7,
+        use_parseq_vocab: bool = True,
     ):
         """
         Initialize tokenizer.
 
         Args:
-            vocab: Character vocabulary
+            vocab: Target character vocabulary (our license plate chars)
             max_length: Maximum sequence length
+            use_parseq_vocab: If True, use Parseq's native vocabulary for encoding
         """
-        self.vocab = vocab
+        self.vocab = vocab  # Our target vocabulary (36 chars)
         self.max_length = max_length
-        self.char_to_idx = {c: i for i, c in enumerate(vocab)}
-        self.idx_to_char = {i: c for i, c in enumerate(vocab)}
-        self.vocab_size = len(vocab)
+        self.use_parseq_vocab = use_parseq_vocab
+
+        if use_parseq_vocab:
+            # Use Parseq's native vocabulary for encoding
+            # Map our characters to Parseq's vocabulary indices
+            self.char_to_idx = {c: self.PARSEQ_VOCAB.index(c) for c in vocab if c in self.PARSEQ_VOCAB}
+            self.idx_to_char = {i: c for i, c in enumerate(self.PARSEQ_VOCAB)}
+            self.vocab_size = len(self.PARSEQ_VOCAB)  # 95
+        else:
+            # Use simple sequential indexing (for SimpleCRNN fallback)
+            self.char_to_idx = {c: i for i, c in enumerate(vocab)}
+            self.idx_to_char = {i: c for i, c in enumerate(vocab)}
+            self.vocab_size = len(vocab)
 
         # Special tokens
         self.pad_token = "[PAD]"
@@ -116,7 +137,7 @@ class ParseqTokenizer:
             indices: Tensor of shape (max_length,) or (B, max_length)
 
         Returns:
-            Decoded text string
+            Decoded text string (filtered to target vocabulary)
         """
         if indices.dim() == 2:
             indices = indices[0]  # Take first batch item
@@ -127,7 +148,13 @@ class ParseqTokenizer:
             if idx_val == 0:
                 continue  # Padding
             if idx_val < self.vocab_size:
-                text += self.idx_to_char[idx_val]
+                char = self.idx_to_char[idx_val]
+                # When using Parseq vocab, only include characters in our target vocabulary
+                if self.use_parseq_vocab:
+                    if char in self.vocab:
+                        text += char
+                else:
+                    text += char
 
         return text
 
@@ -180,18 +207,16 @@ class ParseqOCR(nn.Module):
         self.vocab = vocab
         self.max_length = max_length
         self.frozen = frozen
-        self.tokenizer = ParseqTokenizer(vocab, max_length)
 
         # Try to load Parseq model
         self.model = None
+        self.use_parseq = False
         if PARSEQ_AVAILABLE:
             try:
                 # Load Parseq via torch.hub
                 self.model = torch.hub.load('baudm/parseq', 'parseq', pretrained=True, trust_repo=True)
                 print(f"Loaded Parseq model via torch.hub")
-
-                # Replace Parseq's output layer to match our vocabulary
-                self._replace_parseq_head(vocab)
+                self.use_parseq = True
             except Exception as e:
                 print(f"Warning: Could not load Parseq model: {e}")
                 print("Creating a simple CNN+RNN model as fallback")
@@ -204,6 +229,10 @@ class ParseqOCR(nn.Module):
                 max_length=max_length,
             )
             print("Using fallback CRNN model")
+            self.use_parseq = False
+
+        # Create tokenizer with Parseq vocab if using Parseq model
+        self.tokenizer = ParseqTokenizer(vocab, max_length, use_parseq_vocab=self.use_parseq)
 
         # Freeze weights if specified
         if frozen:
