@@ -181,16 +181,17 @@ class DeformableConv2d(nn.Module):
 
         # Expand input for vectorized sampling
         # We need to sample each location for each channel
-        x_expanded = x.unsqueeze(1).expand(
-            -1, out_channels // self.groups, -1, -1, -1
+        # Use repeat() instead of expand() to ensure contiguous memory
+        x_expanded = x.unsqueeze(1).repeat(
+            1, out_channels // self.groups, 1, 1, 1
         )  # (B, out_C/g, C, H, W)
         x_expanded = x_expanded.reshape(
             B * out_channels // self.groups * C_in, H, W
         ).contiguous()  # (B*out_C/g*C, H, W)
 
         # Resample for each output channel group
-        sample_coords_expanded = sample_coords.unsqueeze(1).expand(
-            -1, C_in * out_channels // self.groups, -1, -1
+        sample_coords_expanded = sample_coords.unsqueeze(1).repeat(
+            1, C_in * out_channels // self.groups, 1, 1
         )  # (B, C*out_C/g, H'*W'*k*k, 2)
         sample_coords_expanded = sample_coords_expanded.reshape(
             B * out_channels // self.groups * C_in, H_out * W_out * kernel_size * kernel_size, 2
@@ -415,16 +416,16 @@ class ModulatedDeformableConv2d(nn.Module):
             B, H_out * W_out * kernel_size * kernel_size, 2
         ).contiguous()
 
-        # Expand input
-        x_expanded = x.unsqueeze(1).expand(
-            -1, self.out_channels // self.groups, -1, -1, -1
+        # Expand input - use repeat() instead of expand() for contiguous memory
+        x_expanded = x.unsqueeze(1).repeat(
+            1, self.out_channels // self.groups, 1, 1, 1
         )
         x_expanded = x_expanded.reshape(
             B * self.out_channels // self.groups * C_in, H, W
         ).contiguous()
 
-        grid_expanded = grid.unsqueeze(1).expand(
-            -1, C_in * self.out_channels // self.groups, -1, -1
+        grid_expanded = grid.unsqueeze(1).repeat(
+            1, C_in * self.out_channels // self.groups, 1, 1
         ).reshape(
             B * self.out_channels // self.groups * C_in,
             H_out * W_out * kernel_size * kernel_size, 2
