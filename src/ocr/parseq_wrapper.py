@@ -213,9 +213,7 @@ class ParseqOCR(nn.Module):
     def _replace_parseq_head(self, vocab: str):
         """
         Replace Parseq's output layer to match our vocabulary.
-
-        Extracts weights for characters in our vocabulary from Parseq's
-        pretrained layer, preserving pretrained knowledge.
+        Uses programmatic search to find the correct output layer.
 
         Args:
             vocab: Target vocabulary string (e.g., "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ")
@@ -237,41 +235,75 @@ class ParseqOCR(nn.Module):
                 # Character not in Parseq's vocab - use last index as fallback
                 vocab_mapping.append(len(parseq_vocab) - 1)
 
-        # Find and replace the head layer
-        # Parseq structure: model.decoder.head is a Linear layer
-        head_found = False
-        if hasattr(self.model, 'decoder'):
-            decoder = self.model.decoder
-            if hasattr(decoder, 'head'):
-                original_head = decoder.head
+        # Programmatic search for the output layer
+        original_head = None
+        head_path = None
 
-                # Get dimensions
-                if hasattr(original_head, 'in_features') and hasattr(original_head, 'out_features'):
-                    in_features = original_head.in_features
-                    original_out_features = original_head.out_features
-                    out_features = len(vocab)  # Our vocab size (36)
+        # Search for Linear layer with ~94 output features (Parseq's vocab size)
+        for name, module in self.model.named_modules():
+            if isinstance(module, nn.Linear):
+                # Check if this is the output layer (vocab size ~94)
+                if module.out_features in [92, 93, 94, 95, 96, 97]:  # Parseq vocab sizes
+                    original_head = module
+                    head_path = name
+                    print(f"Found Parseq output layer: {name}")
+                    print(f"  Input: {module.in_features}, Output: {module.out_features}")
+                    break
 
-                    print(f"Replacing Parseq head: {original_out_features} -> {out_features} classes")
-                    print(f"Preserving pretrained weights for {len(vocab_mapping)} characters")
+        # Fallback: try common paths if size-based search didn't work
+        if original_head is None:
+            print("Warning: Could not find output layer by size. Trying direct paths...")
+            fallback_paths = [
+                'decoder.head', 'decoder.output_projection', 'decoder.lm_head',
+                'decoder.linear', 'head', 'lm_head', 'output_projection'
+            ]
+            for path in fallback_paths:
+                obj = self.model
+                try:
+                    for attr in path.split('.'):
+                        obj = getattr(obj, attr)
+                    if isinstance(obj, nn.Linear):
+                        original_head = obj
+                        head_path = path
+                        print(f"Found output layer at path: {path}")
+                        print(f"  Input: {obj.in_features}, Output: {obj.out_features}")
+                        break
+                except AttributeError:
+                    continue
 
-                    # Create new head with correct output size
-                    new_head = nn.Linear(in_features, out_features)
-                    new_head = new_head.to(original_head.weight.device)
+        if original_head is None:
+            print("Error: Could not find Parseq output layer. Model structure:")
+            print(self.model)
+            return
 
-                    # Initialize with corresponding weights from pretrained layer
-                    with torch.no_grad():
-                        for new_idx, old_idx in enumerate(vocab_mapping):
-                            if old_idx < original_out_features:
-                                new_head.weight[new_idx] = original_head.weight[old_idx].clone()
-                                new_head.bias[new_idx] = original_head.bias[old_idx].clone()
+        # Create new head
+        in_features = original_head.in_features
+        out_features = len(vocab)  # 36
+        new_head = nn.Linear(in_features, out_features)
+        new_head = new_head.to(original_head.weight.device)
 
-                    # Replace the head
-                    self.model.decoder.head = new_head
-                    head_found = True
-                    print("Parseq head replaced successfully")
+        print(f"Replacing Parseq head: {original_head.out_features} -> {out_features} classes")
+        print(f"Preserving pretrained weights for {len(vocab_mapping)} characters")
 
-        if not head_found:
-            print("Warning: Could not find Parseq head layer to replace. Model may not work correctly.")
+        # Initialize with corresponding weights from pretrained layer
+        with torch.no_grad():
+            for new_idx, old_idx in enumerate(vocab_mapping):
+                if old_idx < original_head.out_features:
+                    new_head.weight[new_idx] = original_head.weight[old_idx].clone()
+                    new_head.bias[new_idx] = original_head.bias[old_idx].clone()
+
+        # Replace the layer using the path
+        if '.' in head_path:
+            # Navigate to parent and replace
+            parts = head_path.split('.')
+            parent = self.model
+            for part in parts[:-1]:
+                parent = getattr(parent, part)
+            setattr(parent, parts[-1], new_head)
+        else:
+            setattr(self.model, head_path, new_head)
+
+        print("Parseq head replaced successfully")
 
     def forward(
         self,
