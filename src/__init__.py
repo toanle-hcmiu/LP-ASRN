@@ -1,2 +1,2 @@
-# LACD-SRN Package
+# LP-ASRN Package
 __version__ = "0.1.0"

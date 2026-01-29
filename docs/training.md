@@ -1,4 +1,4 @@
-# LACD-SRN Training Guide
+# LP-ASRN Training Guide
 
 Complete guide for training the Layout-Aware and Character-Driven Super-Resolution Network.
 
@@ -122,7 +122,7 @@ After fine-tuning, you should see:
 
 ## Progressive Training
 
-LACD-SRN uses a three-stage progressive training approach for stability and performance.
+LP-ASRN uses a three-stage progressive training approach for stability and performance.
 
 ### Stage 1: Warm-up
 

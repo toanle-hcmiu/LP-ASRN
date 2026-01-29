@@ -1,5 +1,5 @@
 """
-Progressive Training for LACD-SRN
+Progressive Training for LP-ASRN
 
 Implements multi-stage training approach:
 1. Stage 1: Warm-up with L1 loss only
@@ -50,7 +50,7 @@ class StageConfig:
 
 class ProgressiveTrainer:
     """
-    Progressive Trainer for LACD-SRN.
+    Progressive Trainer for LP-ASRN.
 
     Implements three-stage training:
     1. Warm-up: Stabilize network with L1 loss only

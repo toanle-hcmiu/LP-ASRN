@@ -1,4 +1,4 @@
-# LACD-SRN
+# LP-ASRN
 
 **Layout-Aware & Character-Driven Super-Resolution for License Plates**
 
@@ -6,11 +6,11 @@
 [![PyTorch](https://img.shields.io/badge/pytorch-2.0+-red.svg)](https://pytorch.org/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-A PyTorch implementation of the LACD-SRN architecture from Nascimento et al. (2024) for license plate super-resolution, featuring progressive training, TensorBoard integration, and character-driven optimization.
+A PyTorch implementation of the LP-ASRN architecture from Nascimento et al. (2024) for license plate super-resolution, featuring progressive training, TensorBoard integration, and character-driven optimization.
 
 ## Overview
 
-LACD-SRN addresses the challenge of recognizing license plates from low-resolution surveillance footage by using a task-specific super-resolution approach. Unlike generic super-resolution methods that optimize for pixel-level metrics (PSNR, SSIM), LACD-SRN is explicitly designed to maximize license plate recognition accuracy.
+LP-ASRN addresses the challenge of recognizing license plates from low-resolution surveillance footage by using a task-specific super-resolution approach. Unlike generic super-resolution methods that optimize for pixel-level metrics (PSNR, SSIM), LP-ASRN is explicitly designed to maximize license plate recognition accuracy.
 
 ### Key Features
 
@@ -147,7 +147,7 @@ Metrics reported:
 
 ### Generator Network
 
-The LACD-SRN generator consists of:
+The LP-ASRN generator consists of:
 
 1. **Shallow Feature Extractor**: PixelUnshuffle → Conv → PixelShuffle auto-encoder
 2. **Deep Feature Extractor**: 16 Residual-in-Residual Dense Blocks with Enhanced Attention

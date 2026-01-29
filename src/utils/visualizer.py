@@ -1,5 +1,5 @@
 """
-Image Visualization Utilities for LACD-SRN
+Image Visualization Utilities for LP-ASRN
 
 Provides functions to create visualizations for TensorBoard logging,
 including comparison grids, attention visualizations, and confusion matrices.

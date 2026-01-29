@@ -1,5 +1,5 @@
 """
-Evaluation Script for LACD-SRN
+Evaluation Script for LP-ASRN
 
 Evaluates a trained super-resolution model on license plate data.
 Reports:
@@ -23,7 +23,7 @@ from src.ocr.confusion_tracker import ConfusionTracker
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Evaluate LACD-SRN")
+    parser = argparse.ArgumentParser(description="Evaluate LP-ASRN")
     parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument("--config", type=str, default="configs/lacd_srnn.yaml")
     parser.add_argument("--data-root", type=str, default="data/train")

@@ -1,5 +1,5 @@
 """
-Generator Network for LACD-SRN (Layout-Aware and Character-Driven Super-Resolution Network)
+Generator Network for LP-ASRN (License Plate Super-Resolution Network)
 
 Based on:
 - Nascimento et al. "Super-Resolution of License Plate Images Using Attention
@@ -357,7 +357,7 @@ class UpscalingModule(nn.Module):
 
 class Generator(nn.Module):
     """
-    LACD-SRN Generator Network.
+    LP-ASRN Generator Network.
 
     Complete super-resolution generator for license plate images.
 

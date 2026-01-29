@@ -1,4 +1,4 @@
-# LACD-SRN: Layout-Aware and Character-Driven Super-Resolution Network
+# LP-ASRN: License Plate Super-Resolution Network
 
 # Deep Learning Framework
 torch>=2.0.0

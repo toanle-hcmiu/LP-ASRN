@@ -1,5 +1,5 @@
 """
-Training Script for LACD-SRN
+Training Script for LP-ASRN
 
 Implements the training loop with stability features from the papers:
 - StepLR learning rate schedule (reduce by 0.9 every 5 epochs)
@@ -32,7 +32,7 @@ from src.ocr.confusion_tracker import ConfusionTracker, MetricsTracker
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train LACD-SRN")
+    parser = argparse.ArgumentParser(description="Train LP-ASRN")
     parser.add_argument("--config", type=str, default="configs/lacd_srnn.yaml")
     parser.add_argument("--data-root", type=str, default="data/train")
     parser.add_argument("--resume", type=str, default=None)

@@ -1,10 +1,10 @@
-# LACD-SRN Training Agents
+# LP-ASRN Training Agents
 
-This document describes the progressive training agents used in LACD-SRN and their configuration.
+This document describes the progressive training agents used in LP-ASRN and their configuration.
 
 ## Overview
 
-LACD-SRN uses a three-stage progressive training approach to optimize both image quality and character recognition accuracy. Each stage focuses on specific objectives, with the final stage achieving the best recognition performance.
+LP-ASRN uses a three-stage progressive training approach to optimize both image quality and character recognition accuracy. Each stage focuses on specific objectives, with the final stage achieving the best recognition performance.
 
 ---
 

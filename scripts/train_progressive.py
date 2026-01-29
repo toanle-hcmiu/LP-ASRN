@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """
-Progressive Training Script for LACD-SRN
+Progressive Training Script for LP-ASRN
 
 Implements three-stage progressive training with automatic TensorBoard startup.
 
@@ -103,7 +103,7 @@ class TensorBoardLauncher:
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Train LACD-SRN with progressive training"
+        description="Train LP-ASRN with progressive training"
     )
     parser.add_argument("--config", type=str, default="configs/lacd_srnn.yaml")
     parser.add_argument("--data-root", type=str, default="data/train")

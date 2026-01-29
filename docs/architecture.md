@@ -1,10 +1,10 @@
-# LACD-SRN Architecture
+# LP-ASRN Architecture
 
 Detailed architectural documentation for the Layout-Aware and Character-Driven Super-Resolution Network.
 
 ## Overview
 
-LACD-SRN (Layout-Aware and Character-Driven Super-Resolution Network) is a specialized super-resolution architecture designed specifically for license plate recognition. Unlike generic SR methods that optimize for pixel-level metrics, LACD-SRN incorporates character recognition supervision directly into the training process.
+LP-ASRN (License Plate Super-Resolution Network) is a specialized super-resolution architecture designed specifically for license plate recognition. Unlike generic SR methods that optimize for pixel-level metrics, LP-ASRN incorporates character recognition supervision directly into the training process.
 
 ---
 

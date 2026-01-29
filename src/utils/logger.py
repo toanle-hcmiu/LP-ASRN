@@ -1,5 +1,5 @@
 """
-TensorBoard Logger for LACD-SRN Training
+TensorBoard Logger for LP-ASRN Training
 
 Provides comprehensive logging for training metrics, images, histograms,
 and other visualizations for monitoring the training process.
@@ -24,7 +24,7 @@ except ImportError:
 
 class TensorBoardLogger:
     """
-    TensorBoard Logger for LACD-SRN training.
+    TensorBoard Logger for LP-ASRN training.
 
     Provides:
     - Scalar logging (losses, metrics, learning rates)

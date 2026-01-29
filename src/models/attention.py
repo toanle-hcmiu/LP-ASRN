@@ -1,5 +1,5 @@
 """
-Attention Modules for LACD-SRN
+Attention Modules for LP-ASRN
 
 Implements:
 1. Channel Attention - focuses on "what" features are important
@@ -239,7 +239,7 @@ class PixelShuffleAttention(nn.Module):
 
 class EnhancedAttentionModule(nn.Module):
     """
-    Enhanced Attention Module (EAM) from LACD-SRN.
+    Enhanced Attention Module (EAM) from LP-ASRN.
 
     Combines:
     1. Channel Attention - for inter-channel relationships
