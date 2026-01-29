@@ -37,9 +37,6 @@ cuda >= 11.7
 tensorboard >= 2.13
 tqdm
 pyyaml
-
-# OCR
-strq  # Parseq implementation
 ```
 
 Install all dependencies:
@@ -90,33 +87,16 @@ Each `annotations.json` should contain:
 
 ---
 
-## OCR Fine-tuning
+## OCR Model
 
-Before training the super-resolution model, fine-tune Parseq on your high-resolution license plate images.
+LP-ASRN uses SimpleCRNN for character recognition:
 
-### Why Fine-tune OCR?
+- **Architecture**: CNN feature extractor + Bidirectional LSTM
+- **Vocabulary**: 36 characters (0-9, A-Z) optimized for license plates
+- **Training**: Jointly trained with the generator during progressive training
+- **No pre-training needed**: SimpleCRNN learns from scratch on license plate data
 
-Parseq is pre-trained on general scene text. Fine-tuning on license plates:
-- Adapts to license plate fonts and styles
-- Learns the specific character vocabulary
-- Improves accuracy on the target domain
-
-### Fine-tuning Command
-
-```bash
-python scripts/finetune_parseq.py \
-    --data-root data/train \
-    --epochs 10 \
-    --batch-size 32 \
-    --lr 1e-4 \
-    --save-dir checkpoints/parseq
-```
-
-### Expected Results
-
-After fine-tuning, you should see:
-- Character accuracy > 95% on HR validation set
-- Word accuracy > 90% on HR validation set
+The OCR is automatically trained during the progressive training stages - no separate fine-tuning step required.
 
 ---
 
@@ -420,16 +400,13 @@ Metrics reported:
 ## Training Workflow Summary
 
 ```bash
-# 1. Fine-tune OCR on HR images
-python scripts/finetune_parseq.py --epochs 10
-
-# 2. Run progressive training (all stages)
+# 1. Run progressive training (all stages)
 python scripts/train_progressive.py --stage all
 
-# 3. Monitor in TensorBoard
+# 2. Monitor in TensorBoard
 # Open http://localhost:6007
 
-# 4. Evaluate final model
+# 3. Evaluate final model
 python scripts/evaluate.py --checkpoint checkpoints/lp_asrn/best.pth
 ```
 

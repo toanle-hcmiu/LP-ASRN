@@ -192,11 +192,26 @@ A(c) = β if c is letter
 
 ## OCR Integration
 
-### Parseq Model
+### SimpleCRNN Model
 
-- **Pre-trained**: baudm/parseq-base from HuggingFace
-- **Fine-tuned**: On HR license plate images
-- **Frozen during SR training**: Provides stable gradients
+- **Architecture**: CNN feature extractor + Bidirectional LSTM + CTC decoder
+- **Vocabulary**: 36 characters (0-9, A-Z) optimized for license plates
+- **Input**: Images of shape (B, 3, H, W) in range [0, 1]
+- **Output**: Logits of shape (B, max_length, vocab_size)
+
+#### Architecture Details
+
+1. **CNN Feature Extractor**:
+   - 3 Convolutional layers (64 → 128 → 256 filters)
+   - MaxPool2d after each layer
+   - ReLU activations
+
+2. **RNN Decoder**:
+   - Bidirectional LSTM (2 layers, 256 hidden units)
+   - Processes sequential features from CNN
+
+3. **Output Layer**:
+   - Linear projection to vocabulary size (36)
 
 ### OCR as Discriminator
 

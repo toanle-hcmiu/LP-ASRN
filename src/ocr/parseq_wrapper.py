@@ -208,31 +208,17 @@ class ParseqOCR(nn.Module):
         self.max_length = max_length
         self.frozen = frozen
 
-        # Try to load Parseq model
-        self.model = None
+        # Use SimpleCRNN model for license plate recognition
+        # Parseq's complex vocabulary (special tokens, 95+ classes) causes compatibility issues
+        self.model = SimpleCRNN(
+            vocab_size=len(vocab),
+            max_length=max_length,
+        )
         self.use_parseq = False
-        if PARSEQ_AVAILABLE:
-            try:
-                # Load Parseq via torch.hub
-                self.model = torch.hub.load('baudm/parseq', 'parseq', pretrained=True, trust_repo=True)
-                print(f"Loaded Parseq model via torch.hub")
-                self.use_parseq = True
-            except Exception as e:
-                print(f"Warning: Could not load Parseq model: {e}")
-                print("Creating a simple CNN+RNN model as fallback")
-                self.model = None
+        print("Using SimpleCRNN model for license plate recognition")
 
-        # Fallback to simple CRNN model
-        if self.model is None:
-            self.model = SimpleCRNN(
-                vocab_size=len(vocab),
-                max_length=max_length,
-            )
-            print("Using fallback CRNN model")
-            self.use_parseq = False
-
-        # Create tokenizer with Parseq vocab if using Parseq model
-        self.tokenizer = ParseqTokenizer(vocab, max_length, use_parseq_vocab=self.use_parseq)
+        # Create tokenizer without Parseq vocab
+        self.tokenizer = ParseqTokenizer(vocab, max_length, use_parseq_vocab=False)
 
         # Freeze weights if specified
         if frozen:

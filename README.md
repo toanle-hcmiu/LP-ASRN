@@ -18,7 +18,7 @@ LP-ASRN addresses the challenge of recognizing license plates from low-resolutio
 - **Layout and Character Oriented Focal Loss (LCOFL)**: Penalizes character confusion and layout violations
 - **Enhanced Attention Module**: Deformable convolutions for adaptive character feature extraction
 - **TensorBoard Integration**: Real-time visualization of metrics, images, and confusion matrices
-- **Parseq OCR**: State-of-the-art scene text recognition, fine-tuned on license plates
+- **SimpleCRNN OCR**: CNN+RNN architecture designed for license plate recognition with 36-character vocabulary
 - **Single Unified Model**: Handles both Brazilian (LLLNNNN) and Mercosur (LLLNLNN) layouts
 
 ## Results
@@ -51,29 +51,14 @@ pip install -r requirements.txt
 ### Quick Start
 
 ```bash
-# 1. Fine-tune Parseq on high-resolution license plates
-python scripts/finetune_parseq.py --epochs 10 --batch-size 32
-
-# 2. Train with progressive training (TensorBoard auto-starts on port 6007)
+# 1. Train with progressive training (TensorBoard auto-starts on port 6007)
 python scripts/train_progressive.py --stage all --config configs/lp_asrn.yaml
 
-# 3. Evaluate
+# 2. Evaluate
 python scripts/evaluate.py --checkpoint checkpoints/lp_asrn/best.pth
 ```
 
 ## Usage
-
-### Fine-tuning OCR
-
-Before training the super-resolution model, fine-tune Parseq on your high-resolution license plate images:
-
-```bash
-python scripts/finetune_parseq.py \
-    --data-root data/train \
-    --epochs 10 \
-    --batch-size 32 \
-    --save-dir checkpoints/parseq
-```
 
 ### Progressive Training
 
