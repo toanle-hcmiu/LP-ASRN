@@ -218,7 +218,7 @@ class LayoutPenalty(nn.Module):
         return char.isalpha()
 
     def forward(
-        self, pred_texts: List[str], gt_texts: List[str]
+        self, pred_texts: List[str], gt_texts: List[str], device: torch.device = torch.device("cpu")
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """
         Compute layout penalty.
@@ -226,6 +226,7 @@ class LayoutPenalty(nn.Module):
         Args:
             pred_texts: List of predicted texts
             gt_texts: List of ground truth texts
+            device: Device to create the penalty tensor on
 
         Returns:
             Penalty tensor and info dict
@@ -252,10 +253,11 @@ class LayoutPenalty(nn.Module):
                     total_penalty += self.beta
                     total_violations += 1
 
-        # Average over batch
+        # Average over batch - create tensor on specified device
         penalty = torch.tensor(
             total_penalty / len(pred_texts) if pred_texts else 0.0,
             dtype=torch.float32,
+            device=device,
         )
 
         return penalty, {
@@ -348,7 +350,7 @@ class LCOFL(nn.Module):
 
         # Layout Penalty (requires decoded predictions)
         if pred_texts is not None:
-            layout_loss, layout_info = self.layout_penalty(pred_texts, gt_texts)
+            layout_loss, layout_info = self.layout_penalty(pred_texts, gt_texts, device=sr_images.device)
             weighted_layout = self.lambda_layout * layout_loss
             losses.append(weighted_layout)
             info.update(layout_info)
