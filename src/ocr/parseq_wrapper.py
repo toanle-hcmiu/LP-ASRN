@@ -189,6 +189,9 @@ class ParseqOCR(nn.Module):
                 # Load Parseq via torch.hub
                 self.model = torch.hub.load('baudm/parseq', 'parseq', pretrained=True, trust_repo=True)
                 print(f"Loaded Parseq model via torch.hub")
+
+                # Replace Parseq's output layer to match our vocabulary
+                self._replace_parseq_head(vocab)
             except Exception as e:
                 print(f"Warning: Could not load Parseq model: {e}")
                 print("Creating a simple CNN+RNN model as fallback")
@@ -206,6 +209,69 @@ class ParseqOCR(nn.Module):
         if frozen:
             for param in self.parameters():
                 param.requires_grad = False
+
+    def _replace_parseq_head(self, vocab: str):
+        """
+        Replace Parseq's output layer to match our vocabulary.
+
+        Extracts weights for characters in our vocabulary from Parseq's
+        pretrained layer, preserving pretrained knowledge.
+
+        Args:
+            vocab: Target vocabulary string (e.g., "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+        """
+        # Parseq's default vocabulary (94 characters)
+        parseq_vocab = (
+            "0123456789"
+            "abcdefghijklmnopqrstuvwxyz"
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+            "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~"
+        )
+
+        # Create mapping: our_char_idx -> parseq_char_idx
+        vocab_mapping = []
+        for char in vocab:
+            if char in parseq_vocab:
+                vocab_mapping.append(parseq_vocab.index(char))
+            else:
+                # Character not in Parseq's vocab - use last index as fallback
+                vocab_mapping.append(len(parseq_vocab) - 1)
+
+        # Find and replace the head layer
+        # Parseq structure: model.decoder.head is a Linear layer
+        head_found = False
+        if hasattr(self.model, 'decoder'):
+            decoder = self.model.decoder
+            if hasattr(decoder, 'head'):
+                original_head = decoder.head
+
+                # Get dimensions
+                if hasattr(original_head, 'in_features') and hasattr(original_head, 'out_features'):
+                    in_features = original_head.in_features
+                    original_out_features = original_head.out_features
+                    out_features = len(vocab)  # Our vocab size (36)
+
+                    print(f"Replacing Parseq head: {original_out_features} -> {out_features} classes")
+                    print(f"Preserving pretrained weights for {len(vocab_mapping)} characters")
+
+                    # Create new head with correct output size
+                    new_head = nn.Linear(in_features, out_features)
+                    new_head = new_head.to(original_head.weight.device)
+
+                    # Initialize with corresponding weights from pretrained layer
+                    with torch.no_grad():
+                        for new_idx, old_idx in enumerate(vocab_mapping):
+                            if old_idx < original_out_features:
+                                new_head.weight[new_idx] = original_head.weight[old_idx].clone()
+                                new_head.bias[new_idx] = original_head.bias[old_idx].clone()
+
+                    # Replace the head
+                    self.model.decoder.head = new_head
+                    head_found = True
+                    print("Parseq head replaced successfully")
+
+        if not head_found:
+            print("Warning: Could not find Parseq head layer to replace. Model may not work correctly.")
 
     def forward(
         self,
