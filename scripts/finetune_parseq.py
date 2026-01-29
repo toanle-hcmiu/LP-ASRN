@@ -6,10 +6,14 @@ license plate images before using it for super-resolution training.
 """
 
 import argparse
+import sys
 import yaml
 from pathlib import Path
 
 import torch
+
+# Add project root to path
+sys.path.insert(0, str(Path(__file__).parent.parent))
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
