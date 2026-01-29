@@ -1,0 +1,173 @@
+# LACD-SRN Configuration
+# Layout-Aware and Character-Driven Super-Resolution Network
+
+model:
+  # Number of RRDB-EA blocks in the deep feature extractor
+  num_rrdb_blocks: 16
+
+  # Number of feature channels
+  num_filters: 64
+
+  # Upscaling factor (2 for 2x, 4 for 4x)
+  # Paper 2 uses 2x which achieved 49.8% recognition rate
+  upscale_factor: 2
+
+  # Use deformable convolutions in attention modules
+  use_deformable: true
+
+data:
+  # Scenarios to include in training
+  scenarios:
+    - "Scenario-A"  # Light degradation
+    - "Scenario-B"  # Heavy degradation
+
+  # Layouts to include
+  layouts:
+    - "Brazilian"   # LLLNNNN pattern
+    - "Mercosur"    # LLLNLNN pattern
+
+  # Target size for LR images (height, width)
+  lr_size: [17, 31]
+
+  # Batch size for training
+  batch_size: 16
+
+  # Number of data loading workers
+  num_workers: 4
+
+  # Validation split
+  val_split: 0.1
+
+training:
+  # Number of training epochs
+  epochs: 100
+
+  # Learning rate
+  lr: 0.0001
+
+  # Adam optimizer betas
+  beta1: 0.9
+  beta2: 0.999
+
+  # Gradient clipping for stability (prevents exploding gradients)
+  gradient_clip: 1.0
+
+  # StepLR learning rate schedule
+  # Reduces LR by this factor every lr_step_size epochs
+  # Paper 2 uses this to prevent oscillations
+  lr_scheduler: "StepLR"
+  lr_step_size: 5
+  lr_gamma: 0.9
+
+  # Early stopping patience (from Paper 1)
+  # Stops after 20 epochs without loss decrease
+  early_stop_patience: 20
+
+  # Monitor metric for early stopping
+  # "recognition_rate" monitors OCR accuracy (Paper 2 innovation)
+  # "loss" monitors total loss
+  monitor_metric: "recognition_rate"
+
+  # Checkpoint save directory
+  save_dir: "checkpoints/lacd_srnn"
+
+loss:
+  # Weight for layout penalty
+  lambda_layout: 0.5
+
+  # Weight for SSIM loss (from Paper 2)
+  lambda_ssim: 0.2
+
+  # Confusion weight increment (added to confused character weights)
+  alpha: 0.1
+
+  # Layout penalty value (for each digit/letter mismatch)
+  beta: 1.0
+
+ocr:
+  # OCR model type
+  model_type: "parseq"
+
+  # Pre-trained model path (HuggingFace model ID or local path)
+  pretrained_path: "baudm/parseq-base"
+
+  # Fine-tune Parseq on HR images before SR training
+  finetune_first: true
+
+  # Path to fine-tuned model (after fine-tuning)
+  finetuned_path: "checkpoints/parseq/best.pth"
+
+  # Keep OCR frozen during SR training (critical for stability)
+  freeze_ocr: true
+
+  # Maximum sequence length for OCR
+  max_length: 7
+
+  # Character vocabulary
+  vocab: "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+# Progressive Training Configuration
+progressive_training:
+  enabled: true
+
+  # Stage 1: Warm-up (L1 loss only)
+  # Purpose: Stabilize network before introducing complex losses
+  stage1:
+    name: "warmup"
+    epochs: 10
+    lr: 0.0001
+    loss_components: ["l1"]
+    freeze_ocr: true
+    update_confusion: false
+
+  # Stage 2: LCOFL Training (Character-driven loss)
+  # Purpose: Optimize for character recognition with frozen OCR
+  stage2:
+    name: "lcofl"
+    epochs: 50
+    lr: 0.0001
+    loss_components: ["l1", "lcofl"]
+    freeze_ocr: true
+    update_confusion: true
+
+  # Stage 3: Fine-tuning (Joint optimization)
+  # Purpose: Refine with unfrozen OCR for co-adaptation
+  stage3:
+    name: "finetune"
+    epochs: 20
+    lr: 0.00001  # Lower LR for joint training
+    loss_components: ["l1", "lcofl"]
+    freeze_ocr: false
+    update_confusion: true
+
+# TensorBoard Configuration
+tensorboard:
+  enabled: true
+  log_dir: "logs/tensorboard"
+  port: 6007
+
+  # Logging intervals
+  log_interval: 10      # Log scalars every N steps
+  log_images_every: 5   # Log images every N epochs
+  log_histograms_every: 10  # Log histograms every N epochs
+
+  # Maximum images to log per batch
+  max_images: 16
+
+# Evaluation settings
+evaluation:
+  # Batch size for evaluation
+  batch_size: 8
+
+  # Metrics to compute
+  metrics:
+    - "psnr"        # Peak Signal-to-Noise Ratio
+    - "ssim"        # Structural Similarity Index
+    - "char_acc"    # Character-level accuracy
+    - "word_acc"    # Word-level (full plate) accuracy
+
+  # Number of visualization samples
+  num_vis_samples: 10
+
+  # Visualization save directory
+  vis_dir: "results/visualizations"

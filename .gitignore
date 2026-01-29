@@ -1,0 +1,85 @@
+# LACD-SRN Git Ignore File
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv
+
+# PyTorch
+*.pth
+*.pt
+*.ckpt
+
+# TensorBoard
+logs/
+runs/
+
+# Checkpoints
+checkpoints/
+*.ckpt
+
+# Data
+data/train/*/
+!data/train/.gitkeep
+
+# Results
+results/
+outputs/
+visualizations/
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+*.ipynb
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Cache
+.cache/
+*.cache
+torchhub/
+
+# Hugging Face cache
+.huggingface/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+/data/train/
