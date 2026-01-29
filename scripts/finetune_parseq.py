@@ -87,7 +87,7 @@ def finetune(args):
     # Setup training
     optimizer = torch.optim.Adam(ocr.parameters(), lr=args.lr)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", factor=0.5, patience=3, verbose=True
+        optimizer, mode="min", factor=0.5, patience=3
     )
 
     criterion = nn.CrossEntropyLoss(ignore_index=0)

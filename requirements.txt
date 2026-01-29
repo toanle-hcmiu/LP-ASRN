@@ -7,8 +7,9 @@ torchvision>=0.15.0
 # OCR and Text Recognition
 timm>=0.9.0
 torchmetrics>=1.0.0
+pytorch-lightning>=2.0.0  # Required for Parseq OCR
 # Parseq is loaded via torch.hub (baudm/parseq)
-# No pip install required - automatically downloaded on first use
+# Automatically downloaded on first use
 
 # Image Processing
 Pillow>=10.0.0
