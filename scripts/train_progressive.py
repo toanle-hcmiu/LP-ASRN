@@ -5,7 +5,7 @@ Progressive Training Script for LP-ASRN
 Implements three-stage progressive training with automatic TensorBoard startup.
 
 Usage:
-    python scripts/train_progressive.py --stage all --config configs/lacd_srnn.yaml
+    python scripts/train_progressive.py --stage all --config configs/lp_asrn.yaml
 
 Stages:
     Stage 1 (warmup): L1 loss only, 5-10 epochs
@@ -105,7 +105,7 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="Train LP-ASRN with progressive training"
     )
-    parser.add_argument("--config", type=str, default="configs/lacd_srnn.yaml")
+    parser.add_argument("--config", type=str, default="configs/lp_asrn.yaml")
     parser.add_argument("--data-root", type=str, default="data/train")
     parser.add_argument("--resume", type=str, default=None)
 

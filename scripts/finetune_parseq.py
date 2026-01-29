@@ -21,7 +21,7 @@ from src.ocr.confusion_tracker import MetricsTracker
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Fine-tune Parseq on license plate data")
-    parser.add_argument("--config", type=str, default="configs/lacd_srnn.yaml")
+    parser.add_argument("--config", type=str, default="configs/lp_asrn.yaml")
     parser.add_argument("--data-root", type=str, default="data/train")
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=32)

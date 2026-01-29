@@ -144,7 +144,7 @@ LP-ASRN uses a three-stage progressive training approach for stability and perfo
 python scripts/train_progressive.py \
     --stage 1 \
     --epochs 10 \
-    --config configs/lacd_srnn.yaml
+    --config configs/lp_asrn.yaml
 ```
 
 ### Stage 2: LCOFL Training
@@ -168,7 +168,7 @@ python scripts/train_progressive.py \
 python scripts/train_progressive.py \
     --stage 2 \
     --resume checkpoints/stage1.pth \
-    --config configs/lacd_srnn.yaml
+    --config configs/lp_asrn.yaml
 ```
 
 ### Stage 3: Fine-tuning
@@ -191,7 +191,7 @@ python scripts/train_progressive.py \
 python scripts/train_progressive.py \
     --stage 3 \
     --resume checkpoints/stage2.pth \
-    --config configs/lacd_srnn.yaml
+    --config configs/lp_asrn.yaml
 ```
 
 ### Full Progressive Training
@@ -201,7 +201,7 @@ Run all stages sequentially:
 ```bash
 python scripts/train_progressive.py \
     --stage all \
-    --config configs/lacd_srnn.yaml \
+    --config configs/lp_asrn.yaml \
     --data-root data/train
 ```
 
@@ -381,7 +381,7 @@ loss:
 
 ### Checkpointing
 
-Checkpoints are saved to `checkpoints/lacd_srnn/`:
+Checkpoints are saved to `checkpoints/lp_asrn/`:
 - `best.pth`: Best model (highest word accuracy)
 - `stage_{name}_epoch_{N}.pth`: Per-epoch checkpoints
 
@@ -389,7 +389,7 @@ Checkpoints are saved to `checkpoints/lacd_srnn/`:
 ```bash
 python scripts/train_progressive.py \
     --stage 2 \
-    --resume checkpoints/lacd_srnn/best.pth
+    --resume checkpoints/lp_asrn/best.pth
 ```
 
 ### Evaluation
@@ -397,7 +397,7 @@ python scripts/train_progressive.py \
 Evaluate on test set:
 ```bash
 python scripts/evaluate.py \
-    --checkpoint checkpoints/lacd_srnn/best.pth \
+    --checkpoint checkpoints/lp_asrn/best.pth \
     --save-dir results/evaluation
 ```
 
@@ -430,7 +430,7 @@ python scripts/train_progressive.py --stage all
 # Open http://localhost:6007
 
 # 4. Evaluate final model
-python scripts/evaluate.py --checkpoint checkpoints/lacd_srnn/best.pth
+python scripts/evaluate.py --checkpoint checkpoints/lp_asrn/best.pth
 ```
 
 ---

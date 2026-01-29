@@ -145,7 +145,7 @@ class ProgressiveTrainer:
         self.metrics_tracker = MetricsTracker()
 
         # Save directory
-        self.save_dir = Path(config.get("training", {}).get("save_dir", "checkpoints/lacd_srnn"))
+        self.save_dir = Path(config.get("training", {}).get("save_dir", "checkpoints/lp_asrn"))
         self.save_dir.mkdir(parents=True, exist_ok=True)
 
     def set_stage(self, stage: TrainingStage):

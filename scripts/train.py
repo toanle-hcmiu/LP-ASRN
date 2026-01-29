@@ -33,7 +33,7 @@ from src.ocr.confusion_tracker import ConfusionTracker, MetricsTracker
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train LP-ASRN")
-    parser.add_argument("--config", type=str, default="configs/lacd_srnn.yaml")
+    parser.add_argument("--config", type=str, default="configs/lp_asrn.yaml")
     parser.add_argument("--data-root", type=str, default="data/train")
     parser.add_argument("--resume", type=str, default=None)
     parser.add_argument("--debug", action="store_true")
@@ -186,7 +186,7 @@ def main(args):
     ocr_config = config.get("ocr", {})
 
     # Create save directory
-    save_dir = Path(training_config.get("save_dir", "checkpoints/lacd_srnn"))
+    save_dir = Path(training_config.get("save_dir", "checkpoints/lp_asrn"))
     save_dir.mkdir(parents=True, exist_ok=True)
 
     # Save config

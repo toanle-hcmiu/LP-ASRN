@@ -55,10 +55,10 @@ pip install -r requirements.txt
 python scripts/finetune_parseq.py --epochs 10 --batch-size 32
 
 # 2. Train with progressive training (TensorBoard auto-starts on port 6007)
-python scripts/train_progressive.py --stage all --config configs/lacd_srnn.yaml
+python scripts/train_progressive.py --stage all --config configs/lp_asrn.yaml
 
 # 3. Evaluate
-python scripts/evaluate.py --checkpoint checkpoints/lacd_srnn/best.pth
+python scripts/evaluate.py --checkpoint checkpoints/lp_asrn/best.pth
 ```
 
 ## Usage
@@ -81,7 +81,7 @@ The progressive training approach consists of three stages:
 
 ```bash
 python scripts/train_progressive.py \
-    --config configs/lacd_srnn.yaml \
+    --config configs/lp_asrn.yaml \
     --stage all \
     --tb-port 6007
 ```
@@ -133,7 +133,7 @@ Visualizations:
 
 ```bash
 python scripts/evaluate.py \
-    --checkpoint checkpoints/lacd_srnn/best.pth \
+    --checkpoint checkpoints/lp_asrn/best.pth \
     --save-dir results/evaluation
 ```
 
@@ -201,7 +201,7 @@ Each track includes:
 
 ## Configuration
 
-Edit `configs/lacd_srnn.yaml` to customize:
+Edit `configs/lp_asrn.yaml` to customize:
 
 ```yaml
 model:
@@ -231,7 +231,7 @@ tensorboard:
 ```
 LP-ASRN/
 ├── configs/                 # Training configurations
-│   └── lacd_srnn.yaml
+│   └── lp_asrn.yaml
 ├── src/
 │   ├── data/               # Data loading
 │   │   └── lp_dataset.py

@@ -25,7 +25,7 @@ from src.ocr.confusion_tracker import ConfusionTracker
 def parse_args():
     parser = argparse.ArgumentParser(description="Evaluate LP-ASRN")
     parser.add_argument("--checkpoint", type=str, required=True)
-    parser.add_argument("--config", type=str, default="configs/lacd_srnn.yaml")
+    parser.add_argument("--config", type=str, default="configs/lp_asrn.yaml")
     parser.add_argument("--data-root", type=str, default="data/train")
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--device", type=str, default="cuda")

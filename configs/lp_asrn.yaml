@@ -69,7 +69,7 @@ training:
   monitor_metric: "recognition_rate"
 
   # Checkpoint save directory
-  save_dir: "checkpoints/lacd_srnn"
+  save_dir: "checkpoints/lp_asrn"
 
 loss:
   # Weight for layout penalty

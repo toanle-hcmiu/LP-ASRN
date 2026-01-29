@@ -223,7 +223,7 @@ python scripts/train_progressive.py --stage 3 --resume checkpoints/stage2.pth
 ### 3. Evaluation
 
 ```bash
-python scripts/evaluate.py --checkpoint checkpoints/lacd_srnn/best.pth
+python scripts/evaluate.py --checkpoint checkpoints/lp_asrn/best.pth
 ```
 
 ---
@@ -262,7 +262,7 @@ If word accuracy is low:
 
 ### Custom Stage Configurations
 
-You can modify stage configurations in `configs/lacd_srnn.yaml`:
+You can modify stage configurations in `configs/lp_asrn.yaml`:
 
 ```yaml
 progressive_training:
