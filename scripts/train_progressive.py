@@ -20,6 +20,7 @@ import signal
 import subprocess
 import sys
 import time
+import datetime
 from pathlib import Path
 from threading import Thread
 
@@ -139,7 +140,8 @@ def parse_args():
         help="Disable TensorBoard",
     )
     parser.add_argument("--tb-port", type=int, default=6007, help="TensorBoard port")
-    parser.add_argument("--tb-dir", type=str, default="logs/tensorboard")
+    parser.add_argument("--tb-dir", type=str, default=None, help="TensorBoard log directory (auto-timestamped if None)")
+    parser.add_argument("--save-dir", type=str, default=None, help="Checkpoint save directory (auto-timestamped if None)")
 
     # Training overrides
     parser.add_argument("--device", type=str, default="cuda")
@@ -184,11 +186,22 @@ def load_config(config_path: str, args) -> dict:
     if args.finetune_epochs:
         config["progressive_training"]["stage3"]["epochs"] = args.finetune_epochs
 
-    # Configure TensorBoard
+    # Configure TensorBoard with timestamped directory
+    if args.tb_dir is None:
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        args.tb_dir = f"logs/tensorboard/run_{timestamp}"
+
     config["tensorboard"] = {
         "enabled": args.tensorboard,
         "log_dir": args.tb_dir,
     }
+
+    # Configure checkpoint save_dir with timestamped directory
+    if args.save_dir is None:
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        args.save_dir = f"checkpoints/lp_asrn/run_{timestamp}"
+
+    config.setdefault("training", {})["save_dir"] = args.save_dir
 
     # Set device
     config["training"] = config.get("training", {})

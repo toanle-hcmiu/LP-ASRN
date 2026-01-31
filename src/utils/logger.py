@@ -6,6 +6,7 @@ and other visualizations for monitoring the training process.
 """
 
 import os
+import datetime
 from pathlib import Path
 from typing import Optional, Union, List
 
@@ -36,7 +37,7 @@ class TensorBoardLogger:
 
     def __init__(
         self,
-        log_dir: str = "logs/tensorboard",
+        log_dir: str = None,
         comment: str = "",
         purge_step: Optional[int] = None,
     ):
@@ -44,10 +45,15 @@ class TensorBoardLogger:
         Initialize TensorBoard Logger.
 
         Args:
-            log_dir: Directory for TensorBoard logs
+            log_dir: Directory for TensorBoard logs. If None, auto-generates timestamped path.
             comment: Comment suffix for log directory
             purge_step: Step from which to purge old logs
         """
+        # Auto-generate timestamped directory if not provided
+        if log_dir is None:
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            log_dir = f"logs/tensorboard/run_{timestamp}"
+
         self.log_dir = Path(log_dir)
         self.log_dir.mkdir(parents=True, exist_ok=True)
 

@@ -71,7 +71,8 @@ training:
   monitor_metric: "recognition_rate"
 
   # Checkpoint save directory
-  save_dir: "checkpoints/lp_asrn"
+  # Auto-formatted with timestamp at runtime: checkpoints/lp_asrn/run_YYYYMMDD_HHMMSS
+  save_dir: "checkpoints/lp_asrn/run_%Y%m%d_%H%M%S"
 
 loss:
   # Weight for LCOFL loss (character-driven loss)
@@ -159,7 +160,8 @@ progressive_training:
 # TensorBoard Configuration
 tensorboard:
   enabled: true
-  log_dir: "logs/tensorboard"
+  # Auto-formatted with timestamp at runtime: logs/tensorboard/run_YYYYMMDD_HHMMSS
+  log_dir: "logs/tensorboard/run_%Y%m%d_%H%M%S"
   port: 6007
 
   # Logging intervals
