@@ -120,7 +120,7 @@ progressive_training:
   # This ensures OCR can provide meaningful guidance to the generator
   stage0:
     name: "pretrain"
-    epochs: 20
+    epochs: 50    # Increased: OCR needs more time to learn from scratch
     lr: 0.0001
     loss_components: ["ocr"]
     freeze_ocr: false
@@ -130,7 +130,7 @@ progressive_training:
   # Purpose: Stabilize network before introducing complex losses
   stage1:
     name: "warmup"
-    epochs: 10
+    epochs: 10    # Sufficient for warm-up
     lr: 0.0001
     loss_components: ["l1"]
     freeze_ocr: true
@@ -140,7 +140,7 @@ progressive_training:
   # Purpose: Optimize for character recognition with frozen OCR
   stage2:
     name: "lcofl"
-    epochs: 50
+    epochs: 100   # Increased: model was still improving at epoch 60+
     lr: 0.0001
     loss_components: ["l1", "lcofl"]
     freeze_ocr: true
@@ -150,8 +150,8 @@ progressive_training:
   # Purpose: Refine with unfrozen OCR for co-adaptation
   stage3:
     name: "finetune"
-    epochs: 20
-    lr: 0.00001  # Lower LR for joint training
+    epochs: 50    # Increased: joint training needs more time
+    lr: 0.00001   # Lower LR for joint training
     loss_components: ["l1", "lcofl"]
     freeze_ocr: false
     update_confusion: true

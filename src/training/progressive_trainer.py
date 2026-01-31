@@ -277,21 +277,27 @@ class ProgressiveTrainer:
 
                 # Store first batch for visualization
                 if sample_batch is None and self.logger:
+                    # Get predictions for this batch
+                    pred_texts_batch = self.ocr.predict(sr_images)
+
                     sample_batch = {
                         "lr": lr_images,
                         "sr": sr_images,
                         "hr": hr_images,
                         "gt_texts": gt_texts,
+                        "pred_texts": pred_texts_batch,
                     }
 
                 # Compute PSNR/SSIM
                 for i in range(sr_images.shape[0]):
                     mse = torch.mean((sr_images[i] - hr_images[i]) ** 2)
-                    psnr = 20 * torch.log10(1.0 / torch.sqrt(mse + 1e-10))
+                    # Images are in [-1, 1] range, so max_value = 2.0
+                    psnr = 20 * torch.log10(2.0 / torch.sqrt(mse + 1e-10))
                     total_psnr += psnr.item()
 
-                    # SSIM (simplified)
-                    ssim = 1 - torch.mean(torch.abs(sr_images[i] - hr_images[i]))
+                    # SSIM (simplified) - normalize MAE from [-1, 1] to [0, 1]
+                    mae = torch.mean(torch.abs(sr_images[i] - hr_images[i]))
+                    ssim = 1.0 - (mae / 2.0)
                     total_ssim += ssim.item()
 
                 # OCR predictions
@@ -360,58 +366,39 @@ class ProgressiveTrainer:
 
         best_word_acc = 0.0
         self.epochs_without_improvement = 0
-        criterion = nn.CrossEntropyLoss(ignore_index=0)
 
         print(f"\n{'='*60}")
         print(f"OCR PRETRAINING STAGE")
         print(f"{'='*60}")
         print(f"Epochs: {stage_config.epochs}")
         print(f"Learning Rate: {stage_config.lr}")
+        print(f"Using CTC Loss: Yes")
         print(f"{'='*60}\n")
 
         for epoch in range(stage_config.epochs):
             total_loss = 0.0
-            correct = 0
-            total = 0
 
             pbar = tqdm(self.train_loader, desc=f"OCR Pretrain Epoch {epoch+1}/{stage_config.epochs}")
             for batch in pbar:
                 hr_images = batch["hr"].to(self.device)
                 gt_texts = batch["plate_text"]
 
-                # Encode ground truth texts
-                gt_indices = self.ocr.tokenizer.encode_batch(gt_texts).to(self.device)
-
                 # Forward pass
                 logits = self.ocr(hr_images, return_logits=True)
 
-                # Compute loss
-                B, K, C = logits.shape
-                logits_flat = logits.reshape(-1, C)
-                targets_flat = gt_indices.reshape(-1)
-
-                # Filter padding
-                mask = targets_flat > 0
-                if mask.sum() > 0:
-                    loss = criterion(logits_flat[mask], targets_flat[mask])
-                else:
-                    loss = torch.tensor(0.0, device=self.device)
+                # Compute CTC loss
+                loss = self.ocr.compute_ctc_loss(logits, gt_texts, device=self.device)
 
                 # Backward pass
                 self.optimizer.zero_grad()
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.ocr.parameters(), max_norm=1.0)
                 self.optimizer.step()
 
                 total_loss += loss.item()
                 pbar.set_postfix({"loss": loss.item()})
 
-                # Character-level accuracy
-                pred_indices = logits.argmax(dim=-1)
-                correct += (pred_indices == gt_indices).sum().item()
-                total += gt_indices.numel()
-
             avg_loss = total_loss / len(self.train_loader)
-            char_acc = correct / total if total > 0 else 0
 
             # Validation
             val_metrics = self.validate()
@@ -419,7 +406,6 @@ class ProgressiveTrainer:
             # Print results
             print(f"\nOCR Pretrain Epoch {epoch+1}/{stage_config.epochs}:")
             print(f"  Train Loss: {avg_loss:.4f}")
-            print(f"  Train Char Acc: {char_acc:.4f}")
             print(f"  Val PSNR: {val_metrics['psnr']:.2f} dB")
             print(f"  Val SSIM: {val_metrics['ssim']:.4f}")
             print(f"  Val Word Acc: {val_metrics['word_acc']:.4f}")
@@ -475,7 +461,7 @@ class ProgressiveTrainer:
                     batch["sr"],
                     batch["hr"],
                     batch["gt_texts"],
-                    val_metrics["pred_texts"],
+                    batch["pred_texts"],  # Use sample_batch predictions, not all validation predictions
                     max_images=8,
                 )
                 self.logger.log_image_grid(f"comparison/epoch_{epoch}", grid, epoch)
@@ -485,7 +471,7 @@ class ProgressiveTrainer:
                 sr_shape = getattr(batch.get("sr"), "shape", "N/A")
                 hr_shape = getattr(batch.get("hr"), "shape", "N/A")
                 gt_count = len(batch.get("gt_texts", []))
-                pred_count = len(val_metrics.get("pred_texts", []))
+                pred_count = len(batch.get("pred_texts", []))
                 print(f"Warning: Could not log images: {e}")
                 print(f"  Tensor shapes - LR: {lr_shape}, SR: {sr_shape}, HR: {hr_shape}")
                 print(f"  Text counts - GT: {gt_count}, Pred: {pred_count}")

@@ -110,10 +110,10 @@ LP-ASRN uses a four-stage progressive training approach for stability and perfor
 baseline recognition capability before super-resolution training begins.
 
 **Configuration**:
-- Loss: CrossEntropy (character-level)
+- Loss: CTC (Connectionist Temporal Classification)
 - OCR: Unfrozen (being trained)
 - Learning Rate: 1e-4
-- Duration: 20 epochs
+- Duration: 50 epochs
 
 **What happens**:
 - OCR learns to recognize license plates from HR images
@@ -136,7 +136,7 @@ python scripts/train_progressive.py \
 - Loss: L1 (pixel-level reconstruction)
 - OCR: Frozen
 - Learning Rate: 1e-4
-- Duration: 5-10 epochs
+- Duration: 10 epochs
 
 **What happens**:
 - Generator learns basic upsampling
@@ -159,7 +159,7 @@ python scripts/train_progressive.py \
 - Loss: L1 + LCOFL
 - OCR: Frozen (provides stable gradients)
 - Learning Rate: 1e-4
-- Duration: 50+ epochs
+- Duration: 100 epochs
 
 **What happens**:
 - Character-focused reconstruction
@@ -183,7 +183,7 @@ python scripts/train_progressive.py \
 - Loss: L1 + LCOFL
 - OCR: Unfrozen (joint training)
 - Learning Rate: 1e-5 (lower for stability)
-- Duration: 20+ epochs
+- Duration: 50 epochs
 
 **What happens**:
 - Co-adaptation of generator and OCR

@@ -90,15 +90,15 @@ python scripts/train_progressive.py --stage 3 --resume checkpoints/stage2.pth
 ### Training Stages
 
 0. **Stage 0: OCR Pretraining**
-   - Loss: CrossEntropy (character recognition)
+   - Loss: CTC (Connectionist Temporal Classification)
    - Purpose: Train OCR on HR images before SR training
-   - Duration: 20 epochs
+   - Duration: 50 epochs
    - OCR: Unfrozen (being trained)
 
 1. **Stage 1: Warm-up**
    - Loss: L1 (pixel reconstruction)
    - Purpose: Stabilize network before introducing complex losses
-   - Duration: 5-10 epochs
+   - Duration: 10 epochs
 
 2. **Stage 2: LCOFL Training**
    - Loss: L1 + LCOFL (character-driven)
@@ -206,16 +206,16 @@ model:
 
 progressive_training:
   stage0:
-    epochs: 20
+    epochs: 50    # OCR pretraining
     lr: 0.0001
   stage1:
-    epochs: 10
+    epochs: 10    # Warm-up
     lr: 0.0001
   stage2:
-    epochs: 50
+    epochs: 100   # LCOFL training
     lr: 0.0001
   stage3:
-    epochs: 20
+    epochs: 50    # Fine-tuning
     lr: 0.00001
 
 loss:

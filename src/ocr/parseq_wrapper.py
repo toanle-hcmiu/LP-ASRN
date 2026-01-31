@@ -213,9 +213,11 @@ class ParseqOCR(nn.Module):
         self.model = SimpleCRNN(
             vocab_size=len(vocab),
             max_length=max_length,
+            use_ctc=True,  # Enable CTC decoding
         )
         self.use_parseq = False
-        print("Using SimpleCRNN model for license plate recognition")
+        self.blank_idx = len(vocab)  # Blank token index for CTC
+        print("Using SimpleCRNN model with CTC decoding for license plate recognition")
 
         # Create tokenizer without Parseq vocab
         self.tokenizer = ParseqTokenizer(vocab, max_length, use_parseq_vocab=False)
@@ -389,11 +391,29 @@ class ParseqOCR(nn.Module):
         with torch.no_grad():
             logits = self.forward(images, return_logits=True)
 
-        # Decode predictions
-        pred_indices = logits.argmax(dim=-1)  # (B, max_length)
-        texts = self.tokenizer.decode_batch(pred_indices)
+        # Check if using SimpleCRNN with CTC
+        is_simple_crnn = isinstance(self.model, SimpleCRNN)
 
-        return texts
+        if is_simple_crnn and hasattr(self.model, 'use_ctc') and self.model.use_ctc:
+            # Use CTC beam search decoding
+            decoded_indices_list = self.model.ctc_decode_beam_search(logits, beam_width=5)
+
+            # Convert indices to characters
+            texts = []
+            for indices in decoded_indices_list:
+                text = ""
+                for idx in indices:
+                    if 0 <= idx < self.blank_idx:  # Valid character index
+                        char = self.tokenizer.idx_to_char.get(idx, "")
+                        if char in self.tokenizer.vocab:
+                            text += char
+                texts.append(text)
+            return texts
+        else:
+            # Decode predictions using simple argmax
+            pred_indices = logits.argmax(dim=-1)  # (B, max_length)
+            texts = self.tokenizer.decode_batch(pred_indices)
+            return texts
 
     def finetune(
         self,
@@ -509,6 +529,65 @@ class ParseqOCR(nn.Module):
         self.vocab = checkpoint["vocab"]
         self.max_length = checkpoint["max_length"]
 
+    def compute_ctc_loss(
+        self,
+        logits: torch.Tensor,
+        targets: List[str],
+        device: str = "cuda",
+    ) -> torch.Tensor:
+        """
+        Compute CTC loss for training.
+
+        Args:
+            logits: (B, T, C) predictions from model
+            targets: List of target text strings
+            device: Device to compute loss on
+
+        Returns:
+            CTC loss tensor
+        """
+        import torch.nn.functional as F
+
+        B, T, C = logits.shape
+
+        # Encode targets as indices
+        target_lengths = []
+        target_indices_list = []
+
+        for text in targets:
+            # Encode each character to its index
+            indices = [self.tokenizer.char_to_idx.get(c, 0) for c in text if c in self.tokenizer.char_to_idx]
+            target_indices_list.extend(indices)
+            target_lengths.append(len(indices))
+
+        if len(target_indices_list) == 0:
+            return torch.tensor(0.0, device=device, requires_grad=True)
+
+        target_indices = torch.tensor(target_indices_list, dtype=torch.long, device=device)
+        target_lengths = torch.tensor(target_lengths, dtype=torch.long, device=device)
+
+        # Input lengths are all T (logits sequence length)
+        input_lengths = torch.full((B,), T, dtype=torch.long, device=device)
+
+        # Log softmax for CTC
+        log_probs = F.log_softmax(logits, dim=-1)
+
+        # Transpose for CTC loss: (T, B, C)
+        log_probs = log_probs.transpose(0, 1)
+
+        # Compute CTC loss
+        ctc_loss = F.ctc_loss(
+            log_probs,
+            target_indices,
+            input_lengths,
+            target_lengths,
+            blank=self.blank_idx,
+            zero_infinity=True,
+            reduction='mean',
+        )
+
+        return ctc_loss
+
 
 class SimpleCRNN(nn.Module):
     """
@@ -517,22 +596,32 @@ class SimpleCRNN(nn.Module):
     Architecture: CNN feature extractor + Bidirectional LSTM + CTC decoder
     """
 
+    # Blank token for CTC
+    BLANK_TOKEN = "-"
+
     def __init__(
         self,
         vocab_size: int = 36,
         max_length: int = 7,
+        use_ctc: bool = True,
     ):
         """
         Initialize SimpleCRNN.
 
         Args:
-            vocab_size: Size of character vocabulary
+            vocab_size: Size of character vocabulary (excluding blank)
             max_length: Maximum sequence length
+            use_ctc: If True, use CTC decoding (adds blank token to vocab)
         """
         super().__init__()
 
         self.vocab_size = vocab_size
         self.max_length = max_length
+        self.use_ctc = use_ctc
+
+        # For CTC, output size is vocab_size + 1 (blank token)
+        self.output_size = vocab_size + 1 if use_ctc else vocab_size
+        self.blank_idx = vocab_size  # Blank is at the last index
 
         # CNN feature extractor
         self.cnn = nn.Sequential(
@@ -557,8 +646,8 @@ class SimpleCRNN(nn.Module):
             bidirectional=True,
         )
 
-        # Output projection
-        self.fc = nn.Linear(512, vocab_size)
+        # Output projection (includes blank token for CTC)
+        self.fc = nn.Linear(512, self.output_size)
 
     def forward(self, x: torch.Tensor, return_logits: bool = True) -> torch.Tensor:
         """
@@ -592,9 +681,103 @@ class SimpleCRNN(nn.Module):
         rnn_out, _ = self.rnn(features)  # (B, max_length, 512)
 
         # Output projection
-        logits = self.fc(rnn_out)  # (B, max_length, vocab_size)
+        logits = self.fc(rnn_out)  # (B, max_length, output_size)
 
         return logits
+
+    def ctc_decode_greedy(self, logits: torch.Tensor) -> List[str]:
+        """
+        Decode CTC logits using greedy decoding with blank removal.
+
+        Args:
+            logits: (B, T, C) predictions where C includes blank token
+
+        Returns:
+            List of decoded text strings
+        """
+        B, T, C = logits.shape
+
+        # Get predicted indices (greedy)
+        pred_indices = logits.argmax(dim=-1)  # (B, T)
+
+        results = []
+        for b in range(B):
+            # Remove blank tokens and consecutive duplicates (CTC decoding)
+            decoded = []
+            prev_idx = None
+
+            for t in range(T):
+                idx = pred_indices[b, t].item()
+
+                # Skip blank tokens
+                if idx == self.blank_idx:
+                    prev_idx = None  # Reset after blank
+                    continue
+
+                # Skip consecutive duplicates (CTC collapse)
+                if idx == prev_idx:
+                    continue
+
+                decoded.append(idx)
+                prev_idx = idx
+
+            # Convert indices to string (assuming 0-33 are valid characters)
+            # This will be handled by tokenizer in the wrapper
+            results.append(decoded)
+
+        return results
+
+    def ctc_decode_beam_search(self, logits: torch.Tensor, beam_width: int = 5) -> List[str]:
+        """
+        Decode CTC logits using beam search.
+
+        Args:
+            logits: (B, T, C) predictions where C includes blank token
+            beam_width: Number of beams to keep
+
+        Returns:
+            List of decoded text strings
+        """
+        B, T, C = logits.shape
+        log_probs = F.log_softmax(logits, dim=-1)
+
+        results = []
+        for b in range(B):
+            # Initialize beam with empty sequence
+            # Each beam entry: (sequence, log_prob, prev_idx)
+            beam = [([], 0.0, None)]  # (sequence, log_prob, prev_idx)
+
+            for t in range(T):
+                new_beam = []
+
+                for seq, log_prob, prev_idx in beam:
+                    # Top-k candidates at this timestep
+                    top_k_log_probs, top_k_indices = log_probs[b, t].topk(beam_width)
+
+                    for k in range(beam_width):
+                        idx = top_k_indices[k].item()
+                        prob = top_k_log_probs[k].item()
+
+                        # Skip consecutive duplicates (CTC constraint)
+                        if idx == prev_idx:
+                            continue
+
+                        new_seq = seq.copy()
+                        # Only add non-blank characters
+                        if idx != self.blank_idx:
+                            new_seq.append(idx)
+
+                        new_beam.append((new_seq, log_prob + prob, idx))
+
+                # Sort by log probability and keep top beams
+                new_beam.sort(key=lambda x: x[1], reverse=True)
+                beam = new_beam[:beam_width]
+
+            # Return best sequence (highest log prob)
+            best_seq = beam[0][0]
+            results.append(best_seq)
+
+        return results
 
 
 if __name__ == "__main__":
