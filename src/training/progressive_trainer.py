@@ -421,18 +421,20 @@ class ProgressiveTrainer:
         best_word_acc = 0.0
         self.epochs_without_improvement = 0
 
-        print(f"\n{'='*60}")
-        print(f"OCR PRETRAINING STAGE")
-        print(f"{'='*60}")
-        print(f"Epochs: {stage_config.epochs}")
-        print(f"Learning Rate: {stage_config.lr}")
-        print(f"Using CTC Loss: Yes")
-        print(f"{'='*60}\n")
+        if self.is_main:
+            print(f"\n{'='*60}")
+            print(f"OCR PRETRAINING STAGE")
+            print(f"{'='*60}")
+            print(f"Epochs: {stage_config.epochs}")
+            print(f"Learning Rate: {stage_config.lr}")
+            print(f"Using CTC Loss: Yes")
+            print(f"{'='*60}\n")
 
         for epoch in range(stage_config.epochs):
             total_loss = 0.0
 
-            pbar = tqdm(self.train_loader, desc=f"OCR Pretrain Epoch {epoch+1}/{stage_config.epochs}")
+            pbar = tqdm(self.train_loader, desc=f"OCR Pretrain Epoch {epoch+1}/{stage_config.epochs}",
+                       disable=not self.is_main)
             for batch in pbar:
                 hr_images = batch["hr"].to(self.device)
                 gt_texts = batch["plate_text"]
@@ -457,34 +459,38 @@ class ProgressiveTrainer:
             # Validation
             val_metrics = self.validate()
 
-            # Print results
-            print(f"\nOCR Pretrain Epoch {epoch+1}/{stage_config.epochs}:")
-            print(f"  Train Loss: {avg_loss:.4f}")
-            print(f"  Val PSNR: {val_metrics['psnr']:.2f} dB")
-            print(f"  Val SSIM: {val_metrics['ssim']:.4f}")
-            print(f"  Val Word Acc: {val_metrics['word_acc']:.4f}")
-            print(f"  Val Char Acc: {val_metrics['char_acc']:.4f}")
+            # Print results (only rank 0)
+            if self.is_main:
+                print(f"\nOCR Pretrain Epoch {epoch+1}/{stage_config.epochs}:")
+                print(f"  Train Loss: {avg_loss:.4f}")
+                print(f"  Val PSNR: {val_metrics['psnr']:.2f} dB")
+                print(f"  Val SSIM: {val_metrics['ssim']:.4f}")
+                print(f"  Val Word Acc: {val_metrics['word_acc']:.4f}")
+                print(f"  Val Char Acc: {val_metrics['char_acc']:.4f}")
 
             # Save best model
             if val_metrics['word_acc'] > best_word_acc:
                 best_word_acc = val_metrics['word_acc']
                 self.epochs_without_improvement = 0
                 self.save_ocr_checkpoint(epoch, TrainingStage.PRETRAIN)
-                print(f"  ✓ New best OCR: word_acc={val_metrics['word_acc']:.4f}")
+                if self.is_main:
+                    print(f"  ✓ New best OCR: word_acc={val_metrics['word_acc']:.4f}")
             else:
                 self.epochs_without_improvement += 1
 
             # Early stopping
             patience = self.config.get("training", {}).get("early_stop_patience", 20)
             if self.epochs_without_improvement >= patience:
-                print(f"Early stopping after {patience} epochs without improvement")
+                if self.is_main:
+                    print(f"Early stopping after {patience} epochs without improvement")
                 break
 
         # Freeze OCR after pretraining for subsequent stages
         for param in self.ocr.parameters():
             param.requires_grad = False
 
-        print(f"\nOCR Pretraining complete. Best word accuracy: {best_word_acc:.4f}\n")
+        if self.is_main:
+            print(f"\nOCR Pretraining complete. Best word accuracy: {best_word_acc:.4f}\n")
 
         return best_word_acc
 
@@ -521,14 +527,15 @@ class ProgressiveTrainer:
                 self.logger.log_image_grid(f"comparison/epoch_{epoch}", grid, epoch)
             except Exception as e:
                 # Log detailed error information with tensor shapes
-                lr_shape = getattr(batch.get("lr"), "shape", "N/A")
-                sr_shape = getattr(batch.get("sr"), "shape", "N/A")
-                hr_shape = getattr(batch.get("hr"), "shape", "N/A")
-                gt_count = len(batch.get("gt_texts", []))
-                pred_count = len(batch.get("pred_texts", []))
-                print(f"Warning: Could not log images: {e}")
-                print(f"  Tensor shapes - LR: {lr_shape}, SR: {sr_shape}, HR: {hr_shape}")
-                print(f"  Text counts - GT: {gt_count}, Pred: {pred_count}")
+                if self.is_main:
+                    lr_shape = getattr(batch.get("lr"), "shape", "N/A")
+                    sr_shape = getattr(batch.get("sr"), "shape", "N/A")
+                    hr_shape = getattr(batch.get("hr"), "shape", "N/A")
+                    gt_count = len(batch.get("gt_texts", []))
+                    pred_count = len(batch.get("pred_texts", []))
+                    print(f"Warning: Could not log images: {e}")
+                    print(f"  Tensor shapes - LR: {lr_shape}, SR: {sr_shape}, HR: {hr_shape}")
+                    print(f"  Text counts - GT: {gt_count}, Pred: {pred_count}")
 
         # Log confusion matrix
         if epoch % 5 == 0 and self.current_stage in [TrainingStage.LCOFL, TrainingStage.FINETUNE]:
@@ -541,7 +548,8 @@ class ProgressiveTrainer:
                     epoch,
                 )
             except Exception as e:
-                print(f"Warning: Could not log confusion matrix: {e}")
+                if self.is_main:
+                    print(f"Warning: Could not log confusion matrix: {e}")
 
     def train_stage(self, stage: TrainingStage) -> float:
         """Train a specific stage."""
@@ -582,13 +590,14 @@ class ProgressiveTrainer:
             # Log to TensorBoard
             self.log_to_tensorboard(train_metrics, val_metrics, epoch)
 
-            # Print results
-            print(f"Epoch {current_global_epoch + 1}:")
-            print(f"  Train Loss: {train_metrics['loss']:.4f}")
-            print(f"  Val PSNR: {val_metrics['psnr']:.2f} dB")
-            print(f"  Val SSIM: {val_metrics['ssim']:.4f}")
-            print(f"  Val Word Acc: {val_metrics['word_acc']:.4f}")
-            print(f"  Val Char Acc: {val_metrics['char_acc']:.4f}")
+            # Print results (only rank 0)
+            if self.is_main:
+                print(f"Epoch {current_global_epoch + 1}:")
+                print(f"  Train Loss: {train_metrics['loss']:.4f}")
+                print(f"  Val PSNR: {val_metrics['psnr']:.2f} dB")
+                print(f"  Val SSIM: {val_metrics['ssim']:.4f}")
+                print(f"  Val Word Acc: {val_metrics['word_acc']:.4f}")
+                print(f"  Val Char Acc: {val_metrics['char_acc']:.4f}")
 
             # Update best model
             if val_metrics['word_acc'] > self.best_word_acc:
@@ -596,7 +605,8 @@ class ProgressiveTrainer:
                 self.epochs_without_improvement = 0
 
                 self.save_checkpoint(current_global_epoch, stage)
-                print(f"  ✓ New best model: word_acc={val_metrics['word_acc']:.4f}")
+                if self.is_main:
+                    print(f"  ✓ New best model: word_acc={val_metrics['word_acc']:.4f}")
             else:
                 self.epochs_without_improvement += 1
 
@@ -606,7 +616,8 @@ class ProgressiveTrainer:
             # Early stopping
             patience = self.config.get("training", {}).get("early_stop_patience", 20)
             if self.epochs_without_improvement >= patience:
-                print(f"Early stopping after {patience} epochs without improvement")
+                if self.is_main:
+                    print(f"Early stopping after {patience} epochs without improvement")
                 break
 
         self.global_epoch = start_epoch + config.epochs
@@ -657,48 +668,54 @@ class ProgressiveTrainer:
         """Train all stages sequentially."""
         results = {}
 
-        print("\n" + "=" * 60)
-        print("PROGRESSIVE TRAINING START")
-        print("=" * 60 + "\n")
+        if self.is_main:
+            print("\n" + "=" * 60)
+            print("PROGRESSIVE TRAINING START")
+            print("=" * 60 + "\n")
 
         # Stage 0: OCR Pretraining
-        print("\nStage 0: OCR Pretraining")
-        print("Purpose: Train OCR model on license plate data")
-        print("This ensures OCR can provide meaningful guidance to the generator")
+        if self.is_main:
+            print("\nStage 0: OCR Pretraining")
+            print("Purpose: Train OCR model on license plate data")
+            print("This ensures OCR can provide meaningful guidance to the generator")
         best_acc_stage0 = self.train_pretrain_stage(
             self.stage_configs[TrainingStage.PRETRAIN]
         )
         results["stage0_best_acc"] = best_acc_stage0
 
         # Stage 1: Warm-up
-        print("\nStage 1: Warm-up (L1 loss only)")
-        print("Purpose: Stabilize network with simple reconstruction loss")
+        if self.is_main:
+            print("\nStage 1: Warm-up (L1 loss only)")
+            print("Purpose: Stabilize network with simple reconstruction loss")
         best_acc_stage1 = self.train_stage(TrainingStage.WARMUP)
         results["stage1_best_acc"] = best_acc_stage1
 
         # Stage 2: LCOFL
-        print("\nStage 2: LCOFL Training (Character-driven loss)")
-        print("Purpose: Optimize for character recognition with frozen OCR")
+        if self.is_main:
+            print("\nStage 2: LCOFL Training (Character-driven loss)")
+            print("Purpose: Optimize for character recognition with frozen OCR")
         best_acc_stage2 = self.train_stage(TrainingStage.LCOFL)
         results["stage2_best_acc"] = best_acc_stage2
 
         # Stage 3: Fine-tuning
-        print("\nStage 3: Fine-tuning (Joint optimization)")
-        print("Purpose: Refine with unfrozen OCR for joint training")
+        if self.is_main:
+            print("\nStage 3: Fine-tuning (Joint optimization)")
+            print("Purpose: Refine with unfrozen OCR for joint training")
         best_acc_stage3 = self.train_stage(TrainingStage.FINETUNE)
         results["stage3_best_acc"] = best_acc_stage3
 
         # Save final results
         results["final_best_acc"] = self.best_word_acc
 
-        with open(self.save_dir / "progressive_results.json", "w") as f:
-            json.dump(results, f, indent=2)
+        if self.is_main:
+            with open(self.save_dir / "progressive_results.json", "w") as f:
+                json.dump(results, f, indent=2)
 
-        print("\n" + "=" * 60)
-        print("PROGRESSIVE TRAINING COMPLETE")
-        print("=" * 60)
-        print(f"\nFinal Best Word Accuracy: {self.best_word_acc:.4f}")
-        print(f"Results saved to: {self.save_dir}")
+            print("\n" + "=" * 60)
+            print("PROGRESSIVE TRAINING COMPLETE")
+            print("=" * 60)
+            print(f"\nFinal Best Word Accuracy: {self.best_word_acc:.4f}")
+            print(f"Results saved to: {self.save_dir}")
 
         return results
 
