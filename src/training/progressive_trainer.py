@@ -418,7 +418,8 @@ class ProgressiveTrainer:
         # Create optimizer for OCR only
         self.optimizer = optim.Adam(self.ocr.parameters(), lr=stage_config.lr)
 
-        best_word_acc = 0.0
+        # Use char_acc for early stopping (more granular than word_acc)
+        best_char_acc = 0.0
         self.epochs_without_improvement = 0
 
         if self.is_main:
@@ -473,13 +474,13 @@ class ProgressiveTrainer:
                 print(f"  Val Word Acc: {val_metrics['word_acc']:.4f}")
                 print(f"  Val Char Acc: {val_metrics['char_acc']:.4f}")
 
-            # Save best model
-            if val_metrics['word_acc'] > best_word_acc:
-                best_word_acc = val_metrics['word_acc']
+            # Save best model (using char_acc for early stopping)
+            if val_metrics['char_acc'] > best_char_acc:
+                best_char_acc = val_metrics['char_acc']
                 self.epochs_without_improvement = 0
                 self.save_ocr_checkpoint(epoch, TrainingStage.PRETRAIN)
                 if self.is_main:
-                    print(f"  ✓ New best OCR: word_acc={val_metrics['word_acc']:.4f}")
+                    print(f"  ✓ New best OCR: char_acc={val_metrics['char_acc']:.4f}, word_acc={val_metrics['word_acc']:.4f}")
             else:
                 self.epochs_without_improvement += 1
 
@@ -495,9 +496,9 @@ class ProgressiveTrainer:
             param.requires_grad = False
 
         if self.is_main:
-            print(f"\nOCR Pretraining complete. Best word accuracy: {best_word_acc:.4f}\n")
+            print(f"\nOCR Pretraining complete. Best char accuracy: {best_char_acc:.4f}\n")
 
-        return best_word_acc
+        return best_char_acc
 
     def log_to_tensorboard(
         self,
@@ -542,8 +543,8 @@ class ProgressiveTrainer:
                     print(f"  Tensor shapes - LR: {lr_shape}, SR: {sr_shape}, HR: {hr_shape}")
                     print(f"  Text counts - GT: {gt_count}, Pred: {pred_count}")
 
-        # Log confusion matrix
-        if epoch % 5 == 0 and self.current_stage in [TrainingStage.LCOFL, TrainingStage.FINETUNE]:
+        # Log confusion matrix (only main rank has pred_texts)
+        if epoch % 5 == 0 and self.current_stage in [TrainingStage.LCOFL, TrainingStage.FINETUNE] and self.is_main:
             self.confusion_tracker.update(val_metrics["pred_texts"], val_metrics["gt_texts"])
             try:
                 labels = list(self.config["ocr"]["vocab"])
@@ -592,8 +593,8 @@ class ProgressiveTrainer:
             if self.distributed:
                 dist.barrier()
 
-            # Update confusion if needed
-            if config.update_confusion:
+            # Update confusion if needed (only main rank has pred_texts)
+            if config.update_confusion and self.is_main:
                 self.confusion_tracker.update(val_metrics["pred_texts"], val_metrics["gt_texts"])
                 self.lcofl_loss.update_weights(self.confusion_tracker.confusion_matrix)
 
