@@ -445,6 +445,9 @@ class ProgressiveTrainer:
             print(f"Using CTC Loss: Yes")
             print(f"{'='*60}\n")
 
+        # Track step counter for OCR pretraining
+        ocr_step = 0
+
         for epoch in range(stage_config.epochs):
             total_loss = 0.0
 
@@ -469,6 +472,14 @@ class ProgressiveTrainer:
                 total_loss += loss.item()
                 pbar.set_postfix({"loss": loss.item()})
 
+                # Log training loss to TensorBoard (every 10 steps)
+                if self.logger and self.is_main and ocr_step % 10 == 0:
+                    self.logger.log_scalar("stage0/train_loss", loss.item(), ocr_step)
+                    current_lr = self.optimizer.param_groups[0]['lr']
+                    self.logger.log_scalar("stage0/lr", current_lr, ocr_step)
+
+                ocr_step += 1
+
             avg_loss = total_loss / len(self.train_loader)
 
             # Synchronize all ranks before validation
@@ -483,6 +494,19 @@ class ProgressiveTrainer:
             # Without this, Rank 1 continues while Rank 0 is still validating, causing NCCL timeout
             if self.distributed:
                 dist.barrier()
+
+            # Log validation metrics to TensorBoard
+            if self.logger and self.is_main:
+                stage_prefix = "stage0"
+                self.logger.log_scalar(f"{stage_prefix}/val_loss", avg_loss, epoch)
+                self.logger.log_scalar(f"{stage_prefix}/val_char_acc", val_metrics['char_acc'], epoch)
+                self.logger.log_scalar(f"{stage_prefix}/val_word_acc", val_metrics['word_acc'], epoch)
+                self.logger.log_scalar(f"{stage_prefix}/val_psnr", val_metrics['psnr'], epoch)
+                self.logger.log_scalar(f"{stage_prefix}/val_ssim", val_metrics['ssim'], epoch)
+
+                # Log OCR predictions visualization (every 5 epochs)
+                if epoch % 5 == 0 and val_metrics.get("sample_batch"):
+                    self._log_ocr_predictions(val_metrics["sample_batch"], epoch)
 
             # Print results (only rank 0)
             if self.is_main:
@@ -522,26 +546,196 @@ class ProgressiveTrainer:
 
         return best_char_acc
 
+    def _log_ocr_predictions(
+        self,
+        batch: Dict,
+        epoch: int,
+        max_images: int = 8,
+    ):
+        """
+        Log OCR predictions visualization to TensorBoard.
+
+        Shows HR images with ground truth and predicted text overlays.
+
+        Args:
+            batch: Batch containing hr_images, gt_texts, pred_texts
+            epoch: Current epoch number
+            max_images: Maximum number of images to log
+        """
+        if not self.logger:
+            return
+
+        try:
+            import matplotlib.pyplot as plt
+            import matplotlib.patches as patches
+            from torchvision.utils import make_grid
+
+            hr_images = batch["hr"]
+            gt_texts = batch["gt_texts"]
+            pred_texts = batch["pred_texts"]
+
+            # Limit number of images
+            n_images = min(len(gt_texts), max_images)
+
+            # Create figure with subplots
+            fig, axes = plt.subplots(n_images, 1, figsize=(12, 2 * n_images))
+            if n_images == 1:
+                axes = [axes]
+
+            for i in range(n_images):
+                # Get image and convert to numpy
+                img = hr_images[i].cpu()
+                img = img.permute(1, 2, 0).numpy()
+
+                # Ensure range [0, 1]
+                if img.min() < 0:
+                    img = (img + 1.0) / 2.0
+                img = img.clip(0, 1)
+
+                # Display image
+                axes[i].imshow(img, cmap='gray' if img.shape[-1] == 1 else None)
+                axes[i].axis('off')
+
+                # Add text annotations
+                gt = gt_texts[i] if i < len(gt_texts) else ""
+                pred = pred_texts[i] if i < len(pred_texts) else ""
+
+                # Color code: green if correct, red if wrong
+                color = 'green' if gt == pred else 'red'
+
+                title = f"GT: {gt} | Pred: {pred}"
+                axes[i].set_title(title, color=color, fontsize=12, fontweight='bold')
+
+            plt.tight_layout()
+            self.logger.log_figure(f"stage0/ocr_predictions_epoch_{epoch}", fig, epoch)
+            plt.close(fig)
+
+        except Exception as e:
+            if self.is_main:
+                print(f"Warning: Could not log OCR predictions: {e}")
+
+    def _log_sr_ocr_predictions(
+        self,
+        batch: Dict,
+        epoch: int,
+        max_images: int = 4,
+    ):
+        """
+        Log SR+OCR predictions visualization to TensorBoard.
+
+        Shows LR -> SR -> HR progression with OCR predictions.
+
+        Args:
+            batch: Batch containing lr, sr, hr, gt_texts, pred_texts
+            epoch: Current epoch number
+            max_images: Maximum number of images to log
+        """
+        if not self.logger:
+            return
+
+        try:
+            import matplotlib.pyplot as plt
+
+            lr_images = batch["lr"]
+            sr_images = batch["sr"]
+            hr_images = batch["hr"]
+            gt_texts = batch["gt_texts"]
+            pred_texts = batch["pred_texts"]
+
+            # Limit number of images
+            n_images = min(len(gt_texts), max_images)
+
+            # Create figure: each row shows LR -> SR -> HR
+            fig, axes = plt.subplots(n_images, 3, figsize=(15, 4 * n_images))
+            if n_images == 1:
+                axes = axes.reshape(1, -1)
+
+            for i in range(n_images):
+                # Get images and convert to numpy
+                lr = lr_images[i].cpu().permute(1, 2, 0).numpy()
+                sr = sr_images[i].cpu().permute(1, 2, 0).numpy()
+                hr = hr_images[i].cpu().permute(1, 2, 0).numpy()
+
+                # Ensure range [0, 1]
+                for img in [lr, sr, hr]:
+                    if img.min() < 0:
+                        img = (img + 1.0) / 2.0
+                    img.clip(0, 1, out=img)
+
+                # Display LR
+                axes[i, 0].imshow(lr, cmap='gray' if lr.shape[-1] == 1 else None)
+                axes[i, 0].set_title("LR Input", fontsize=10)
+                axes[i, 0].axis('off')
+
+                # Display SR with OCR prediction
+                axes[i, 1].imshow(sr, cmap='gray' if sr.shape[-1] == 1 else None)
+                pred = pred_texts[i] if i < len(pred_texts) else ""
+                axes[i, 1].set_title(f"SR Output\nOCR: {pred}", fontsize=10, color='blue')
+                axes[i, 1].axis('off')
+
+                # Display HR with ground truth
+                axes[i, 2].imshow(hr, cmap='gray' if hr.shape[-1] == 1 else None)
+                gt = gt_texts[i] if i < len(gt_texts) else ""
+                color = 'green' if gt == pred else 'red'
+                axes[i, 2].set_title(f"HR Ground Truth\nGT: {gt}", fontsize=10, color=color)
+                axes[i, 2].axis('off')
+
+            stage_to_name = {
+                TrainingStage.WARMUP: "Stage1_Warmup",
+                TrainingStage.LCOFL: "Stage2_LCOFL",
+                TrainingStage.FINETUNE: "Stage3_Finetune",
+            }
+            stage_name = stage_to_name.get(self.current_stage, "SR")
+
+            plt.suptitle(f"{stage_name} - SR+OCR Results (Epoch {epoch})", fontsize=14, fontweight='bold')
+            plt.tight_layout()
+            self.logger.log_figure(f"{stage_name.lower()}/sr_ocr_predictions_epoch_{epoch}", fig, epoch)
+            plt.close(fig)
+
+        except Exception as e:
+            if self.is_main:
+                print(f"Warning: Could not log SR+OCR predictions: {e}")
+
     def log_to_tensorboard(
         self,
         train_metrics: Dict,
         val_metrics: Dict,
         epoch: int,
     ):
-        """Log metrics to TensorBoard."""
+        """Log metrics to TensorBoard with stage-prefixed names."""
         if not self.logger:
             return
 
-        # Log scalars
-        self.logger.log_scalars(train_metrics, epoch, "train")
-        self.logger.log_scalars(val_metrics, epoch, "val")
+        # Get stage prefix for organized logging
+        stage_to_prefix = {
+            TrainingStage.PRETRAIN: "stage0_ocr",
+            TrainingStage.WARMUP: "stage1_warmup",
+            TrainingStage.LCOFL: "stage2_lcofl",
+            TrainingStage.FINETUNE: "stage3_finetune",
+        }
+        stage_prefix = stage_to_prefix.get(self.current_stage, f"stage_{self.current_stage.value}")
 
-        # Log model weights
+        # Log training metrics with stage prefix
+        for key, value in train_metrics.items():
+            if isinstance(value, (int, float)):
+                self.logger.log_scalar(f"{stage_prefix}/train_{key}", value, epoch)
+
+        # Log validation metrics with stage prefix
+        for key, value in val_metrics.items():
+            if isinstance(value, (int, float)):
+                self.logger.log_scalar(f"{stage_prefix}/val_{key}", value, epoch)
+
+        # Log learning rate
+        if hasattr(self, 'optimizer') and self.optimizer:
+            current_lr = self.optimizer.param_groups[0]['lr']
+            self.logger.log_scalar(f"{stage_prefix}/learning_rate", current_lr, epoch)
+
+        # Log model weights (less frequently)
         if epoch % 10 == 0:
-            self.logger.log_model_weights(self.generator, epoch)
+            self.logger.log_model_weights(self.generator, epoch, prefix=stage_prefix)
 
-        # Log comparison images
-        if val_metrics.get("sample_batch") and epoch % 5 == 0:
+        # Log comparison images for SR stages (not OCR pretraining)
+        if val_metrics.get("sample_batch") and epoch % 5 == 0 and self.current_stage != TrainingStage.PRETRAIN:
             batch = val_metrics["sample_batch"]
             try:
                 grid = create_comparison_grid(
@@ -549,23 +743,15 @@ class ProgressiveTrainer:
                     batch["sr"],
                     batch["hr"],
                     batch["gt_texts"],
-                    batch["pred_texts"],  # Use sample_batch predictions, not all validation predictions
+                    batch["pred_texts"],
                     max_images=8,
                 )
-                self.logger.log_image_grid(f"comparison/epoch_{epoch}", grid, epoch)
+                self.logger.log_image_grid(f"{stage_prefix}/comparison_epoch_{epoch}", grid, epoch)
             except Exception as e:
-                # Log detailed error information with tensor shapes
                 if self.is_main:
-                    lr_shape = getattr(batch.get("lr"), "shape", "N/A")
-                    sr_shape = getattr(batch.get("sr"), "shape", "N/A")
-                    hr_shape = getattr(batch.get("hr"), "shape", "N/A")
-                    gt_count = len(batch.get("gt_texts", []))
-                    pred_count = len(batch.get("pred_texts", []))
-                    print(f"Warning: Could not log images: {e}")
-                    print(f"  Tensor shapes - LR: {lr_shape}, SR: {sr_shape}, HR: {hr_shape}")
-                    print(f"  Text counts - GT: {gt_count}, Pred: {pred_count}")
+                    print(f"Warning: Could not log comparison images: {e}")
 
-        # Log confusion matrix (only main rank has pred_texts)
+        # Log confusion matrix for LCOFL and finetune stages
         if epoch % 5 == 0 and self.current_stage in [TrainingStage.LCOFL, TrainingStage.FINETUNE] and self.is_main:
             self.confusion_tracker.update(val_metrics["pred_texts"], val_metrics["gt_texts"])
             try:
@@ -574,10 +760,16 @@ class ProgressiveTrainer:
                     self.confusion_tracker.confusion_matrix,
                     labels,
                     epoch,
+                    tag=f"{stage_prefix}/confusion_matrix",
                 )
             except Exception as e:
                 if self.is_main:
                     print(f"Warning: Could not log confusion matrix: {e}")
+
+        # Log OCR predictions for LCOFL and finetune stages
+        if epoch % 5 == 0 and self.current_stage in [TrainingStage.LCOFL, TrainingStage.FINETUNE] and self.is_main:
+            if val_metrics.get("sample_batch"):
+                self._log_sr_ocr_predictions(val_metrics["sample_batch"], epoch)
 
     def train_stage(self, stage: TrainingStage) -> float:
         """Train a specific stage."""

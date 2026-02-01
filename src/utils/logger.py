@@ -307,6 +307,7 @@ class TensorBoardLogger:
         self,
         model: nn.Module,
         step: Optional[int] = None,
+        prefix: str = "",
     ):
         """
         Log all model weights as histograms.
@@ -314,13 +315,15 @@ class TensorBoardLogger:
         Args:
             model: PyTorch model
             step: Global step
+            prefix: Prefix for histogram names (e.g., stage name)
         """
         if step is None:
             step = self.global_step
 
         for name, param in model.named_parameters():
             if param.requires_grad and param.data is not None:
-                self.writer.add_histogram(f"weights/{name}", param.data, step)
+                tag = f"{prefix}/weights/{name}" if prefix else f"weights/{name}"
+                self.writer.add_histogram(tag, param.data, step)
 
     def log_gradients(
         self,
@@ -385,7 +388,7 @@ class TensorBoardLogger:
             confusion_matrix: Confusion matrix tensor (C, C)
             labels: Character labels
             step: Global step
-            tag: Figure tag
+            tag: Figure tag (supports prefix like "stage2_lcofl/confusion_matrix")
         """
         if not MATPLOTLIB_AVAILABLE:
             return
@@ -396,7 +399,10 @@ class TensorBoardLogger:
         import matplotlib.pyplot as plt
         import seaborn as sns
 
-        fig, ax = plt.subplots(figsize=(10, 8))
+        # Calculate appropriate figure size based on number of classes
+        n_classes = len(labels)
+        fig_size = max(16, n_classes * 0.5)
+        fig, ax = plt.subplots(figsize=(fig_size, fig_size * 0.9))
 
         # Convert to numpy for plotting
         if isinstance(confusion_matrix, torch.Tensor):
@@ -408,19 +414,42 @@ class TensorBoardLogger:
         cm_normalized = cm.astype(float) / cm.sum(axis=1, keepdims=True)
         cm_normalized = np.nan_to_num(cm_normalized)
 
+        # Use integer annotations for readability, or fewer decimals
+        # If values are very small, use scientific notation
+        max_val = cm_normalized.max()
+        if max_val < 0.01:
+            fmt = ".1e"
+        elif max_val < 0.1:
+            fmt = ".3f"
+        else:
+            fmt = ".2f"
+
         sns.heatmap(
             cm_normalized,
             annot=True,
-            fmt=".2f",
+            fmt=fmt,
             cmap="Blues",
             xticklabels=labels,
             yticklabels=labels,
             ax=ax,
+            annot_kws={"size": 8 if n_classes > 20 else 10},
+            cbar_kws={"shrink": 0.8},
         )
 
-        ax.set_xlabel("Predicted")
-        ax.set_ylabel("Ground Truth")
-        ax.set_title("Confusion Matrix")
+        # Rotate labels for better readability
+        ax.set_xlabel("Predicted", fontsize=12, fontweight='bold')
+        ax.set_ylabel("Ground Truth", fontsize=12, fontweight='bold')
+        ax.set_title("Confusion Matrix", fontsize=14, fontweight='bold')
+
+        # Rotate tick labels if there are many classes
+        if n_classes > 15:
+            plt.xticks(rotation=45, ha='right')
+            plt.yticks(rotation=0)
+        else:
+            plt.xticks(rotation=0)
+            plt.yticks(rotation=0)
+
+        plt.tight_layout()
 
         self.log_figure(tag, fig, step)
 
