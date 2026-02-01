@@ -180,6 +180,11 @@ class ProgressiveTrainer:
 
     def set_stage(self, stage: TrainingStage):
         """Set the current training stage."""
+        # Synchronize all ranks before changing stage configuration
+        # This ensures all ranks have the same model structure (OCR frozen/unfrozen)
+        if self.distributed:
+            dist.barrier()
+
         self.current_stage = stage
         config = self.stage_configs[stage]
 
@@ -704,6 +709,11 @@ class ProgressiveTrainer:
         )
         results["stage0_best_acc"] = best_acc_stage0
 
+        # Synchronize all ranks between stages (critical for DDP)
+        # Ensures all ranks complete stage 0 before stage 1 starts
+        if self.distributed:
+            dist.barrier()
+
         # Stage 1: Warm-up
         if self.is_main:
             print("\nStage 1: Warm-up (L1 loss only)")
@@ -711,12 +721,20 @@ class ProgressiveTrainer:
         best_acc_stage1 = self.train_stage(TrainingStage.WARMUP)
         results["stage1_best_acc"] = best_acc_stage1
 
+        # Synchronize all ranks between stages
+        if self.distributed:
+            dist.barrier()
+
         # Stage 2: LCOFL
         if self.is_main:
             print("\nStage 2: LCOFL Training (Character-driven loss)")
             print("Purpose: Optimize for character recognition with frozen OCR")
         best_acc_stage2 = self.train_stage(TrainingStage.LCOFL)
         results["stage2_best_acc"] = best_acc_stage2
+
+        # Synchronize all ranks between stages
+        if self.distributed:
+            dist.barrier()
 
         # Stage 3: Fine-tuning
         if self.is_main:
