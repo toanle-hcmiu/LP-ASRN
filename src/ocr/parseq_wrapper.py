@@ -330,9 +330,14 @@ class ParseqOCR(nn.Module):
             If return_logits: Logits of shape (B, max_length, vocab_size)
             Otherwise: Predicted texts
         """
-        # Convert from [-1, 1] to [0, 1]
-        x = (images + 1.0) / 2.0
-        x = torch.clamp(x, 0, 1)
+        # Normalize to [0, 1] range
+        # Dataset may provide images in either [-1, 1] or [0, 1] range
+        # Auto-detect and normalize only if needed
+        if images.min() < 0:  # Input is in [-1, 1] range
+            x = (images + 1.0) / 2.0
+            x = torch.clamp(x, 0, 1)
+        else:
+            x = images  # Already in [0, 1] range
 
         # Check if using SimpleCRNN fallback
         is_simple_crnn = isinstance(self.model, SimpleCRNN)

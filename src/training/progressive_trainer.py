@@ -332,7 +332,7 @@ class ProgressiveTrainer:
 
                 # OCR predictions (ONCE per batch - greedy decoding for speed)
                 ocr_unwrapped = self._unwrap_model(self.ocr)
-                pred_texts = ocr_unwrapped.predict(sr_images, beam_width=1)
+                pred_texts = ocr_unwrapped.predict(sr_images, beam_width=5)
 
                 # Store first batch for visualization
                 if sample_batch is None and self.logger:
@@ -423,6 +423,15 @@ class ProgressiveTrainer:
         # Create optimizer for OCR only
         self.optimizer = optim.Adam(self.ocr.parameters(), lr=stage_config.lr)
 
+        # Add LR scheduler for OCR pretraining (reduces LR when accuracy plateaus)
+        ocr_scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer,
+            mode='max',
+            factor=0.5,
+            patience=10,
+            verbose=True if self.is_main else False,
+        )
+
         # Use char_acc for early stopping (more granular than word_acc)
         best_char_acc = 0.0
         self.epochs_without_improvement = 0
@@ -483,6 +492,9 @@ class ProgressiveTrainer:
                 print(f"  Val SSIM: {val_metrics['ssim']:.4f}")
                 print(f"  Val Word Acc: {val_metrics['word_acc']:.4f}")
                 print(f"  Val Char Acc: {val_metrics['char_acc']:.4f}")
+
+            # Step LR scheduler based on validation char_acc
+            ocr_scheduler.step(val_metrics['char_acc'])
 
             # Save best model (using char_acc for early stopping)
             if val_metrics['char_acc'] > best_char_acc:
