@@ -389,23 +389,28 @@ def create_dataloaders(
             drop_last=True,
         )
 
-        # Validation also uses DistributedSampler (no shuffle)
-        val_sampler = DistributedSampler(
-            val_dataset,
-            num_replicas=world_size,
-            rank=rank,
-            shuffle=False,
-            drop_last=False,
-        )
-
-        val_loader = DataLoader(
-            val_dataset,
-            batch_size=batch_size,
-            sampler=val_sampler,
-            num_workers=num_workers,
-            pin_memory=True,
-            drop_last=False,
-        )
+        # Validation: only rank 0 validates on full dataset
+        # Other ranks skip validation (early return in validate() method)
+        if rank == 0:
+            # Rank 0 validates on FULL validation set (no DistributedSampler)
+            # Use fewer workers to avoid resource exhaustion
+            val_loader = DataLoader(
+                val_dataset,
+                batch_size=batch_size,
+                shuffle=False,
+                num_workers=min(num_workers, 4),  # Limit workers for validation
+                pin_memory=True,
+                drop_last=False,
+            )
+        else:
+            # Other ranks: minimal DataLoader (won't be used due to early return)
+            val_loader = DataLoader(
+                val_dataset,
+                batch_size=1,
+                shuffle=False,
+                num_workers=0,
+                pin_memory=False,
+            )
     else:
         # Single GPU training
         train_loader = DataLoader(
