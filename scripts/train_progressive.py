@@ -370,8 +370,10 @@ def train_ddp(rank, world_size, args, config):
         if is_main:
             print("OCR not wrapped with DDP (frozen, no trainable parameters)")
 
-    # Store the wrapped model reference for consistency
-    ocr.model = ocr_model
+    # Store the wrapped model reference (only for DDP-wrapped models)
+    # This avoids circular reference when OCR is frozen
+    if has_trainable_params:
+        ocr.model = ocr_model
 
     # Create logger (only rank 0)
     logger = None
