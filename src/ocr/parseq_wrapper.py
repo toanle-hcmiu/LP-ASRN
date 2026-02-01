@@ -22,18 +22,10 @@ import torch.nn.functional as F
 from typing import List, Dict, Optional, Tuple
 import re
 
-# Parseq availability check - will use torch.hub to load
-try:
-    # Try to load Parseq via torch.hub
-    _test_model = torch.hub.load('baudm/parseq', 'parseq', pretrained=False, trust_repo=True)
-    PARSEQ_AVAILABLE = True
-    PARSEQ_SOURCE = 'torch_hub'
-    del _test_model  # Free memory
-except Exception as e:
-    PARSEQ_AVAILABLE = False
-    PARSEQ_SOURCE = None
-    print(f"Warning: Could not load Parseq via torch.hub: {e}")
-    print("Using fallback CRNN model. For Parseq, ensure internet connection for torch.hub.")
+# Parseq availability check - DISABLED to avoid torch.hub loading at import time
+# SimpleCRNN is the actual OCR model being used
+PARSEQ_AVAILABLE = False
+PARSEQ_SOURCE = None
 
 
 class ParseqTokenizer:
