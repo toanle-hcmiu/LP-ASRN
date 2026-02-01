@@ -37,7 +37,7 @@ data:
   num_workers: 16
 
   # Validation split
-  val_split: 0.1
+  val_split: 0.05
 
 training:
   # Number of training epochs
@@ -45,6 +45,12 @@ training:
 
   # Learning rate
   lr: 0.0001
+
+  # Validation interval (validate every N epochs to save time)
+  val_interval: 10
+
+  # Beam width for validation (higher = more accurate but slower)
+  val_beam_width: 5
 
   # Adam optimizer betas
   beta1: 0.9

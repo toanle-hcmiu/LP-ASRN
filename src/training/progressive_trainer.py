@@ -298,8 +298,16 @@ class ProgressiveTrainer:
             "gt_texts": gt_texts_all,
         }
 
-    def validate(self) -> Dict[str, float]:
-        """Validate the model (only on main process for DDP)."""
+    def validate(self, beam_width: int = 5) -> Dict[str, float]:
+        """
+        Validate the model (only on main process for DDP).
+
+        Args:
+            beam_width: Beam width for OCR decoding (higher = more accurate).
+
+        Returns:
+            Dictionary with validation metrics.
+        """
         if self.distributed and not self.is_main:
             return {
                 "psnr": 0.0,
@@ -330,9 +338,9 @@ class ProgressiveTrainer:
                 # Forward pass
                 sr_images = self.generator(lr_images)
 
-                # OCR predictions (ONCE per batch - greedy decoding for speed)
+                # OCR predictions (ONCE per batch - use configurable beam width)
                 ocr_unwrapped = self._unwrap_model(self.ocr)
-                pred_texts = ocr_unwrapped.predict(sr_images, beam_width=3)
+                pred_texts = ocr_unwrapped.predict(sr_images, beam_width=beam_width)
 
                 # Store first batch for visualization
                 if sample_batch is None and self.logger:
@@ -480,60 +488,71 @@ class ProgressiveTrainer:
 
             avg_loss = total_loss / len(self.train_loader)
 
-            # Synchronize all ranks before validation
-            # Ensures both ranks reach validation at the same time
-            if self.distributed:
-                dist.barrier()
+            # Get validation config
+            val_interval = self.config.get("training", {}).get("val_interval", 30)
+            val_beam_width = self.config.get("training", {}).get("val_beam_width", 5)
 
-            # Validation
-            val_metrics = self.validate()
+            # Only validate every val_interval epochs (or first/last epoch)
+            should_validate = (epoch % val_interval == 0) or (epoch == 0) or (epoch == stage_config.epochs - 1)
 
-            # Synchronize all ranks after validation (critical for DDP)
-            # Without this, Rank 1 continues while Rank 0 is still validating, causing NCCL timeout
-            if self.distributed:
-                dist.barrier()
+            if should_validate:
+                # Synchronize all ranks before validation
+                if self.distributed:
+                    dist.barrier()
 
-            # Log validation metrics to TensorBoard
-            if self.logger and self.is_main:
-                stage_prefix = "stage0"
-                self.logger.log_scalar(f"{stage_prefix}/val_loss", avg_loss, epoch)
-                self.logger.log_scalar(f"{stage_prefix}/val_char_acc", val_metrics['char_acc'], epoch)
-                self.logger.log_scalar(f"{stage_prefix}/val_word_acc", val_metrics['word_acc'], epoch)
-                self.logger.log_scalar(f"{stage_prefix}/val_psnr", val_metrics['psnr'], epoch)
-                self.logger.log_scalar(f"{stage_prefix}/val_ssim", val_metrics['ssim'], epoch)
+                val_metrics = self.validate(beam_width=val_beam_width)
 
-                # Log OCR predictions visualization (every 5 epochs)
-                if epoch % 5 == 0 and val_metrics.get("sample_batch"):
-                    self._log_ocr_predictions(val_metrics["sample_batch"], epoch)
+                # Synchronize all ranks after validation
+                if self.distributed:
+                    dist.barrier()
 
-            # Print results (only rank 0)
-            if self.is_main:
-                print(f"\nOCR Pretrain Epoch {epoch+1}/{stage_config.epochs}:")
-                print(f"  Train Loss: {avg_loss:.4f}")
-                print(f"  Val PSNR: {val_metrics['psnr']:.2f} dB")
-                print(f"  Val SSIM: {val_metrics['ssim']:.4f}")
-                print(f"  Val Word Acc: {val_metrics['word_acc']:.4f}")
-                print(f"  Val Char Acc: {val_metrics['char_acc']:.4f}")
+                # Log validation metrics to TensorBoard
+                if self.logger and self.is_main:
+                    stage_prefix = "stage0"
+                    self.logger.log_scalar(f"{stage_prefix}/val_loss", avg_loss, epoch)
+                    self.logger.log_scalar(f"{stage_prefix}/val_char_acc", val_metrics['char_acc'], epoch)
+                    self.logger.log_scalar(f"{stage_prefix}/val_word_acc", val_metrics['word_acc'], epoch)
+                    self.logger.log_scalar(f"{stage_prefix}/val_psnr", val_metrics['psnr'], epoch)
+                    self.logger.log_scalar(f"{stage_prefix}/val_ssim", val_metrics['ssim'], epoch)
 
-            # Step LR scheduler based on validation char_acc
-            ocr_scheduler.step(val_metrics['char_acc'])
+                    # Log OCR predictions visualization
+                    if val_metrics.get("sample_batch"):
+                        self._log_ocr_predictions(val_metrics["sample_batch"], epoch)
 
-            # Save best model (using char_acc for early stopping)
-            if val_metrics['char_acc'] > best_char_acc:
-                best_char_acc = val_metrics['char_acc']
-                self.epochs_without_improvement = 0
-                self.save_ocr_checkpoint(epoch, TrainingStage.PRETRAIN)
+                # Print results
                 if self.is_main:
-                    print(f"  ✓ New best OCR: char_acc={val_metrics['char_acc']:.4f}, word_acc={val_metrics['word_acc']:.4f}")
+                    print(f"\nOCR Pretrain Epoch {epoch+1}/{stage_config.epochs}:")
+                    print(f"  Train Loss: {avg_loss:.4f}")
+                    print(f"  Val PSNR: {val_metrics['psnr']:.2f} dB")
+                    print(f"  Val SSIM: {val_metrics['ssim']:.4f}")
+                    print(f"  Val Word Acc: {val_metrics['word_acc']:.4f}")
+                    print(f"  Val Char Acc: {val_metrics['char_acc']:.4f}")
+
+                # Step LR scheduler based on validation char_acc
+                ocr_scheduler.step(val_metrics['char_acc'])
+
+                # Save best model (using char_acc for early stopping)
+                if val_metrics['char_acc'] > best_char_acc:
+                    best_char_acc = val_metrics['char_acc']
+                    self.epochs_without_improvement = 0
+                    self.save_ocr_checkpoint(epoch, TrainingStage.PRETRAIN)
+                    if self.is_main:
+                        print(f"  ✓ New best OCR: char_acc={val_metrics['char_acc']:.4f}, word_acc={val_metrics['word_acc']:.4f}")
+                else:
+                    self.epochs_without_improvement += 1
+
+                # Early stopping (scale patience by validation interval)
+                base_patience = self.config.get("training", {}).get("early_stop_patience", 20)
+                patience = base_patience * max(1, val_interval // 10)
+                if self.epochs_without_improvement >= patience:
+                    if self.is_main:
+                        print(f"Early stopping after {patience} validations without improvement")
+                    break
+
             else:
-                self.epochs_without_improvement += 1
-
-            # Early stopping
-            patience = self.config.get("training", {}).get("early_stop_patience", 20)
-            if self.epochs_without_improvement >= patience:
+                # Skip validation - just print training progress
                 if self.is_main:
-                    print(f"Early stopping after {patience} epochs without improvement")
-                break
+                    print(f"\nOCR Pretrain Epoch {epoch+1}/{stage_config.epochs}: Train Loss: {avg_loss:.4f}")
 
         # Freeze OCR after pretraining for subsequent stages
         for param in self.ocr.parameters():
@@ -797,46 +816,55 @@ class ProgressiveTrainer:
             # Train
             train_metrics = self.train_epoch(config)
 
-            # Synchronize all ranks before validation
-            # Ensures both ranks reach validation at the same time
-            if self.distributed:
-                dist.barrier()
+            # Get validation interval
+            val_interval = self.config.get("training", {}).get("val_interval", 10)
+            val_beam_width = self.config.get("training", {}).get("val_beam_width", 5)
 
-            # Validate
-            val_metrics = self.validate()
+            # Only validate every val_interval epochs (or first/last epoch)
+            should_validate = (epoch % val_interval == 0) or (epoch == 0) or (epoch == config.epochs - 1)
 
-            # Synchronize all ranks after validation (critical for DDP)
-            # Without this, Rank 1 continues while Rank 0 is still validating, causing NCCL timeout
-            if self.distributed:
-                dist.barrier()
+            if should_validate:
+                # Synchronize all ranks before validation
+                if self.distributed:
+                    dist.barrier()
 
-            # Update confusion if needed (only main rank has pred_texts)
-            if config.update_confusion and self.is_main:
-                self.confusion_tracker.update(val_metrics["pred_texts"], val_metrics["gt_texts"])
-                self.lcofl_loss.update_weights(self.confusion_tracker.confusion_matrix)
+                val_metrics = self.validate(beam_width=val_beam_width)
 
-            # Log to TensorBoard
-            self.log_to_tensorboard(train_metrics, val_metrics, epoch)
+                # Synchronize all ranks after validation
+                if self.distributed:
+                    dist.barrier()
 
-            # Print results (only rank 0)
-            if self.is_main:
-                print(f"Epoch {current_global_epoch + 1}:")
-                print(f"  Train Loss: {train_metrics['loss']:.4f}")
-                print(f"  Val PSNR: {val_metrics['psnr']:.2f} dB")
-                print(f"  Val SSIM: {val_metrics['ssim']:.4f}")
-                print(f"  Val Word Acc: {val_metrics['word_acc']:.4f}")
-                print(f"  Val Char Acc: {val_metrics['char_acc']:.4f}")
+                # Update confusion if needed (only main rank has pred_texts)
+                if config.update_confusion and self.is_main:
+                    self.confusion_tracker.update(val_metrics["pred_texts"], val_metrics["gt_texts"])
+                    self.lcofl_loss.update_weights(self.confusion_tracker.confusion_matrix)
 
-            # Update best model
-            if val_metrics['word_acc'] > self.best_word_acc:
-                self.best_word_acc = val_metrics['word_acc']
-                self.epochs_without_improvement = 0
-
-                self.save_checkpoint(current_global_epoch, stage)
-                if self.is_main:
-                    print(f"  ✓ New best model: word_acc={val_metrics['word_acc']:.4f}")
+                # Log to TensorBoard
+                self.log_to_tensorboard(train_metrics, val_metrics, epoch)
             else:
-                self.epochs_without_improvement += 1
+                # Skip validation - provide minimal metrics for early stopping
+                val_metrics = {"word_acc": 0.0, "char_acc": 0.0, "psnr": 0.0, "ssim": 0.0, "pred_texts": [], "gt_texts": []}
+
+            # Print results (only when validation was performed)
+            if should_validate:
+                if self.is_main:
+                    print(f"Epoch {current_global_epoch + 1}:")
+                    print(f"  Train Loss: {train_metrics['loss']:.4f}")
+                    print(f"  Val PSNR: {val_metrics['psnr']:.2f} dB")
+                    print(f"  Val SSIM: {val_metrics['ssim']:.4f}")
+                    print(f"  Val Word Acc: {val_metrics['word_acc']:.4f}")
+                    print(f"  Val Char Acc: {val_metrics['char_acc']:.4f}")
+
+                # Update best model (only when validation was performed)
+                if val_metrics['word_acc'] > self.best_word_acc:
+                    self.best_word_acc = val_metrics['word_acc']
+                    self.epochs_without_improvement = 0
+
+                    self.save_checkpoint(current_global_epoch, stage)
+                    if self.is_main:
+                        print(f"  ✓ New best model: word_acc={val_metrics['word_acc']:.4f}")
+                else:
+                    self.epochs_without_improvement += 1
 
             # Learning rate scheduling
             self.scheduler.step()
