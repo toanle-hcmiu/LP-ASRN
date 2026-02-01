@@ -507,15 +507,8 @@ class ProgressiveTrainer:
             should_validate = (epoch % val_interval == 0) or (epoch == 0) or (epoch == stage_config.epochs - 1)
 
             if should_validate:
-                # Synchronize all ranks before validation
-                if self.distributed:
-                    dist.barrier()
-
+                # No barrier needed - only rank 0 validates, others return early
                 val_metrics = self.validate(beam_width=val_beam_width)
-
-                # Synchronize all ranks after validation
-                if self.distributed:
-                    dist.barrier()
 
                 # Log validation metrics to TensorBoard
                 if self.logger and self.is_main:
@@ -835,15 +828,8 @@ class ProgressiveTrainer:
             should_validate = (epoch % val_interval == 0) or (epoch == 0) or (epoch == config.epochs - 1)
 
             if should_validate:
-                # Synchronize all ranks before validation
-                if self.distributed:
-                    dist.barrier()
-
+                # No barrier needed - only rank 0 validates, others return early
                 val_metrics = self.validate(beam_width=val_beam_width)
-
-                # Synchronize all ranks after validation
-                if self.distributed:
-                    dist.barrier()
 
                 # Update confusion if needed (only main rank has pred_texts)
                 if config.update_confusion and self.is_main:
