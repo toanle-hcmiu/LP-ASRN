@@ -457,6 +457,11 @@ class ProgressiveTrainer:
 
             avg_loss = total_loss / len(self.train_loader)
 
+            # Synchronize all ranks before validation
+            # Ensures both ranks reach validation at the same time
+            if self.distributed:
+                dist.barrier()
+
             # Validation
             val_metrics = self.validate()
 
@@ -584,6 +589,11 @@ class ProgressiveTrainer:
 
             # Train
             train_metrics = self.train_epoch(config)
+
+            # Synchronize all ranks before validation
+            # Ensures both ranks reach validation at the same time
+            if self.distributed:
+                dist.barrier()
 
             # Validate
             val_metrics = self.validate()
