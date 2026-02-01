@@ -316,6 +316,17 @@ class ProgressiveTrainer:
                 "char_acc": 0.0,
             }
 
+        # Handle None val_loader (non-main ranks in DDP)
+        if self.val_loader is None:
+            return {
+                "psnr": 0.0,
+                "ssim": 0.0,
+                "word_acc": 0.0,
+                "char_acc": 0.0,
+                "pred_texts": [],
+                "gt_texts": [],
+            }
+
         self.generator.eval()
 
         total_psnr = 0.0

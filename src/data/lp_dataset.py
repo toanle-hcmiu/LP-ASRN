@@ -403,14 +403,9 @@ def create_dataloaders(
                 drop_last=False,
             )
         else:
-            # Other ranks: minimal DataLoader (won't be used due to early return)
-            val_loader = DataLoader(
-                val_dataset,
-                batch_size=1,
-                shuffle=False,
-                num_workers=0,
-                pin_memory=False,
-            )
+            # Other ranks: None (completely skip validation dataloader)
+            # This avoids multiprocessing issues in DDP
+            val_loader = None
     else:
         # Single GPU training
         train_loader = DataLoader(
