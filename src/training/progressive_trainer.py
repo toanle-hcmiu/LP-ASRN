@@ -429,7 +429,6 @@ class ProgressiveTrainer:
             mode='max',
             factor=0.5,
             patience=10,
-            verbose=True if self.is_main else False,
         )
 
         # Use char_acc for early stopping (more granular than word_acc)
