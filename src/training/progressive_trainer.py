@@ -344,17 +344,16 @@ class ProgressiveTrainer:
                         "pred_texts": pred_texts,
                     }
 
-                # Compute PSNR/SSIM
-                for i in range(sr_images.shape[0]):
-                    mse = torch.mean((sr_images[i] - hr_images[i]) ** 2)
-                    # Images are in [-1, 1] range, so max_value = 2.0
-                    psnr = 20 * torch.log10(2.0 / torch.sqrt(mse + 1e-10))
-                    total_psnr += psnr.item()
+                # Compute PSNR/SSIM (vectorized - much faster!)
+                # MSE per image in batch
+                mse_per_img = torch.mean((sr_images - hr_images) ** 2, dim=(1, 2, 3))
+                psnr_per_img = 20 * torch.log10(2.0 / torch.sqrt(mse_per_img + 1e-10))
+                total_psnr += psnr_per_img.sum().item()
 
-                    # SSIM (simplified) - normalize MAE from [-1, 1] to [0, 1]
-                    mae = torch.mean(torch.abs(sr_images[i] - hr_images[i]))
-                    ssim = 1.0 - (mae / 2.0)
-                    total_ssim += ssim.item()
+                # SSIM (simplified) - batch computation
+                mae_per_img = torch.mean(torch.abs(sr_images - hr_images), dim=(1, 2, 3))
+                ssim_per_img = 1.0 - (mae_per_img / 2.0)
+                total_ssim += ssim_per_img.sum().item()
 
                 # Store predictions for metrics
                 pred_texts_all.extend(pred_texts)
