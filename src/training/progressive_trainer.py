@@ -106,12 +106,6 @@ class ProgressiveTrainer:
         self.world_size = world_size
         self.is_main = not distributed or rank == 0
 
-    def _unwrap_model(self, model):
-        """Unwrap DDP model to access underlying model."""
-        if self.distributed and isinstance(model, nn.parallel.DistributedDataParallel):
-            return model.module
-        return model
-
         # Extract progressive training config
         self.progressive_config = config.get("progressive_training", {})
         self.tensorboard_config = config.get("tensorboard", {})
@@ -177,6 +171,12 @@ class ProgressiveTrainer:
         # Save directory (single output folder for checkpoints + logs)
         self.save_dir = Path(config.get("training", {}).get("save_dir", "outputs/run_default"))
         self.save_dir.mkdir(parents=True, exist_ok=True)
+
+    def _unwrap_model(self, model):
+        """Unwrap DDP model to access underlying model."""
+        if self.distributed and isinstance(model, nn.parallel.DistributedDataParallel):
+            return model.module
+        return model
 
     def set_stage(self, stage: TrainingStage):
         """Set the current training stage."""
