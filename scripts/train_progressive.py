@@ -352,12 +352,25 @@ def train_ddp(rank, world_size, args, config):
         output_device=rank,
         find_unused_parameters=True,  # For OCR frozen periods
     )
-    ocr_model = nn.parallel.DistributedDataParallel(
-        ocr.to(device),
-        device_ids=[rank],
-        output_device=rank,
-    )
-    # Store the base OCR for access to methods
+
+    # Only wrap OCR with DDP if it has trainable parameters
+    # (OCR is frozen by default, so no need for DDP)
+    has_trainable_params = any(p.requires_grad for p in ocr.parameters())
+    if has_trainable_params:
+        ocr_model = nn.parallel.DistributedDataParallel(
+            ocr.to(device),
+            device_ids=[rank],
+            output_device=rank,
+        )
+        if is_main:
+            print("OCR wrapped with DDP (has trainable parameters)")
+    else:
+        # OCR is frozen, no need for DDP wrapper
+        ocr_model = ocr.to(device)
+        if is_main:
+            print("OCR not wrapped with DDP (frozen, no trainable parameters)")
+
+    # Store the wrapped model reference for consistency
     ocr.model = ocr_model
 
     # Create logger (only rank 0)
