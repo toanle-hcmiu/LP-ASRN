@@ -190,7 +190,7 @@ def main(args):
     ocr_config = config.get("ocr", {})
 
     # Create save directory
-    save_dir = Path(training_config.get("save_dir", "checkpoints/lp_asrn"))
+    save_dir = Path(training_config.get("save_dir", "outputs/run_default"))
     save_dir.mkdir(parents=True, exist_ok=True)
 
     # Save config

@@ -89,6 +89,7 @@ class ProgressiveTrainer:
         self.val_loader = val_loader
         self.config = config
         self.logger = logger
+        self.text_logger = None  # Optional TextLogger
         self.device = device
 
         # Extract progressive training config
@@ -153,8 +154,8 @@ class ProgressiveTrainer:
         )
         self.metrics_tracker = MetricsTracker()
 
-        # Save directory
-        self.save_dir = Path(config.get("training", {}).get("save_dir", "checkpoints/lp_asrn"))
+        # Save directory (single output folder for checkpoints + logs)
+        self.save_dir = Path(config.get("training", {}).get("save_dir", "outputs/run_default"))
         self.save_dir.mkdir(parents=True, exist_ok=True)
 
     def set_stage(self, stage: TrainingStage):
@@ -165,6 +166,24 @@ class ProgressiveTrainer:
         # Update OCR frozen state
         for param in self.ocr.parameters():
             param.requires_grad = not config.freeze_ocr
+
+    def set_text_logger(self, text_logger):
+        """Set the text logger for file logging."""
+        self.text_logger = text_logger
+
+    def _log(self, message: str, level: str = "info"):
+        """Log message to both console and text file."""
+        if self.text_logger:
+            if level == "info":
+                self.text_logger.info(message)
+            elif level == "debug":
+                self.text_logger.debug(message)
+            elif level == "warning":
+                self.text_logger.warning(message)
+            elif level == "error":
+                self.text_logger.error(message)
+        else:
+            print(message)
 
         print(f"\n{'='*60}")
         print(f"STAGE: {stage.value.upper()}")
@@ -654,7 +673,7 @@ if __name__ == "__main__":
         "ocr": {"vocab": "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"},
         "loss": {"lambda_layout": 0.5},
         "training": {
-            "save_dir": "checkpoints/test_progressive",
+            "save_dir": "outputs/test_progressive",
             "gradient_clip": 1.0,
             "lr_step_size": 5,
             "lr_gamma": 0.9,
@@ -667,7 +686,7 @@ if __name__ == "__main__":
         },
         "tensorboard": {
             "enabled": True,
-            "log_dir": "logs/test",
+            "log_dir": "outputs/test_progressive/logs",
         },
     }
 
@@ -684,7 +703,7 @@ if __name__ == "__main__":
     ocr = ParseqOCR(frozen=True)
 
     # Create logger
-    logger = TensorBoardLogger(log_dir="logs/test")
+    logger = TensorBoardLogger(log_dir="outputs/test_progressive/logs")
 
     # Create trainer
     trainer = ProgressiveTrainer(

@@ -6,6 +6,7 @@ and other visualizations for monitoring the training process.
 """
 
 import os
+import sys
 import datetime
 from pathlib import Path
 from typing import Optional, Union, List
@@ -21,6 +22,113 @@ try:
 except ImportError:
     MATPLOTLIB_AVAILABLE = False
     print("Warning: matplotlib not available. Figure logging disabled.")
+
+
+class TextLogger:
+    """
+    Text file logger for training output.
+
+    Captures console output and writes to a timestamped text file.
+    Useful for having a persistent log without needing TensorBoard.
+    """
+
+    def __init__(
+        self,
+        log_dir: str = None,
+        filename: str = "training.log",
+        also_console: bool = True,
+    ):
+        """
+        Initialize Text Logger.
+
+        Args:
+            log_dir: Directory for log file. If None, auto-generates path.
+            filename: Name of the log file.
+            also_console: If True, also print to console.
+        """
+        if log_dir is None:
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            log_dir = f"outputs/run_{timestamp}/logs"
+
+        self.log_dir = Path(log_dir)
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+
+        self.log_file = self.log_dir / filename
+        self.also_console = also_console
+
+        # Create log file
+        self.log_file.touch()
+
+        # Write header
+        self.info(f"{'='*60}")
+        self.info(f"Training Log Started: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        self.info(f"Log file: {self.log_file}")
+        self.info(f"{'='*60}\n")
+
+    def _write(self, message: str):
+        """Write message to log file."""
+        with open(self.log_file, "a", encoding="utf-8") as f:
+            f.write(message + "\n")
+
+    def info(self, message: str):
+        """Log an info message."""
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        log_message = f"[{timestamp}] {message}"
+        self._write(log_message)
+        if self.also_console:
+            print(message)
+
+    def debug(self, message: str):
+        """Log a debug message."""
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        log_message = f"[{timestamp}] [DEBUG] {message}"
+        self._write(log_message)
+        if self.also_console:
+            print(f"[DEBUG] {message}")
+
+    def warning(self, message: str):
+        """Log a warning message."""
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        log_message = f"[{timestamp}] [WARNING] {message}"
+        self._write(log_message)
+        if self.also_console:
+            print(f"[WARNING] {message}")
+
+    def error(self, message: str):
+        """Log an error message."""
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        log_message = f"[{timestamp}] [ERROR] {message}"
+        self._write(log_message)
+        if self.also_console:
+            print(f"[ERROR] {message}", file=sys.stderr)
+
+    def log_metrics(self, metrics: dict, step: int = None):
+        """Log metrics dictionary."""
+        step_str = f"Step {step}" if step is not None else "Metrics"
+        self.info(f"{step_str}:")
+        for key, value in metrics.items():
+            self.info(f"  {key}: {value}")
+
+    def log_epoch(self, epoch: int, metrics: dict, stage: str = None):
+        """Log epoch summary."""
+        stage_str = f"[{stage}] " if stage else ""
+        self.info(f"{stage_str}Epoch {epoch}:")
+        for key, value in metrics.items():
+            self.info(f"  {key}: {value}")
+
+    def close(self):
+        """Close the logger (writes footer)."""
+        self.info(f"\n{'='*60}")
+        self.info(f"Training Log Ended: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        self.info(f"{'='*60}")
+
+    def __enter__(self):
+        """Context manager entry."""
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Context manager exit."""
+        self.close()
 
 
 class TensorBoardLogger:
@@ -52,7 +160,7 @@ class TensorBoardLogger:
         # Auto-generate timestamped directory if not provided
         if log_dir is None:
             timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            log_dir = f"logs/tensorboard/run_{timestamp}"
+            log_dir = f"outputs/run_{timestamp}/logs"
 
         self.log_dir = Path(log_dir)
         self.log_dir.mkdir(parents=True, exist_ok=True)

@@ -33,7 +33,7 @@ from src.training.progressive_trainer import ProgressiveTrainer, TrainingStage
 from src.data.lp_dataset import create_dataloaders
 from src.models.generator import Generator
 from src.ocr.parseq_wrapper import ParseqOCR
-from src.utils.logger import TensorBoardLogger
+from src.utils.logger import TensorBoardLogger, TextLogger
 
 
 class TensorBoardLauncher:
@@ -140,8 +140,8 @@ def parse_args():
         help="Disable TensorBoard",
     )
     parser.add_argument("--tb-port", type=int, default=6007, help="TensorBoard port")
-    parser.add_argument("--tb-dir", type=str, default=None, help="TensorBoard log directory (auto-timestamped if None)")
-    parser.add_argument("--save-dir", type=str, default=None, help="Checkpoint save directory (auto-timestamped if None)")
+    parser.add_argument("--tb-dir", type=str, default=None, help="TensorBoard log directory (default: <save_dir>/logs)")
+    parser.add_argument("--save-dir", type=str, default=None, help="Output directory for checkpoints and logs (auto-timestamped if None)")
 
     # Training overrides
     parser.add_argument("--device", type=str, default="cuda")
@@ -186,22 +186,22 @@ def load_config(config_path: str, args) -> dict:
     if args.finetune_epochs:
         config["progressive_training"]["stage3"]["epochs"] = args.finetune_epochs
 
-    # Configure TensorBoard with timestamped directory
-    if args.tb_dir is None:
+    # Configure single output directory with timestamped run folder
+    # All outputs (checkpoints, logs, etc.) go into one folder
+    if args.save_dir is None:
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        args.tb_dir = f"logs/tensorboard/run_{timestamp}"
+        args.save_dir = f"outputs/run_{timestamp}"
+
+    config.setdefault("training", {})["save_dir"] = args.save_dir
+
+    # TensorBoard logs go into a subdirectory of the output folder
+    if args.tb_dir is None:
+        args.tb_dir = f"{args.save_dir}/logs"
 
     config["tensorboard"] = {
         "enabled": args.tensorboard,
         "log_dir": args.tb_dir,
     }
-
-    # Configure checkpoint save_dir with timestamped directory
-    if args.save_dir is None:
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        args.save_dir = f"checkpoints/lp_asrn/run_{timestamp}"
-
-    config.setdefault("training", {})["save_dir"] = args.save_dir
 
     # Set device
     config["training"] = config.get("training", {})
@@ -305,6 +305,15 @@ def main():
 
     # Create logger
     logger = TensorBoardLogger(log_dir=config["tensorboard"]["log_dir"])
+    text_logger = TextLogger(log_dir=config["tensorboard"]["log_dir"], filename="training.log")
+
+    # Log training start
+    text_logger.info(f"Training configuration:")
+    text_logger.info(f"  Stage 0 (Pretrain): {config['progressive_training']['stage0']['epochs']} epochs")
+    text_logger.info(f"  Stage 1 (Warmup): {config['progressive_training']['stage1']['epochs']} epochs")
+    text_logger.info(f"  Stage 2 (LCOFL): {config['progressive_training']['stage2']['epochs']} epochs")
+    text_logger.info(f"  Stage 3 (Finetune): {config['progressive_training']['stage3']['epochs']} epochs")
+    text_logger.info("")
 
     # Create trainer
     trainer = ProgressiveTrainer(
@@ -316,6 +325,7 @@ def main():
         logger=logger,
         device=device,
     )
+    trainer.set_text_logger(text_logger)
 
     # Resume from checkpoint if specified
     if args.resume:
@@ -334,8 +344,9 @@ def main():
         final_acc = trainer.train_stage(stage)
         results = {"final_acc": final_acc}
 
-    # Close logger
+    # Close loggers
     logger.close()
+    text_logger.close()
 
     # Stop TensorBoard
     if tb_launcher:
