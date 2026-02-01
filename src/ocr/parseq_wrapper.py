@@ -378,12 +378,13 @@ class ParseqOCR(nn.Module):
             else:
                 return self.model(x)
 
-    def predict(self, images: torch.Tensor) -> List[str]:
+    def predict(self, images: torch.Tensor, beam_width: int = 1) -> List[str]:
         """
         Predict text from images.
 
         Args:
             images: Input images of shape (B, 3, H, W)
+            beam_width: Beam width for CTC decoding (1 = greedy/fast, 5 = accurate/slow)
 
         Returns:
             List of predicted text strings
@@ -395,8 +396,13 @@ class ParseqOCR(nn.Module):
         is_simple_crnn = isinstance(self.model, SimpleCRNN)
 
         if is_simple_crnn and hasattr(self.model, 'use_ctc') and self.model.use_ctc:
-            # Use CTC beam search decoding
-            decoded_indices_list = self.model.ctc_decode_beam_search(logits, beam_width=5)
+            # Use CTC decoding (greedy if beam_width=1, beam search if >1)
+            if beam_width == 1:
+                # Fast greedy decoding (~10x faster than beam search)
+                decoded_indices_list = self.model.ctc_decode_greedy(logits)
+            else:
+                # Slower but more accurate beam search
+                decoded_indices_list = self.model.ctc_decode_beam_search(logits, beam_width=beam_width)
 
             # Convert indices to characters
             texts = []

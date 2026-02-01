@@ -8,10 +8,10 @@ Usage:
     python scripts/train_progressive.py --stage all --config configs/lp_asrn.yaml
 
 Stages:
-    Stage 0 (pretrain): OCR pretraining on HR images, 50 epochs
-    Stage 1 (warmup): L1 loss only, 10 epochs
-    Stage 2 (lcofl): Full LCOFL training, 100 epochs
-    Stage 3 (finetune): Joint OCR optimization, 50 epochs
+    Stage 0 (pretrain): OCR pretraining on HR images, 150 epochs
+    Stage 1 (warmup): L1 loss only, 30 epochs
+    Stage 2 (lcofl): Full LCOFL training, 300 epochs
+    Stage 3 (finetune): Joint OCR optimization, 150 epochs
 """
 
 import argparse
@@ -170,10 +170,10 @@ def load_config(config_path: str, args) -> dict:
     if "progressive_training" not in config:
         config["progressive_training"] = {
             "enabled": True,
-            "stage0": {"epochs": 50, "lr": 1e-4},
-            "stage1": {"epochs": 10, "lr": 1e-4},
-            "stage2": {"epochs": 100, "lr": 1e-4},
-            "stage3": {"epochs": 50, "lr": 1e-5},
+            "stage0": {"epochs": 150, "lr": 1e-4},
+            "stage1": {"epochs": 30, "lr": 1e-4},
+            "stage2": {"epochs": 300, "lr": 1e-4},
+            "stage3": {"epochs": 150, "lr": 1e-5},
         }
 
     # Apply epoch overrides

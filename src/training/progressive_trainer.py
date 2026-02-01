@@ -275,17 +275,17 @@ class ProgressiveTrainer:
                 # Forward pass
                 sr_images = self.generator(lr_images)
 
+                # OCR predictions (ONCE per batch - greedy decoding for speed)
+                pred_texts = self.ocr.predict(sr_images, beam_width=1)
+
                 # Store first batch for visualization
                 if sample_batch is None and self.logger:
-                    # Get predictions for this batch
-                    pred_texts_batch = self.ocr.predict(sr_images)
-
                     sample_batch = {
                         "lr": lr_images,
                         "sr": sr_images,
                         "hr": hr_images,
                         "gt_texts": gt_texts,
-                        "pred_texts": pred_texts_batch,
+                        "pred_texts": pred_texts,
                     }
 
                 # Compute PSNR/SSIM
@@ -300,8 +300,7 @@ class ProgressiveTrainer:
                     ssim = 1.0 - (mae / 2.0)
                     total_ssim += ssim.item()
 
-                # OCR predictions
-                pred_texts = self.ocr.predict(sr_images)
+                # Store predictions for metrics
                 pred_texts_all.extend(pred_texts)
                 gt_texts_all.extend(gt_texts)
 
