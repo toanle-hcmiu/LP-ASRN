@@ -17,6 +17,7 @@ from enum import Enum
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.distributed as dist
 from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import StepLR
 from tqdm import tqdm
@@ -70,27 +71,46 @@ class ProgressiveTrainer:
         config: Dict[str, Any],
         logger: Optional[TensorBoardLogger] = None,
         device: str = "cuda",
+        distributed: bool = False,
+        rank: int = 0,
+        world_size: int = 1,
     ):
         """
         Initialize Progressive Trainer.
 
         Args:
-            generator: Generator network
-            ocr: OCR model
+            generator: Generator network (may be wrapped in DDP)
+            ocr: OCR model (may be wrapped in DDP)
             train_loader: Training data loader
             val_loader: Validation data loader
             config: Training configuration
             logger: TensorBoard logger
             device: Device to use
+            distributed: Whether using DDP
+            rank: Rank for DDP
+            world_size: World size for DDP
         """
-        self.generator = generator.to(device)
-        self.ocr = ocr.to(device)
+        # For DDP, models are already wrapped and moved to device
+        self.generator = generator
+        self.ocr = ocr
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.config = config
         self.logger = logger
         self.text_logger = None  # Optional TextLogger
         self.device = device
+
+        # DDP settings
+        self.distributed = distributed
+        self.rank = rank
+        self.world_size = world_size
+        self.is_main = not distributed or rank == 0
+
+    def _unwrap_model(self, model):
+        """Unwrap DDP model to access underlying model."""
+        if self.distributed and isinstance(model, nn.parallel.DistributedDataParallel):
+            return model.module
+        return model
 
         # Extract progressive training config
         self.progressive_config = config.get("progressive_training", {})
@@ -172,7 +192,9 @@ class ProgressiveTrainer:
         self.text_logger = text_logger
 
     def _log(self, message: str, level: str = "info"):
-        """Log message to both console and text file."""
+        """Log message to both console and text file (main process only)."""
+        if self.distributed and not self.is_main:
+            return  # Only main process logs
         if self.text_logger:
             if level == "info":
                 self.text_logger.info(message)
@@ -222,7 +244,8 @@ class ProgressiveTrainer:
                 # Get OCR predictions
                 with torch.no_grad():
                     pred_logits = self.ocr(sr_images, return_logits=True)
-                    pred_texts = self.ocr.predict(sr_images)
+                    ocr_unwrapped = self._unwrap_model(self.ocr)
+                    pred_texts = ocr_unwrapped.predict(sr_images)
 
                 # Compute LCOFL
                 lcofl, lcofl_info = self.lcofl_loss(
@@ -271,7 +294,15 @@ class ProgressiveTrainer:
         }
 
     def validate(self) -> Dict[str, float]:
-        """Validate the model."""
+        """Validate the model (only on main process for DDP)."""
+        if self.distributed and not self.is_main:
+            return {
+                "psnr": 0.0,
+                "ssim": 0.0,
+                "word_acc": 0.0,
+                "char_acc": 0.0,
+            }
+
         self.generator.eval()
 
         total_psnr = 0.0
@@ -295,7 +326,8 @@ class ProgressiveTrainer:
                 sr_images = self.generator(lr_images)
 
                 # OCR predictions (ONCE per batch - greedy decoding for speed)
-                pred_texts = self.ocr.predict(sr_images, beam_width=1)
+                ocr_unwrapped = self._unwrap_model(self.ocr)
+                pred_texts = ocr_unwrapped.predict(sr_images, beam_width=1)
 
                 # Store first batch for visualization
                 if sample_batch is None and self.logger:
@@ -350,12 +382,16 @@ class ProgressiveTrainer:
         }
 
     def save_ocr_checkpoint(self, epoch: int, stage: TrainingStage):
-        """Save OCR model checkpoint."""
+        """Save OCR model checkpoint (main process only for DDP)."""
+        if self.distributed and not self.is_main:
+            return
+
+        ocr_unwrapped = self._unwrap_model(self.ocr)
         ocr_path = self.save_dir / f"ocr_stage_{stage.value}_epoch_{epoch}.pth"
-        self.ocr.save(str(ocr_path))
+        ocr_unwrapped.save(str(ocr_path))
         # Also save as default for later loading
         default_path = self.save_dir / "ocr_best.pth"
-        self.ocr.save(str(default_path))
+        ocr_unwrapped.save(str(default_path))
 
     def train_pretrain_stage(self, stage_config: StageConfig) -> float:
         """
@@ -578,7 +614,10 @@ class ProgressiveTrainer:
         return self.best_word_acc
 
     def save_checkpoint(self, epoch: int, stage: TrainingStage):
-        """Save a checkpoint."""
+        """Save a checkpoint (main process only for DDP)."""
+        if self.distributed and not self.is_main:
+            return
+
         checkpoint = {
             "epoch": epoch,
             "stage": stage.value,
@@ -609,6 +648,10 @@ class ProgressiveTrainer:
 
         self.global_epoch = checkpoint.get("global_epoch", 0)
         self.best_word_acc = checkpoint.get("best_word_acc", 0.0)
+
+        if self.distributed:
+            # Synchronize all processes after loading checkpoint
+            dist.barrier()
 
     def train_full_progressive(self) -> Dict[str, Any]:
         """Train all stages sequentially."""

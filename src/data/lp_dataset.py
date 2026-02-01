@@ -319,6 +319,9 @@ def create_dataloaders(
     layouts: Optional[List[str]] = None,
     image_size: Optional[Tuple[int, int]] = None,
     augment_train: bool = True,
+    distributed: bool = False,
+    rank: int = 0,
+    world_size: int = 1,
 ) -> Tuple[DataLoader, DataLoader]:
     """
     Create train and validation dataloaders.
@@ -332,6 +335,9 @@ def create_dataloaders(
         layouts: List of layouts to include
         image_size: Target size for LR images (h, w)
         augment_train: Whether to augment training data
+        distributed: Whether to use DistributedSampler for DDP
+        rank: Rank of current process (for DDP)
+        world_size: Total number of processes (for DDP)
 
     Returns:
         Tuple of (train_dataloader, val_dataloader)
@@ -362,23 +368,63 @@ def create_dataloaders(
         train_dataset.dataset.augment = True
 
     # Create dataloaders
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=True,
-        drop_last=True,
-    )
+    if distributed:
+        # Use DistributedSampler for DDP training
+        from torch.utils.data.distributed import DistributedSampler
 
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=True,
-        drop_last=False,
-    )
+        train_sampler = DistributedSampler(
+            train_dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=True,
+            drop_last=True,
+        )
+
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=batch_size,
+            sampler=train_sampler,
+            num_workers=num_workers,
+            pin_memory=True,
+            drop_last=True,
+        )
+
+        # Validation also uses DistributedSampler (no shuffle)
+        val_sampler = DistributedSampler(
+            val_dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=False,
+            drop_last=False,
+        )
+
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=batch_size,
+            sampler=val_sampler,
+            num_workers=num_workers,
+            pin_memory=True,
+            drop_last=False,
+        )
+    else:
+        # Single GPU training
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            pin_memory=True,
+            drop_last=True,
+        )
+
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=True,
+            drop_last=False,
+        )
 
     return train_loader, val_loader
 

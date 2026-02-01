@@ -21,10 +21,14 @@ import subprocess
 import sys
 import time
 import datetime
+import os
 from pathlib import Path
 from threading import Thread
 
 import torch
+import torch.nn as nn
+import torch.multiprocessing as mp
+import torch.distributed as dist
 
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -145,6 +149,7 @@ def parse_args():
 
     # Training overrides
     parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--gpus", type=str, default="0", help="GPU IDs to use for DDP (comma-separated, e.g., '0,1')")
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--debug", action="store_true")
 
@@ -235,19 +240,42 @@ def map_stage_name(stage: str) -> TrainingStage:
     return stage_map.get(stage.lower())
 
 
-def main():
-    args = parse_args()
+def setup_ddp(rank, world_size):
+    """Initialize DDP environment."""
+    os.environ['MASTER_ADDR'] = 'localhost'
+    os.environ['MASTER_PORT'] = '12355'
+    dist.init_process_group(
+        backend='nccl',
+        world_size=world_size,
+        rank=rank
+    )
+    torch.cuda.set_device(rank)
 
-    # Load configuration
-    config = load_config(args.config, args)
 
-    # Determine device
-    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+def cleanup_ddp():
+    """Cleanup DDP environment."""
+    dist.destroy_process_group()
 
-    # TensorBoard launcher
+
+def train_ddp(rank, world_size, args, config):
+    """DDP training function for each process."""
+    # Setup DDP
+    setup_ddp(rank, world_size)
+    device = torch.device(f"cuda:{rank}")
+
+    # Only rank 0 prints and logs
+    is_main = rank == 0
+
+    if is_main:
+        print(f"[Rank {rank}] Using DDP with {world_size} GPUs")
+        print(f"[Rank {rank}] Using device: {device}")
+
+    # Enable CuDNN autotuner for A100 optimization
+    torch.backends.cudnn.benchmark = True
+
+    # TensorBoard launcher (only on rank 0)
     tb_launcher = None
-    if config["tensorboard"]["enabled"]:
+    if is_main and config["tensorboard"]["enabled"]:
         tb_launcher = TensorBoardLauncher(
             log_dir=config["tensorboard"]["log_dir"],
             port=args.tb_port,
@@ -259,25 +287,35 @@ def main():
             print("\nStopping training...")
             if tb_launcher:
                 tb_launcher.stop()
+            cleanup_ddp()
             sys.exit(0)
 
         signal.signal(signal.SIGINT, cleanup_handler)
         signal.signal(signal.SIGTERM, cleanup_handler)
 
-    # Create data loaders
-    print("\nLoading data...")
+    # Create data loaders with DistributedSampler
+    if is_main:
+        print("\nLoading data...")
+
+    from src.data.lp_dataset import create_dataloaders
     train_loader, val_loader = create_dataloaders(
         root_dir=args.data_root,
         batch_size=config["data"].get("batch_size", 16),
         num_workers=config["data"].get("num_workers", 4),
         image_size=tuple(config["data"].get("lr_size", [17, 31])),
+        distributed=True,
+        rank=rank,
+        world_size=world_size,
     )
 
-    print(f"Train samples: {len(train_loader.dataset)}")
-    print(f"Val samples: {len(val_loader.dataset)}")
+    if is_main:
+        print(f"Train samples: {len(train_loader.dataset)}")
+        print(f"Val samples: {len(val_loader.dataset)}")
 
     # Create generator
-    print("\nCreating generator...")
+    if is_main:
+        print("\nCreating generator...")
+
     model_config = config.get("model", {})
     generator = Generator(
         num_features=model_config.get("num_filters", 64),
@@ -286,51 +324,81 @@ def main():
         use_deformable=model_config.get("use_deformable", True),
     )
 
-    # Count parameters
-    total_params = sum(p.numel() for p in generator.parameters())
-    print(f"Generator parameters: {total_params:,}")
+    # Count parameters (only rank 0)
+    if is_main:
+        total_params = sum(p.numel() for p in generator.parameters())
+        print(f"Generator parameters: {total_params:,}")
 
     # Create OCR
-    print("\nCreating OCR model...")
+    if is_main:
+        print("\nCreating OCR model...")
+
     ocr_config = config.get("ocr", {})
     ocr = ParseqOCR(
         vocab=ocr_config.get("vocab", "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"),
         max_length=ocr_config.get("max_length", 7),
     )
 
-    # Load fine-tuned OCR if available
+    # Load fine-tuned OCR if available (all ranks need this)
     if ocr_config.get("finetuned_path") and Path(ocr_config["finetuned_path"]).exists():
-        print(f"Loading fine-tuned OCR from {ocr_config['finetuned_path']}")
+        if is_main:
+            print(f"Loading fine-tuned OCR from {ocr_config['finetuned_path']}")
         ocr.load(ocr_config["finetuned_path"])
 
-    # Create logger
-    logger = TensorBoardLogger(log_dir=config["tensorboard"]["log_dir"])
-    text_logger = TextLogger(log_dir=config["tensorboard"]["log_dir"], filename="training.log")
+    # Wrap models with DDP
+    generator = nn.parallel.DistributedDataParallel(
+        generator.to(device),
+        device_ids=[rank],
+        output_device=rank,
+        find_unused_parameters=True,  # For OCR frozen periods
+    )
+    ocr_model = nn.parallel.DistributedDataParallel(
+        ocr.to(device),
+        device_ids=[rank],
+        output_device=rank,
+    )
+    # Store the base OCR for access to methods
+    ocr.model = ocr_model
 
-    # Log training start
-    text_logger.info(f"Training configuration:")
-    text_logger.info(f"  Stage 0 (Pretrain): {config['progressive_training']['stage0']['epochs']} epochs")
-    text_logger.info(f"  Stage 1 (Warmup): {config['progressive_training']['stage1']['epochs']} epochs")
-    text_logger.info(f"  Stage 2 (LCOFL): {config['progressive_training']['stage2']['epochs']} epochs")
-    text_logger.info(f"  Stage 3 (Finetune): {config['progressive_training']['stage3']['epochs']} epochs")
-    text_logger.info("")
+    # Create logger (only rank 0)
+    logger = None
+    text_logger = None
+    if is_main:
+        logger = TensorBoardLogger(log_dir=config["tensorboard"]["log_dir"])
+        text_logger = TextLogger(log_dir=config["tensorboard"]["log_dir"], filename="training.log")
+
+        # Log training start
+        text_logger.info(f"DDP Training with {world_size} GPUs")
+        text_logger.info(f"Training configuration:")
+        text_logger.info(f"  Stage 0 (Pretrain): {config['progressive_training']['stage0']['epochs']} epochs")
+        text_logger.info(f"  Stage 1 (Warmup): {config['progressive_training']['stage1']['epochs']} epochs")
+        text_logger.info(f"  Stage 2 (LCOFL): {config['progressive_training']['stage2']['epochs']} epochs")
+        text_logger.info(f"  Stage 3 (Finetune): {config['progressive_training']['stage3']['epochs']} epochs")
+        text_logger.info("")
 
     # Create trainer
     trainer = ProgressiveTrainer(
         generator=generator,
-        ocr=ocr,
+        ocr=ocr_model,
         train_loader=train_loader,
         val_loader=val_loader,
         config=config,
         logger=logger,
         device=device,
+        distributed=True,
+        rank=rank,
+        world_size=world_size,
     )
-    trainer.set_text_logger(text_logger)
+    if is_main:
+        trainer.set_text_logger(text_logger)
 
-    # Resume from checkpoint if specified
-    if args.resume:
+    # Resume from checkpoint if specified (only rank 0 loads, then broadcast)
+    if args.resume and is_main:
         print(f"\nResuming from {args.resume}")
         trainer.load_checkpoint(args.resume)
+
+    # Synchronize all ranks before training
+    dist.barrier()
 
     # Run training
     if args.stage.lower() == "all":
@@ -338,22 +406,167 @@ def main():
     else:
         stage = map_stage_name(args.stage)
         if stage is None:
-            print(f"Invalid stage: {args.stage}")
+            if is_main:
+                print(f"Invalid stage: {args.stage}")
             return
-
         final_acc = trainer.train_stage(stage)
         results = {"final_acc": final_acc}
 
-    # Close loggers
-    logger.close()
-    text_logger.close()
+    # Close loggers (only rank 0)
+    if is_main:
+        logger.close()
+        text_logger.close()
 
-    # Stop TensorBoard
-    if tb_launcher:
-        print("\nStopping TensorBoard...")
-        tb_launcher.stop()
+        # Stop TensorBoard
+        if tb_launcher:
+            print("\nStopping TensorBoard...")
+            tb_launcher.stop()
 
-    print("\nTraining complete!")
+        print("\nTraining complete!")
+
+    # Cleanup DDP
+    cleanup_ddp()
+
+
+def main():
+    args = parse_args()
+
+    # Load configuration
+    config = load_config(args.config, args)
+
+    # Check if using DDP (multiple GPUs)
+    gpu_ids = args.gpus.split(',')
+    world_size = len(gpu_ids)
+
+    if world_size > 1:
+        # Use DDP for multi-GPU training
+        print(f"Using DDP with {world_size} GPUs: {args.gpus}")
+        mp.spawn(
+            train_ddp,
+            args=(world_size, args, config),
+            nprocs=world_size,
+            join=True
+        )
+    else:
+        # Single GPU training (original code path)
+        # Determine device
+        device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+        print(f"Using device: {device}")
+
+        # Enable CuDNN autotuner for A100 optimization
+        if torch.cuda.is_available():
+            torch.backends.cudnn.benchmark = True
+            print("CuDNN benchmark enabled for A100 optimization")
+
+        # TensorBoard launcher
+        tb_launcher = None
+        if config["tensorboard"]["enabled"]:
+            tb_launcher = TensorBoardLauncher(
+                log_dir=config["tensorboard"]["log_dir"],
+                port=args.tb_port,
+            )
+            tb_launcher.start()
+
+            # Handle Ctrl+C gracefully
+            def cleanup_handler(signum, frame):
+                print("\nStopping training...")
+                if tb_launcher:
+                    tb_launcher.stop()
+                sys.exit(0)
+
+            signal.signal(signal.SIGINT, cleanup_handler)
+            signal.signal(signal.SIGTERM, cleanup_handler)
+
+        # Create data loaders
+        print("\nLoading data...")
+        train_loader, val_loader = create_dataloaders(
+            root_dir=args.data_root,
+            batch_size=config["data"].get("batch_size", 16),
+            num_workers=config["data"].get("num_workers", 4),
+            image_size=tuple(config["data"].get("lr_size", [17, 31])),
+        )
+
+        print(f"Train samples: {len(train_loader.dataset)}")
+        print(f"Val samples: {len(val_loader.dataset)}")
+
+        # Create generator
+        print("\nCreating generator...")
+        model_config = config.get("model", {})
+        generator = Generator(
+            num_features=model_config.get("num_filters", 64),
+            num_blocks=model_config.get("num_rrdb_blocks", 16),
+            upscale_factor=model_config.get("upscale_factor", 2),
+            use_deformable=model_config.get("use_deformable", True),
+        )
+
+        # Count parameters
+        total_params = sum(p.numel() for p in generator.parameters())
+        print(f"Generator parameters: {total_params:,}")
+
+        # Create OCR
+        print("\nCreating OCR model...")
+        ocr_config = config.get("ocr", {})
+        ocr = ParseqOCR(
+            vocab=ocr_config.get("vocab", "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"),
+            max_length=ocr_config.get("max_length", 7),
+        )
+
+        # Load fine-tuned OCR if available
+        if ocr_config.get("finetuned_path") and Path(ocr_config["finetuned_path"]).exists():
+            print(f"Loading fine-tuned OCR from {ocr_config['finetuned_path']}")
+            ocr.load(ocr_config["finetuned_path"])
+
+        # Create logger
+        logger = TensorBoardLogger(log_dir=config["tensorboard"]["log_dir"])
+        text_logger = TextLogger(log_dir=config["tensorboard"]["log_dir"], filename="training.log")
+
+        # Log training start
+        text_logger.info(f"Training configuration:")
+        text_logger.info(f"  Stage 0 (Pretrain): {config['progressive_training']['stage0']['epochs']} epochs")
+        text_logger.info(f"  Stage 1 (Warmup): {config['progressive_training']['stage1']['epochs']} epochs")
+        text_logger.info(f"  Stage 2 (LCOFL): {config['progressive_training']['stage2']['epochs']} epochs")
+        text_logger.info(f"  Stage 3 (Finetune): {config['progressive_training']['stage3']['epochs']} epochs")
+        text_logger.info("")
+
+        # Create trainer
+        trainer = ProgressiveTrainer(
+            generator=generator,
+            ocr=ocr,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            config=config,
+            logger=logger,
+            device=device,
+        )
+        trainer.set_text_logger(text_logger)
+
+        # Resume from checkpoint if specified
+        if args.resume:
+            print(f"\nResuming from {args.resume}")
+            trainer.load_checkpoint(args.resume)
+
+        # Run training
+        if args.stage.lower() == "all":
+            results = trainer.train_full_progressive()
+        else:
+            stage = map_stage_name(args.stage)
+            if stage is None:
+                print(f"Invalid stage: {args.stage}")
+                return
+
+            final_acc = trainer.train_stage(stage)
+            results = {"final_acc": final_acc}
+
+        # Close loggers
+        logger.close()
+        text_logger.close()
+
+        # Stop TensorBoard
+        if tb_launcher:
+            print("\nStopping TensorBoard...")
+            tb_launcher.stop()
+
+        print("\nTraining complete!")
 
 
 if __name__ == "__main__":

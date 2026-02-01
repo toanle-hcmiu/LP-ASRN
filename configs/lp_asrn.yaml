@@ -3,9 +3,8 @@
 
 model:
   # Number of RRDB-EA blocks in the deep feature extractor
-  # Reduced from 16 to 12 for stability and memory efficiency
-  # Still provides excellent performance
-  num_rrdb_blocks: 12
+  # Full 16 blocks for maximum accuracy (A100 80GB can handle it)
+  num_rrdb_blocks: 16
 
   # Number of feature channels
   num_filters: 64
@@ -31,11 +30,11 @@ data:
   # Target size for LR images (height, width)
   lr_size: [17, 31]
 
-  # Batch size for training
-  batch_size: 16
+  # Batch size for training (optimized for A100 80GB)
+  batch_size: 128
 
-  # Number of data loading workers
-  num_workers: 4
+  # Number of data loading workers (optimized for A100)
+  num_workers: 16
 
   # Validation split
   val_split: 0.1
@@ -174,8 +173,8 @@ tensorboard:
 
 # Evaluation settings
 evaluation:
-  # Batch size for evaluation
-  batch_size: 8
+  # Batch size for evaluation (optimized for A100)
+  batch_size: 32
 
   # Metrics to compute
   metrics:
