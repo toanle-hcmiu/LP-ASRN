@@ -332,7 +332,7 @@ class ProgressiveTrainer:
 
                 # OCR predictions (ONCE per batch - greedy decoding for speed)
                 ocr_unwrapped = self._unwrap_model(self.ocr)
-                pred_texts = ocr_unwrapped.predict(sr_images, beam_width=5)
+                pred_texts = ocr_unwrapped.predict(sr_images, beam_width=3)
 
                 # Store first batch for visualization
                 if sample_batch is None and self.logger:
