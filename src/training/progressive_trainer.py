@@ -459,6 +459,11 @@ class ProgressiveTrainer:
             # Validation
             val_metrics = self.validate()
 
+            # Synchronize all ranks after validation (critical for DDP)
+            # Without this, Rank 1 continues while Rank 0 is still validating, causing NCCL timeout
+            if self.distributed:
+                dist.barrier()
+
             # Print results (only rank 0)
             if self.is_main:
                 print(f"\nOCR Pretrain Epoch {epoch+1}/{stage_config.epochs}:")
@@ -581,6 +586,11 @@ class ProgressiveTrainer:
 
             # Validate
             val_metrics = self.validate()
+
+            # Synchronize all ranks after validation (critical for DDP)
+            # Without this, Rank 1 continues while Rank 0 is still validating, causing NCCL timeout
+            if self.distributed:
+                dist.barrier()
 
             # Update confusion if needed
             if config.update_confusion:
