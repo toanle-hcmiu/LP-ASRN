@@ -212,15 +212,6 @@ class ProgressiveTrainer:
         else:
             print(message)
 
-        print(f"\n{'='*60}")
-        print(f"STAGE: {stage.value.upper()}")
-        print(f"{'='*60}")
-        print(f"Epochs: {config.epochs}")
-        print(f"Learning Rate: {config.lr}")
-        print(f"Loss Components: {config.loss_components}")
-        print(f"OCR Frozen: {config.freeze_ocr}")
-        print(f"{'='*60}\n")
-
     def train_epoch(self, stage_config: StageConfig) -> Dict[str, float]:
         """Train for one epoch."""
         self.generator.train()
@@ -328,6 +319,7 @@ class ProgressiveTrainer:
             }
 
         self.generator.eval()
+        self.ocr.eval()  # Critical: ensure batch norm uses eval statistics
 
         total_psnr = 0.0
         total_ssim = 0.0
@@ -394,6 +386,10 @@ class ProgressiveTrainer:
         word_acc = word_correct / len(self.val_loader.dataset)
         char_acc = char_correct / total_chars if total_chars > 0 else 0
 
+        # Restore training mode
+        self.generator.train()
+        self.ocr.train()
+
         return {
             "psnr": avg_psnr,
             "ssim": avg_ssim,
@@ -402,6 +398,62 @@ class ProgressiveTrainer:
             "pred_texts": pred_texts_all,
             "gt_texts": gt_texts_all,
             "sample_batch": sample_batch,
+        }
+
+    def validate_ocr_only(self, beam_width: int = 5) -> Dict[str, float]:
+        """
+        Validate OCR model on HR images (for OCR pretraining stage).
+
+        Unlike validate() which runs SR generator, this validates OCR directly
+        on HR images since OCR pretraining doesn't use the generator.
+
+        Args:
+            beam_width: Beam width for OCR decoding
+
+        Returns:
+            Dictionary with word_acc and char_acc (no PSNR/SSIM for OCR-only validation)
+        """
+        if self.distributed and not self.is_main:
+            return {"word_acc": 0.0, "char_acc": 0.0}
+
+        if self.val_loader is None:
+            return {"word_acc": 0.0, "char_acc": 0.0}
+
+        self.ocr.eval()
+
+        word_correct = 0
+        char_correct = 0
+        char_total = 0
+        total_samples = 0
+
+        with torch.no_grad():
+            for batch in tqdm(self.val_loader, desc="OCR Validation"):
+                hr_images = batch["hr"].to(self.device)
+                gt_texts = batch["plate_text"]
+
+                # OCR predictions on HR images (not SR!)
+                ocr_unwrapped = self._unwrap_model(self.ocr)
+                pred_texts = ocr_unwrapped.predict(hr_images, beam_width=beam_width)
+
+                for pred, gt in zip(pred_texts, gt_texts):
+                    total_samples += 1
+                    if pred == gt:
+                        word_correct += 1
+
+                    # Fixed char accuracy: count ALL GT chars, not just matched positions
+                    for i, g_char in enumerate(gt):
+                        char_total += 1
+                        if i < len(pred) and pred[i] == g_char:
+                            char_correct += 1
+                    # Extra predicted chars count as errors
+                    if len(pred) > len(gt):
+                        char_total += len(pred) - len(gt)
+
+        self.ocr.train()  # Restore training mode
+
+        return {
+            "word_acc": word_correct / total_samples if total_samples > 0 else 0,
+            "char_acc": char_correct / char_total if char_total > 0 else 0,
         }
 
     def save_ocr_checkpoint(self, epoch: int, stage: TrainingStage):
@@ -439,18 +491,19 @@ class ProgressiveTrainer:
         self.ocr.train()
 
         # Create optimizer for OCR only (AdamW with weight decay for better generalization)
+        # Note: LR scaled down by 10x for more stable fine-tuning (original 0.001 was too aggressive)
         self.optimizer = optim.AdamW(
             self.ocr.parameters(),
-            lr=stage_config.lr,
-            weight_decay=0.05,
+            lr=stage_config.lr * 0.1,  # Scale down: 0.001 → 0.0001
+            weight_decay=0.01,  # Reduced from 0.05 (was preventing proper adaptation)
         )
 
         # Add LR scheduler for OCR pretraining (cosine annealing with warm restarts)
         ocr_scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
             self.optimizer,
             T_0=20,      # Restart every 20 epochs
-            T_mult=2,    # Double period after each restart
-            eta_min=1e-6,
+            T_mult=1,    # Don't double period (more stable, was T_mult=2)
+            eta_min=1e-5,  # Higher minimum (was 1e-6, too low)
         )
 
         # Use char_acc for early stopping (more granular than word_acc)
@@ -468,6 +521,10 @@ class ProgressiveTrainer:
 
         # Track step counter for OCR pretraining
         ocr_step = 0
+
+        # Get validation config (outside loop for efficiency)
+        val_interval = self.config.get("training", {}).get("val_interval", 30)
+        val_beam_width = self.config.get("training", {}).get("val_beam_width", 5)
 
         for epoch in range(stage_config.epochs):
             total_loss = 0.0
@@ -503,16 +560,12 @@ class ProgressiveTrainer:
 
             avg_loss = total_loss / len(self.train_loader)
 
-            # Get validation config
-            val_interval = self.config.get("training", {}).get("val_interval", 30)
-            val_beam_width = self.config.get("training", {}).get("val_beam_width", 5)
-
             # Only validate every val_interval epochs (or first/last epoch)
             should_validate = (epoch % val_interval == 0) or (epoch == 0) or (epoch == stage_config.epochs - 1)
 
             if should_validate:
                 # No barrier needed - only rank 0 validates, others return early
-                val_metrics = self.validate(beam_width=val_beam_width)
+                val_metrics = self.validate_ocr_only(beam_width=val_beam_width)
 
                 # Log validation metrics to TensorBoard
                 if self.logger and self.is_main:
@@ -520,24 +573,14 @@ class ProgressiveTrainer:
                     self.logger.log_scalar(f"{stage_prefix}/val_loss", avg_loss, epoch)
                     self.logger.log_scalar(f"{stage_prefix}/val_char_acc", val_metrics['char_acc'], epoch)
                     self.logger.log_scalar(f"{stage_prefix}/val_word_acc", val_metrics['word_acc'], epoch)
-                    self.logger.log_scalar(f"{stage_prefix}/val_psnr", val_metrics['psnr'], epoch)
-                    self.logger.log_scalar(f"{stage_prefix}/val_ssim", val_metrics['ssim'], epoch)
-
-                    # Log OCR predictions visualization
-                    if val_metrics.get("sample_batch"):
-                        self._log_ocr_predictions(val_metrics["sample_batch"], epoch)
+                    # No PSNR/SSIM for OCR-only validation (not applicable without SR generator)
 
                 # Print results
                 if self.is_main:
                     print(f"\nOCR Pretrain Epoch {epoch+1}/{stage_config.epochs}:")
                     print(f"  Train Loss: {avg_loss:.4f}")
-                    print(f"  Val PSNR: {val_metrics['psnr']:.2f} dB")
-                    print(f"  Val SSIM: {val_metrics['ssim']:.4f}")
                     print(f"  Val Word Acc: {val_metrics['word_acc']:.4f}")
                     print(f"  Val Char Acc: {val_metrics['char_acc']:.4f}")
-
-                # Step LR scheduler (CosineAnnealingWarmRestarts is epoch-based)
-                ocr_scheduler.step()
 
                 # Save best model (using char_acc for early stopping)
                 if val_metrics['char_acc'] > best_char_acc:
@@ -562,8 +605,8 @@ class ProgressiveTrainer:
                 if self.is_main:
                     print(f"\nOCR Pretrain Epoch {epoch+1}/{stage_config.epochs}: Train Loss: {avg_loss:.4f}")
 
-                # Still step scheduler when validation is skipped
-                ocr_scheduler.step()
+            # Always step scheduler after each epoch (cosine annealing is epoch-based)
+            ocr_scheduler.step()
 
         # Freeze OCR after pretraining for subsequent stages
         for param in self.ocr.parameters():

@@ -28,10 +28,11 @@ data:
     - "Mercosur"    # LLLNLNN pattern
 
   # Target size for LR images (height, width)
-  lr_size: [17, 31]
+  # Increased from 17x31 to 34x62 (2x) for better OCR - each character now ~10-12 pixels instead of ~5-6
+  lr_size: [34, 62]
 
-  # Batch size for training (optimized for A100 80GB)
-  batch_size: 128
+  # Batch size for training (reduced from 128 to 32 due to 4x larger images)
+  batch_size: 32
 
   # Number of data loading workers (reduced for DDP stability)
   num_workers: 4
@@ -179,8 +180,8 @@ tensorboard:
 
 # Evaluation settings
 evaluation:
-  # Batch size for evaluation (optimized for A100)
-  batch_size: 32
+  # Batch size for evaluation (reduced from 32 to 16 due to larger input images)
+  batch_size: 16
 
   # Metrics to compute
   metrics:

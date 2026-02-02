@@ -8,7 +8,9 @@
       "Bash(timeout:*)",
       "Bash(CUDA_VISIBLE_DEVICES= python:*)",
       "Bash(python.exe:*)",
-      "Bash(dir:*)"
+      "Bash(dir:*)",
+      "Bash(xargs:*)",
+      "Bash(find:*)"
     ]
   }
 }

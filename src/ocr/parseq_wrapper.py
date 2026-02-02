@@ -725,7 +725,7 @@ class SimpleCRNN(nn.Module):
 
         # 1. Spatial Transformer (TPS) for text rectification
         self.stn = TPS_SpatialTransformerNetwork(
-            input_size=(34, 62),
+            input_size=(68, 124),  # Updated for new HR size (was 34, 62)
             output_size=(32, 100),
             num_fiducial=20,
         )
@@ -848,13 +848,14 @@ class SimpleCRNN(nn.Module):
 
         return results
 
-    def ctc_decode_beam_search(self, logits: torch.Tensor, beam_width: int = 5) -> List[str]:
+    def ctc_decode_beam_search(self, logits: torch.Tensor, beam_width: int = 5, length_norm: float = 0.7) -> List[str]:
         """
-        Decode CTC logits using beam search.
+        Decode CTC logits using beam search with length normalization.
 
         Args:
             logits: (B, T, C) predictions where C includes blank token
             beam_width: Number of beams to keep
+            length_norm: Exponent for length normalization (0=no norm, 0.7=recommended)
 
         Returns:
             List of decoded text strings
@@ -865,13 +866,13 @@ class SimpleCRNN(nn.Module):
         results = []
         for b in range(B):
             # Initialize beam with empty sequence
-            # Each beam entry: (sequence, log_prob, prev_idx)
-            beam = [([], 0.0, None)]  # (sequence, log_prob, prev_idx)
+            # Each beam entry: (sequence, log_prob, prev_idx, blank_count)
+            beam = [([], 0.0, None, 0)]  # (sequence, log_prob, prev_idx, blank_count)
 
             for t in range(T):
                 new_beam = []
 
-                for seq, log_prob, prev_idx in beam:
+                for seq, log_prob, prev_idx, blank_count in beam:
                     # Top-k candidates at this timestep
                     top_k_log_probs, top_k_indices = log_probs[b, t].topk(beam_width)
 
@@ -879,23 +880,40 @@ class SimpleCRNN(nn.Module):
                         idx = top_k_indices[k].item()
                         prob = top_k_log_probs[k].item()
 
-                        # Skip consecutive duplicates (CTC constraint)
-                        if idx == prev_idx:
-                            continue
-
                         new_seq = seq.copy()
-                        # Only add non-blank characters
-                        if idx != self.blank_idx:
+                        new_blank_count = blank_count
+
+                        # Proper CTC blank handling
+                        if idx == self.blank_idx:
+                            # Blank token - don't add to sequence but track blank count
+                            new_blank_count += 1
+                            new_prev_idx = None  # Reset prev_idx after blank
+                        elif prev_idx == idx and blank_count == 0:
+                            # Consecutive duplicate without blank - skip (CTC collapse)
+                            continue
+                        else:
+                            # Valid character
                             new_seq.append(idx)
+                            new_blank_count = 0
+                            new_prev_idx = idx
 
-                        new_beam.append((new_seq, log_prob + prob, idx))
+                        # Apply length normalization during beam selection
+                        norm_log_prob = log_prob + prob
+                        seq_len = len(new_seq) if len(new_seq) > 0 else 1
+                        norm_score = norm_log_prob / (seq_len ** length_norm)
 
-                # Sort by log probability and keep top beams
-                new_beam.sort(key=lambda x: x[1], reverse=True)
+                        new_beam.append((new_seq, norm_log_prob, new_prev_idx, new_blank_count))
+
+                # Sort by normalized score and keep top beams
+                new_beam.sort(key=lambda x: x[0] / (len(x[0]) ** length_norm) if len(x[0]) > 0 else x[1], reverse=True)
                 beam = new_beam[:beam_width]
 
-            # Return best sequence (highest log prob)
-            best_seq = beam[0][0]
+            # Return best sequence using length-normalized score
+            if len(beam) > 0:
+                best_beam = max(beam, key=lambda x: x[1] / (max(len(x[0]), 1) ** length_norm))
+                best_seq = best_beam[0]
+            else:
+                best_seq = []
             results.append(best_seq)
 
         return results
