@@ -244,6 +244,11 @@ def setup_ddp(rank, world_size):
     """Initialize DDP environment."""
     os.environ['MASTER_ADDR'] = 'localhost'
     os.environ['MASTER_PORT'] = '12355'
+
+    # NCCL settings for better error handling and longer timeout
+    os.environ["NCCL_BLOCKING_WAIT"] = "1"  # Better error messages
+    os.environ["NCCL_TIMEOUT"] = "1800"  # 30 minutes (default is 10 min)
+
     dist.init_process_group(
         backend='nccl',
         world_size=world_size,

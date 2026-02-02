@@ -387,6 +387,8 @@ def create_dataloaders(
             num_workers=num_workers,
             pin_memory=True,
             drop_last=True,
+            timeout=300,  # 5 minute timeout for worker response
+            persistent_workers=False,  # Recreate workers each epoch for DDP stability
         )
 
         # Validation: only rank 0 validates on full dataset
@@ -401,6 +403,8 @@ def create_dataloaders(
                 num_workers=min(num_workers, 4),  # Limit workers for validation
                 pin_memory=True,
                 drop_last=False,
+                timeout=300,  # 5 minute timeout for worker response
+                persistent_workers=False,  # Recreate workers each epoch for DDP stability
             )
         else:
             # Other ranks: None (completely skip validation dataloader)
@@ -415,6 +419,8 @@ def create_dataloaders(
             num_workers=num_workers,
             pin_memory=True,
             drop_last=True,
+            timeout=300,  # 5 minute timeout for worker response
+            persistent_workers=False,  # Recreate workers each epoch for stability
         )
 
         val_loader = DataLoader(
@@ -424,6 +430,8 @@ def create_dataloaders(
             num_workers=num_workers,
             pin_memory=True,
             drop_last=False,
+            timeout=300,  # 5 minute timeout for worker response
+            persistent_workers=False,  # Recreate workers each epoch for stability
         )
 
     return train_loader, val_loader
