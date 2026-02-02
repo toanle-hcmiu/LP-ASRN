@@ -16,6 +16,20 @@ import numpy as np
 from torchvision import transforms
 
 
+class AddGaussianNoise:
+    """Add Gaussian noise to tensor for low-light simulation."""
+
+    def __init__(self, mean=0.0, std=0.05):
+        self.mean = mean
+        self.std = std
+
+    def __call__(self, img):
+        if isinstance(img, Image.Image):
+            img = transforms.ToTensor()(img)
+        noise = torch.randn_like(img) * self.std + self.mean
+        return torch.clamp(img + noise, 0, 1)
+
+
 class LicensePlateDataset(Dataset):
     """
     Dataset for license plate super-resolution.
@@ -130,11 +144,30 @@ class LicensePlateDataset(Dataset):
         return samples
 
     def _get_augment_transform(self) -> transforms.Compose:
-        """Get data augmentation pipeline."""
+        """Get license plate specific augmentation pipeline - NO horizontal flip!"""
         return transforms.Compose([
-            transforms.RandomHorizontalFlip(p=0.5),
-            transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.1),
-            transforms.RandomRotation(degrees=5),
+            # Geometric transforms (preserve text order - NO horizontal flip!)
+            transforms.RandomAffine(
+                degrees=5,              # Slight rotation
+                translate=(0.05, 0.1),  # Small translation
+                scale=(0.9, 1.1),       # Scale variation
+                shear=5,                # Perspective simulation
+            ),
+            # Photometric transforms
+            transforms.ColorJitter(
+                brightness=0.4,
+                contrast=0.4,
+                saturation=0.2,
+                hue=0.1,
+            ),
+            # Blur for motion/defocus simulation
+            transforms.RandomApply([
+                transforms.GaussianBlur(kernel_size=3, sigma=(0.5, 2.0)),
+            ], p=0.3),
+            # Noise for low-light simulation
+            transforms.RandomApply([
+                AddGaussianNoise(mean=0, std=0.05),
+            ], p=0.3),
         ])
 
     def _load_image(self, path: str) -> Image.Image:

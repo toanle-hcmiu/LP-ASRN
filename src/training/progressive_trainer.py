@@ -438,15 +438,19 @@ class ProgressiveTrainer:
 
         self.ocr.train()
 
-        # Create optimizer for OCR only
-        self.optimizer = optim.Adam(self.ocr.parameters(), lr=stage_config.lr)
+        # Create optimizer for OCR only (AdamW with weight decay for better generalization)
+        self.optimizer = optim.AdamW(
+            self.ocr.parameters(),
+            lr=stage_config.lr,
+            weight_decay=0.05,
+        )
 
-        # Add LR scheduler for OCR pretraining (reduces LR when accuracy plateaus)
-        ocr_scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        # Add LR scheduler for OCR pretraining (cosine annealing with warm restarts)
+        ocr_scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
             self.optimizer,
-            mode='max',
-            factor=0.5,
-            patience=10,
+            T_0=20,      # Restart every 20 epochs
+            T_mult=2,    # Double period after each restart
+            eta_min=1e-6,
         )
 
         # Use char_acc for early stopping (more granular than word_acc)
@@ -532,8 +536,8 @@ class ProgressiveTrainer:
                     print(f"  Val Word Acc: {val_metrics['word_acc']:.4f}")
                     print(f"  Val Char Acc: {val_metrics['char_acc']:.4f}")
 
-                # Step LR scheduler based on validation char_acc
-                ocr_scheduler.step(val_metrics['char_acc'])
+                # Step LR scheduler (CosineAnnealingWarmRestarts is epoch-based)
+                ocr_scheduler.step()
 
                 # Save best model (using char_acc for early stopping)
                 if val_metrics['char_acc'] > best_char_acc:
@@ -557,6 +561,9 @@ class ProgressiveTrainer:
                 # Skip validation - just print training progress
                 if self.is_main:
                     print(f"\nOCR Pretrain Epoch {epoch+1}/{stage_config.epochs}: Train Loss: {avg_loss:.4f}")
+
+                # Still step scheduler when validation is skipped
+                ocr_scheduler.step()
 
         # Freeze OCR after pretraining for subsequent stages
         for param in self.ocr.parameters():

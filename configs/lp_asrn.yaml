@@ -47,7 +47,7 @@ training:
   lr: 0.0001
 
   # Validation interval (validate every N epochs to save time)
-  val_interval: 10
+  val_interval: 5  # Validate more frequently for better monitoring
 
   # Beam width for validation (higher = more accurate but slower)
   val_beam_width: 5
@@ -67,8 +67,8 @@ training:
   lr_gamma: 0.9
 
   # Early stopping patience (from Paper 1)
-  # Stops after 20 epochs without loss decrease
-  early_stop_patience: 20
+  # Stops after 30 epochs without improvement (increased for 98% target)
+  early_stop_patience: 30
 
   # Monitor metric for early stopping
   # "recognition_rate" monitors OCR accuracy (Paper 2 innovation)
@@ -127,7 +127,7 @@ progressive_training:
   stage0:
     name: "pretrain"
     epochs: 150   # Increased: OCR needs more time to learn from scratch
-    lr: 0.0001
+    lr: 0.001  # Increased from 0.0001 for faster convergence
     loss_components: ["ocr"]
     freeze_ocr: false
     update_confusion: false
