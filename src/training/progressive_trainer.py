@@ -523,7 +523,6 @@ class ProgressiveTrainer:
             factor=0.5,       # Halve LR on plateau
             patience=5,       # Wait 5 validations
             min_lr=1e-6,
-            verbose=True,
         )
 
         # Use char_acc for early stopping (more granular than word_acc)
