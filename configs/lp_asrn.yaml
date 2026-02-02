@@ -127,7 +127,7 @@ progressive_training:
   # This ensures OCR can provide meaningful guidance to the generator
   stage0:
     name: "pretrain"
-    epochs: 150   # Increased: OCR needs more time to learn from scratch
+    epochs: 50   # Reduced: OCR converges fast, no need for 150
     lr: 0.001  # Increased from 0.0001 for faster convergence
     loss_components: ["ocr"]
     freeze_ocr: false

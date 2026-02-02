@@ -427,13 +427,17 @@ class ProgressiveTrainer:
         total_samples = 0
 
         with torch.no_grad():
-            for batch in tqdm(self.val_loader, desc="OCR Validation"):
+            for batch_idx, batch in enumerate(tqdm(self.val_loader, desc="OCR Validation")):
                 hr_images = batch["hr"].to(self.device)
                 gt_texts = batch["plate_text"]
 
                 # OCR predictions on HR images (not SR!)
                 ocr_unwrapped = self._unwrap_model(self.ocr)
                 pred_texts = ocr_unwrapped.predict(hr_images, beam_width=beam_width)
+
+                # Periodic GPU memory cleanup to prevent OOM
+                if batch_idx % 20 == 0 and batch_idx > 0:
+                    torch.cuda.empty_cache()
 
                 for pred, gt in zip(pred_texts, gt_texts):
                     total_samples += 1
@@ -576,8 +580,15 @@ class ProgressiveTrainer:
             should_validate = (epoch % val_interval == 0) or (epoch == 0) or (epoch == stage_config.epochs - 1)
 
             if should_validate:
-                # No barrier needed - only rank 0 validates, others return early
+                # DDP sync: all ranks pause before validation, allowing memory release
+                if self.distributed:
+                    dist.barrier()
+
                 val_metrics = self.validate_ocr_only(beam_width=val_beam_width)
+
+                # DDP sync: all ranks wait for validation to complete
+                if self.distributed:
+                    dist.barrier()
 
                 # Log validation metrics to TensorBoard
                 if self.logger and self.is_main:
