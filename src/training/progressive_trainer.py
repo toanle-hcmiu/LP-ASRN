@@ -549,8 +549,9 @@ class ProgressiveTrainer:
                 # Forward pass
                 logits = self.ocr(hr_images, return_logits=True)
 
-                # Compute CTC loss
-                loss = self.ocr.compute_ctc_loss(logits, gt_texts, device=self.device)
+                # Compute CTC loss (unwrap DDP to access custom method)
+                ocr_unwrapped = self._unwrap_model(self.ocr)
+                loss = ocr_unwrapped.compute_ctc_loss(logits, gt_texts, device=self.device)
 
                 # Backward pass
                 self.optimizer.zero_grad()
