@@ -19,7 +19,7 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.distributed as dist
 from torch.utils.data import DataLoader
-from torch.optim.lr_scheduler import StepLR
+from torch.optim.lr_scheduler import StepLR, ReduceLROnPlateau
 from tqdm import tqdm
 
 from src.models.generator import Generator
@@ -74,6 +74,7 @@ class ProgressiveTrainer:
         distributed: bool = False,
         rank: int = 0,
         world_size: int = 1,
+        train_sampler: Optional["DistributedSampler"] = None,
     ):
         """
         Initialize Progressive Trainer.
@@ -89,6 +90,7 @@ class ProgressiveTrainer:
             distributed: Whether using DDP
             rank: Rank for DDP
             world_size: World size for DDP
+            train_sampler: DistributedSampler for training data (for set_epoch calls)
         """
         # For DDP, models are already wrapped and moved to device
         self.generator = generator
@@ -105,6 +107,7 @@ class ProgressiveTrainer:
         self.rank = rank
         self.world_size = world_size
         self.is_main = not distributed or rank == 0
+        self.train_sampler = train_sampler
 
         # Extract progressive training config
         self.progressive_config = config.get("progressive_training", {})
@@ -513,12 +516,14 @@ class ProgressiveTrainer:
             weight_decay=0.01,  # Reduced from 0.05 (was preventing proper adaptation)
         )
 
-        # Add LR scheduler for OCR pretraining (cosine annealing with warm restarts)
-        ocr_scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        # Add LR scheduler for OCR pretraining (ReduceLROnPlateau for stability)
+        ocr_scheduler = optim.lr_scheduler.ReduceLROnPlateau(
             self.optimizer,
-            T_0=20,      # Restart every 20 epochs
-            T_mult=1,    # Don't double period (more stable, was T_mult=2)
-            eta_min=1e-5,  # Higher minimum (was 1e-6, too low)
+            mode='max',       # Maximize character accuracy
+            factor=0.5,       # Halve LR on plateau
+            patience=5,       # Wait 5 validations
+            min_lr=1e-6,
+            verbose=True,
         )
 
         # Use char_acc for early stopping (more granular than word_acc)
@@ -542,6 +547,10 @@ class ProgressiveTrainer:
         val_beam_width = self.config.get("training", {}).get("val_beam_width", 5)
 
         for epoch in range(stage_config.epochs):
+            # Set epoch for proper shuffling in DDP
+            if self.train_sampler is not None:
+                self.train_sampler.set_epoch(epoch)
+
             total_loss = 0.0
 
             pbar = tqdm(self.train_loader, desc=f"OCR Pretrain Epoch {epoch+1}/{stage_config.epochs}",
@@ -555,7 +564,9 @@ class ProgressiveTrainer:
 
                 # Compute CTC loss (unwrap DDP to access custom method)
                 ocr_unwrapped = self._unwrap_model(self.ocr)
-                loss = ocr_unwrapped.compute_ctc_loss(logits, gt_texts, device=self.device)
+                label_smoothing = self.config.get("ocr", {}).get("label_smoothing", 0.1)
+                loss = ocr_unwrapped.compute_ctc_loss(logits, gt_texts, device=self.device,
+                                                       label_smoothing=label_smoothing)
 
                 # Backward pass
                 self.optimizer.zero_grad()
@@ -579,16 +590,12 @@ class ProgressiveTrainer:
             # Only validate every val_interval epochs (or first/last epoch)
             should_validate = (epoch % val_interval == 0) or (epoch == 0) or (epoch == stage_config.epochs - 1)
 
+            # DDP sync: all ranks pause before validation
+            if self.distributed:
+                dist.barrier()
+
             if should_validate:
-                # DDP sync: all ranks pause before validation, allowing memory release
-                if self.distributed:
-                    dist.barrier()
-
                 val_metrics = self.validate_ocr_only(beam_width=val_beam_width)
-
-                # DDP sync: all ranks wait for validation to complete
-                if self.distributed:
-                    dist.barrier()
 
                 # Log validation metrics to TensorBoard
                 if self.logger and self.is_main:
@@ -628,8 +635,16 @@ class ProgressiveTrainer:
                 if self.is_main:
                     print(f"\nOCR Pretrain Epoch {epoch+1}/{stage_config.epochs}: Train Loss: {avg_loss:.4f}")
 
-            # Always step scheduler after each epoch (cosine annealing is epoch-based)
-            ocr_scheduler.step()
+            # DDP sync: all ranks wait for validation to complete
+            if self.distributed:
+                dist.barrier()
+
+            # Step scheduler with validation metric (ReduceLROnPlateau is metric-based)
+            if should_validate:
+                ocr_scheduler.step(val_metrics['char_acc'])
+            else:
+                # If no validation, step with current best (scheduler will keep same LR)
+                ocr_scheduler.step(best_char_acc)
 
         # Freeze OCR after pretraining for subsequent stages
         for param in self.ocr.parameters():
@@ -901,7 +916,6 @@ class ProgressiveTrainer:
             should_validate = (epoch % val_interval == 0) or (epoch == 0) or (epoch == config.epochs - 1)
 
             if should_validate:
-                # No barrier needed - only rank 0 validates, others return early
                 val_metrics = self.validate(beam_width=val_beam_width)
 
                 # Update confusion if needed (only main rank has pred_texts)
@@ -914,6 +928,10 @@ class ProgressiveTrainer:
             else:
                 # Skip validation - provide minimal metrics for early stopping
                 val_metrics = {"word_acc": 0.0, "char_acc": 0.0, "psnr": 0.0, "ssim": 0.0, "pred_texts": [], "gt_texts": []}
+
+            # DDP sync: ALL ranks must synchronize at end of epoch (before early stopping check)
+            if self.distributed:
+                dist.barrier()
 
             # Print results (only when validation was performed)
             if should_validate:

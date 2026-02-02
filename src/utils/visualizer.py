@@ -90,15 +90,19 @@ def create_comparison_grid(
     _, _, H_lr, W_lr = lr_images.shape
     _, _, H_hr, W_hr = hr_images.shape
 
+    # Validate dimensions - skip if any image has zero-dimension
+    if H_lr <= 0 or W_lr <= 0 or H_hr <= 0 or W_hr <= 0:
+        raise ValueError(f"Invalid image dimensions: lr=({H_lr}, {W_lr}), hr=({H_hr}, {W_hr})")
+
     # Upscale LR for display
     lr_upscaled = nn.functional.interpolate(
         lr_images[:B], size=(H_hr, W_hr), mode='bilinear', align_corners=False
     )
 
     # Calculate grid dimensions
-    # 3 columns (LR, SR, HR) x B rows
+    # 3 columns (LR, SR, HR) x B rows, with padding on left and between images
     H_grid = B * H_hr + (B + 1) * padding
-    W_grid = 3 * W_hr + 2 * padding
+    W_grid = 3 * W_hr + 4 * padding  # padding | LR | padding | SR | padding | HR | padding
 
     # Create blank canvas (channel by channel since torch.full requires scalar fill_value)
     grid = torch.zeros((3, H_grid, W_grid), dtype=torch.float32)
@@ -119,10 +123,10 @@ def create_comparison_grid(
         grid[:, row_y:row_y+H_hr, padding:padding+W_hr] = lr_disp[i]
 
         # SR image
-        grid[:, row_y:row_y+H_hr, padding+W_hr+padding:2*padding+W_hr] = sr_disp[i]
+        grid[:, row_y:row_y+H_hr, W_hr+2*padding:2*W_hr+2*padding] = sr_disp[i]
 
         # HR image
-        grid[:, row_y:row_y+H_hr, 2*padding+2*W_hr:2*padding+3*W_hr] = hr_disp[i]
+        grid[:, row_y:row_y+H_hr, 2*W_hr+3*padding:3*W_hr+3*padding] = hr_disp[i]
 
     # Add text if available
     if gt_texts is not None or pred_texts is not None:

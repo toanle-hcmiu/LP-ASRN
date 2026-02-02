@@ -15,6 +15,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import List, Dict, Optional, Tuple
 import re
+import math
 
 import torch
 import torch.nn as nn
@@ -184,6 +185,7 @@ class ParseqOCR(nn.Module):
         vocab: str = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ",
         max_length: int = 7,
         frozen: bool = True,
+        rnn_dropout: float = 0.3,
     ):
         """
         Initialize Parseq OCR.
@@ -193,6 +195,7 @@ class ParseqOCR(nn.Module):
             vocab: Character vocabulary
             max_length: Maximum sequence length
             frozen: If True, freeze weights during SR training
+            rnn_dropout: Dropout rate for RNN layer in SimpleCRNN
         """
         super().__init__()
 
@@ -206,6 +209,7 @@ class ParseqOCR(nn.Module):
             vocab_size=len(vocab),
             max_length=max_length,
             use_ctc=True,  # Enable CTC decoding
+            rnn_dropout=rnn_dropout,  # Adaptive dropout for regularization
         )
         self.use_parseq = False
         self.blank_idx = len(vocab)  # Blank token index for CTC
@@ -537,6 +541,7 @@ class ParseqOCR(nn.Module):
         logits: torch.Tensor,
         targets: List[str],
         device: str = "cuda",
+        label_smoothing: float = 0.1,
     ) -> torch.Tensor:
         """
         Compute CTC loss for training.
@@ -545,6 +550,7 @@ class ParseqOCR(nn.Module):
             logits: (B, T, C) predictions from model
             targets: List of target text strings
             device: Device to compute loss on
+            label_smoothing: Label smoothing factor (0.0 = disabled, 0.1 = recommended)
 
         Returns:
             CTC loss tensor
@@ -574,6 +580,16 @@ class ParseqOCR(nn.Module):
 
         # Log softmax for CTC
         log_probs = F.log_softmax(logits, dim=-1)
+
+        # Apply label smoothing for CTC via temperature scaling
+        if label_smoothing > 0:
+            # Temperature scaling: divide by temperature > 1 softens predictions
+            temperature = 1.0 / (1.0 - label_smoothing)
+            log_probs = F.log_softmax(logits / temperature, dim=-1)
+
+            # Add uniform distribution penalty (KL divergence to uniform)
+            uniform_probs = torch.full_like(log_probs, -math.log(log_probs.shape[-1]))
+            log_probs = (1 - label_smoothing) * log_probs + label_smoothing * uniform_probs
 
         # Transpose for CTC loss: (T, B, C)
         log_probs = log_probs.transpose(0, 1)
@@ -704,6 +720,7 @@ class SimpleCRNN(nn.Module):
         vocab_size: int = 36,
         max_length: int = 7,
         use_ctc: bool = True,
+        rnn_dropout: float = 0.3,
     ):
         """
         Initialize SimpleCRNN.
@@ -712,6 +729,7 @@ class SimpleCRNN(nn.Module):
             vocab_size: Size of character vocabulary (excluding blank)
             max_length: Maximum sequence length
             use_ctc: If True, use CTC decoding (adds blank token to vocab)
+            rnn_dropout: Dropout rate after RNN layer (0.0 = disabled, 0.3 = recommended)
         """
         super().__init__()
 
@@ -722,6 +740,10 @@ class SimpleCRNN(nn.Module):
         # For CTC, output size is vocab_size + 1 (blank token)
         self.output_size = vocab_size + 1 if use_ctc else vocab_size
         self.blank_idx = vocab_size  # Blank is at the last index
+
+        # Adaptive dropout after RNN
+        self.rnn_dropout_rate = rnn_dropout
+        self.rnn_dropout = nn.Dropout(p=rnn_dropout) if rnn_dropout > 0 else nn.Identity()
 
         # 1. Spatial Transformer (TPS) for text rectification
         self.stn = TPS_SpatialTransformerNetwork(
@@ -800,6 +822,9 @@ class SimpleCRNN(nn.Module):
 
         # RNN
         rnn_out, _ = self.rnn(features)  # (B, max_length, 512)
+
+        # Apply adaptive dropout after RNN
+        rnn_out = self.rnn_dropout(rnn_out)
 
         # Output projection
         logits = self.fc(rnn_out)  # (B, max_length, output_size)

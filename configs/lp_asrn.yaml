@@ -40,6 +40,10 @@ data:
   # Validation split
   val_split: 0.05
 
+  # Enable OCR-specific augmentation during pretraining
+  # Set to true when running stage0 (OCR pretraining) for better robustness
+  ocr_pretrain_augmentation: true
+
 training:
   # Number of training epochs
   epochs: 100
@@ -117,6 +121,14 @@ ocr:
 
   # Character vocabulary
   vocab: "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+  # Label smoothing for CTC loss (prevents overconfidence)
+  # 0.0 = disabled, 0.1 = recommended, 0.2 = strong
+  label_smoothing: 0.1
+
+  # Dropout rate for RNN layer in SimpleCRNN (prevents overfitting)
+  # 0.0 = disabled, 0.3 = recommended, 0.5 = strong
+  rnn_dropout: 0.3
 
 # Progressive Training Configuration
 progressive_training:

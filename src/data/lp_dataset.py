@@ -56,6 +56,7 @@ class LicensePlateDataset(Dataset):
         crop_to_corners: bool = True,
         augment: bool = True,
         normalize: bool = True,
+        ocr_pretrain_mode: bool = False,
     ):
         """
         Initialize the dataset.
@@ -68,6 +69,7 @@ class LicensePlateDataset(Dataset):
             crop_to_corners: Whether to crop images using corner coordinates
             augment: Whether to apply data augmentation
             normalize: Whether to normalize images to [-1, 1]
+            ocr_pretrain_mode: If True, use OCR-specific augmentation for pretraining
         """
         self.root_dir = Path(root_dir)
         self.scenarios = scenarios or ["Scenario-A", "Scenario-B"]
@@ -76,12 +78,18 @@ class LicensePlateDataset(Dataset):
         self.crop_to_corners = crop_to_corners
         self.augment = augment
         self.normalize = normalize
+        self.ocr_pretrain_mode = ocr_pretrain_mode
 
         # Load all samples
         self.samples = self._load_samples()
 
-        # Setup augmentation
-        self.augment_transform = self._get_augment_transform() if augment else None
+        # Setup augmentation (OCR-specific or standard)
+        if ocr_pretrain_mode and augment:
+            self.augment_transform = self._get_ocr_augment_transform()
+        elif augment:
+            self.augment_transform = self._get_augment_transform()
+        else:
+            self.augment_transform = None
 
     def _load_samples(self) -> List[Dict[str, Any]]:
         """Load all valid samples from the dataset directory."""
@@ -168,6 +176,34 @@ class LicensePlateDataset(Dataset):
             transforms.RandomApply([
                 AddGaussianNoise(mean=0, std=0.05),
             ], p=0.3),
+        ])
+
+    def _get_ocr_augment_transform(self) -> transforms.Compose:
+        """Enhanced augmentation pipeline for OCR pretraining."""
+        return transforms.Compose([
+            # Stronger geometric transforms
+            transforms.RandomAffine(
+                degrees=10,              # More rotation
+                translate=(0.1, 0.15),   # More translation
+                scale=(0.85, 1.15),      # Wider scale
+                shear=8,                 # More shear
+            ),
+            # Perspective warp for camera angle simulation
+            transforms.RandomPerspective(distortion_scale=0.2, p=0.5),
+            # Photometric: more aggressive
+            transforms.ColorJitter(
+                brightness=0.5,
+                contrast=0.5,
+                saturation=0.3,
+                hue=0.15,
+            ),
+            # More blur/noise
+            transforms.RandomApply([
+                transforms.GaussianBlur(kernel_size=5, sigma=(0.5, 3.0)),
+            ], p=0.4),
+            transforms.RandomApply([
+                AddGaussianNoise(mean=0, std=0.08),
+            ], p=0.4),
         ])
 
     def _load_image(self, path: str) -> Image.Image:
@@ -355,7 +391,8 @@ def create_dataloaders(
     distributed: bool = False,
     rank: int = 0,
     world_size: int = 1,
-) -> Tuple[DataLoader, DataLoader]:
+    ocr_pretrain_mode: bool = False,
+) -> Tuple[DataLoader, DataLoader, Optional["DistributedSampler"]]:
     """
     Create train and validation dataloaders.
 
@@ -371,9 +408,11 @@ def create_dataloaders(
         distributed: Whether to use DistributedSampler for DDP
         rank: Rank of current process (for DDP)
         world_size: Total number of processes (for DDP)
+        ocr_pretrain_mode: If True, use OCR-specific augmentation for pretraining
 
     Returns:
-        Tuple of (train_dataloader, val_dataloader)
+        Tuple of (train_dataloader, val_dataloader, train_sampler)
+        train_sampler is None when distributed=False
     """
     # Create full dataset
     full_dataset = LicensePlateDataset(
@@ -382,6 +421,7 @@ def create_dataloaders(
         layouts=layouts,
         image_size=image_size,
         augment=False,  # We'll augment in the collate function or separately
+        ocr_pretrain_mode=ocr_pretrain_mode,
     )
 
     # Split into train and validation
@@ -472,7 +512,10 @@ def create_dataloaders(
             persistent_workers=False,  # Recreate workers each epoch for stability
         )
 
-    return train_loader, val_loader
+    if distributed:
+        return train_loader, val_loader, train_sampler
+    else:
+        return train_loader, val_loader, None
 
 
 if __name__ == "__main__":

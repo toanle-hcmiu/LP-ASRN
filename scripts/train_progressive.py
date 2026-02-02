@@ -303,7 +303,7 @@ def train_ddp(rank, world_size, args, config):
         print("\nLoading data...")
 
     from src.data.lp_dataset import create_dataloaders
-    train_loader, val_loader = create_dataloaders(
+    train_loader, val_loader, train_sampler = create_dataloaders(
         root_dir=args.data_root,
         batch_size=config["data"].get("batch_size", 16),
         num_workers=config["data"].get("num_workers", 4),
@@ -311,6 +311,7 @@ def train_ddp(rank, world_size, args, config):
         distributed=True,
         rank=rank,
         world_size=world_size,
+        ocr_pretrain_mode=config["data"].get("ocr_pretrain_augmentation", False),
     )
 
     if is_main:
@@ -342,6 +343,7 @@ def train_ddp(rank, world_size, args, config):
     ocr = ParseqOCR(
         vocab=ocr_config.get("vocab", "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"),
         max_length=ocr_config.get("max_length", 7),
+        rnn_dropout=ocr_config.get("rnn_dropout", 0.3),
     )
 
     # Load fine-tuned OCR if available (all ranks need this)
@@ -408,6 +410,7 @@ def train_ddp(rank, world_size, args, config):
         distributed=True,
         rank=rank,
         world_size=world_size,
+        train_sampler=train_sampler,
     )
     if is_main:
         trainer.set_text_logger(text_logger)
@@ -419,6 +422,16 @@ def train_ddp(rank, world_size, args, config):
 
     # Synchronize all ranks before training
     dist.barrier()
+
+    # Broadcast trainer state from rank 0 to all ranks
+    # This ensures best_word_acc and global_epoch are consistent across all processes
+    if args.resume:
+        state = [0.0, 0]  # [best_word_acc, global_epoch]
+        if is_main:
+            state = [trainer.best_word_acc, trainer.global_epoch]
+        dist.broadcast_object_list(state, src=0)
+        trainer.best_word_acc = state[0]
+        trainer.global_epoch = state[1]
 
     # Run training
     if args.stage.lower() == "all":
@@ -504,6 +517,7 @@ def main():
             batch_size=config["data"].get("batch_size", 16),
             num_workers=config["data"].get("num_workers", 4),
             image_size=tuple(config["data"].get("lr_size", [17, 31])),
+            ocr_pretrain_mode=config["data"].get("ocr_pretrain_augmentation", False),
         )
 
         print(f"Train samples: {len(train_loader.dataset)}")
@@ -529,6 +543,7 @@ def main():
         ocr = ParseqOCR(
             vocab=ocr_config.get("vocab", "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"),
             max_length=ocr_config.get("max_length", 7),
+            rnn_dropout=ocr_config.get("rnn_dropout", 0.3),
         )
 
         # Load fine-tuned OCR if available
