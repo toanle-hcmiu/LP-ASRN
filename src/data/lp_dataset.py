@@ -413,15 +413,19 @@ def create_dataloaders(
             drop_last=True,
         )
 
+        # Reduce workers for DDP to avoid BrokenPipeError with mp.spawn
+        ddp_workers = min(num_workers, 2)  # Max 2 workers per GPU in DDP
+
         train_loader = DataLoader(
             train_dataset,
             batch_size=batch_size,
             sampler=train_sampler,
-            num_workers=num_workers,
+            num_workers=ddp_workers,
             pin_memory=True,
             drop_last=True,
             timeout=300,  # 5 minute timeout for worker response
-            persistent_workers=False,  # Recreate workers each epoch for DDP stability
+            persistent_workers=ddp_workers > 0,  # Keep workers alive between batches
+            multiprocessing_context='spawn' if ddp_workers > 0 else None,  # Match mp.spawn
         )
 
         # Validation: only rank 0 validates on full dataset
@@ -433,11 +437,12 @@ def create_dataloaders(
                 val_dataset,
                 batch_size=batch_size,
                 shuffle=False,
-                num_workers=min(num_workers, 4),  # Limit workers for validation
+                num_workers=ddp_workers,  # Same workers as train for consistency
                 pin_memory=True,
                 drop_last=False,
                 timeout=300,  # 5 minute timeout for worker response
-                persistent_workers=False,  # Recreate workers each epoch for DDP stability
+                persistent_workers=ddp_workers > 0,
+                multiprocessing_context='spawn' if ddp_workers > 0 else None,
             )
         else:
             # Other ranks: None (completely skip validation dataloader)

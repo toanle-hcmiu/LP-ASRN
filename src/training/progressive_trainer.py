@@ -482,11 +482,22 @@ class ProgressiveTrainer:
         Returns:
             Best word accuracy achieved during pretraining
         """
-        import torch.nn as nn
-
         # Unfreeze OCR for training
-        for param in self.ocr.parameters():
+        ocr_unwrapped = self._unwrap_model(self.ocr)
+        for param in ocr_unwrapped.parameters():
             param.requires_grad = True
+
+        # In DDP mode, wrap OCR with DDP if not already wrapped
+        # (OCR was initially frozen, so may not have been wrapped)
+        if self.distributed and not isinstance(self.ocr, nn.parallel.DistributedDataParallel):
+            self.ocr = nn.parallel.DistributedDataParallel(
+                self.ocr.to(self.device),
+                device_ids=[self.rank],
+                output_device=self.rank,
+                find_unused_parameters=False,  # All params used in pretraining
+            )
+            if self.is_main:
+                print("OCR wrapped with DDP for pretraining")
 
         self.ocr.train()
 
