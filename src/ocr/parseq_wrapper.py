@@ -905,7 +905,7 @@ class SimpleCRNN(nn.Module):
                         new_beam.append((new_seq, norm_log_prob, new_prev_idx, new_blank_count))
 
                 # Sort by normalized score and keep top beams
-                new_beam.sort(key=lambda x: x[0] / (len(x[0]) ** length_norm) if len(x[0]) > 0 else x[1], reverse=True)
+                new_beam.sort(key=lambda x: x[1] / (len(x[0]) ** length_norm) if len(x[0]) > 0 else x[1], reverse=True)
                 beam = new_beam[:beam_width]
 
             # Return best sequence using length-normalized score
