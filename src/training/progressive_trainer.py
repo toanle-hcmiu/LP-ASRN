@@ -403,7 +403,7 @@ class ProgressiveTrainer:
             "sample_batch": sample_batch,
         }
 
-    def validate_ocr_only(self, beam_width: int = 5) -> Dict[str, float]:
+    def validate_ocr_only(self, beam_width: int = 5, max_batches: int = None) -> Dict[str, float]:
         """
         Validate OCR model on HR images (for OCR pretraining stage).
 
@@ -412,6 +412,8 @@ class ProgressiveTrainer:
 
         Args:
             beam_width: Beam width for OCR decoding
+            max_batches: Limit validation to this many batches (None = all). 
+                         Use to prevent OOM during long validation runs.
 
         Returns:
             Dictionary with word_acc and char_acc (no PSNR/SSIM for OCR-only validation)
@@ -429,8 +431,17 @@ class ProgressiveTrainer:
         char_total = 0
         total_samples = 0
 
+        # Limit validation batches to prevent OOM
+        total_batches = len(self.val_loader)
+        if max_batches is not None:
+            total_batches = min(total_batches, max_batches)
+
         with torch.no_grad():
-            for batch_idx, batch in enumerate(tqdm(self.val_loader, desc="OCR Validation")):
+            for batch_idx, batch in enumerate(tqdm(self.val_loader, desc="OCR Validation", total=total_batches)):
+                # Stop if we've reached max_batches
+                if max_batches is not None and batch_idx >= max_batches:
+                    break
+
                 hr_images = batch["hr"].to(self.device)
                 gt_texts = batch["plate_text"]
 
@@ -438,9 +449,13 @@ class ProgressiveTrainer:
                 ocr_unwrapped = self._unwrap_model(self.ocr)
                 pred_texts = ocr_unwrapped.predict(hr_images, beam_width=beam_width)
 
-                # Periodic GPU memory cleanup to prevent OOM
-                if batch_idx % 20 == 0 and batch_idx > 0:
+                # Aggressive GPU memory cleanup every 10 batches to prevent OOM
+                # (Reduced from 20 to 10 for memory-constrained scenarios)
+                if batch_idx % 10 == 0 and batch_idx > 0:
+                    del hr_images  # Explicitly delete tensors
                     torch.cuda.empty_cache()
+                    import gc
+                    gc.collect()
 
                 for pred, gt in zip(pred_texts, gt_texts):
                     total_samples += 1
@@ -456,6 +471,8 @@ class ProgressiveTrainer:
                     if len(pred) > len(gt):
                         char_total += len(pred) - len(gt)
 
+        # Final memory cleanup
+        torch.cuda.empty_cache()
         self.ocr.train()  # Restore training mode
 
         return {
@@ -594,7 +611,9 @@ class ProgressiveTrainer:
                 dist.barrier()
 
             if should_validate:
-                val_metrics = self.validate_ocr_only(beam_width=val_beam_width)
+                # Limit validation batches to prevent OOM (configurable, default 100 batches)
+                max_val_batches = self.config.get("training", {}).get("max_val_batches", 100)
+                val_metrics = self.validate_ocr_only(beam_width=val_beam_width, max_batches=max_val_batches)
 
                 # Log validation metrics to TensorBoard
                 if self.logger and self.is_main:
