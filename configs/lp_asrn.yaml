@@ -52,7 +52,7 @@ training:
   lr: 0.0001
 
   # Validation interval (validate every N epochs to save time)
-  val_interval: 5  # Validate more frequently for better monitoring
+  val_interval: 3  # Reduced from 5 for better monitoring during OCR pretraining
 
   # Beam width for validation (higher = more accurate but slower)
   val_beam_width: 5
@@ -124,11 +124,11 @@ ocr:
 
   # Label smoothing for CTC loss (prevents overconfidence)
   # 0.0 = disabled, 0.1 = recommended, 0.2 = strong
-  label_smoothing: 0.1
+  label_smoothing: 0.15  # Increased from 0.1 for better generalization
 
   # Dropout rate for RNN layer in SimpleCRNN (prevents overfitting)
   # 0.0 = disabled, 0.3 = recommended, 0.5 = strong
-  rnn_dropout: 0.3
+  rnn_dropout: 0.5  # Increased from 0.3 for stronger regularization
 
 # Progressive Training Configuration
 progressive_training:

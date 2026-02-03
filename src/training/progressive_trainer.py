@@ -534,16 +534,22 @@ class ProgressiveTrainer:
         self.optimizer = optim.AdamW(
             self.ocr.parameters(),
             lr=stage_config.lr,  # Use configured LR directly (0.001)
-            weight_decay=0.01,  # Reduced from 0.05 (was preventing proper adaptation)
+            weight_decay=0.05,  # Increased from 0.01 for better regularization
         )
 
-        # Add LR scheduler for OCR pretraining (ReduceLROnPlateau for stability)
-        ocr_scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        # Add warmup scheduler for first 5 epochs to prevent early instability
+        warmup_epochs = 5
+        warmup_scheduler = optim.lr_scheduler.LambdaLR(
             self.optimizer,
-            mode='max',       # Maximize character accuracy
-            factor=0.5,       # Halve LR on plateau
-            patience=2,       # Wait 2 validations (reduced from 5 for 50-epoch runs)
-            min_lr=1e-6,
+            lr_lambda=lambda epoch: min(1.0, (epoch + 1) / warmup_epochs)
+        )
+
+        # Main scheduler: Cosine annealing with warm restarts for gradual decay
+        ocr_scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            self.optimizer,
+            T_0=10,  # Restart every 10 epochs
+            T_mult=2,  # Double period after each restart
+            eta_min=1e-6,
         )
 
         # Use char_acc for early stopping (more granular than word_acc)
@@ -661,12 +667,11 @@ class ProgressiveTrainer:
             if self.distributed:
                 dist.barrier()
 
-            # Step scheduler with validation metric (ReduceLROnPlateau is metric-based)
-            if should_validate:
-                ocr_scheduler.step(val_metrics['char_acc'])
+            # Step warmup scheduler for first 5 epochs, then cosine annealing
+            if epoch < warmup_epochs:
+                warmup_scheduler.step()
             else:
-                # If no validation, step with current best (scheduler will keep same LR)
-                ocr_scheduler.step(best_char_acc)
+                ocr_scheduler.step()
 
         # Freeze OCR after pretraining for subsequent stages
         for param in self.ocr.parameters():
