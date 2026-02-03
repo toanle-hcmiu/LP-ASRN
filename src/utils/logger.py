@@ -26,10 +26,16 @@ except ImportError:
 
 class TextLogger:
     """
-    Text file logger for training output.
+    Enhanced text file logger for comprehensive training output.
 
-    Captures console output and writes to a timestamped text file.
-    Useful for having a persistent log without needing TensorBoard.
+    Provides rich logging including:
+    - System information (GPU, memory, PyTorch version)
+    - Model architecture summaries
+    - Per-epoch metrics with tabular formatting
+    - Stage transitions with visual separators
+    - Best checkpoint tracking
+    - Memory usage monitoring
+    - Timing information
     """
 
     def __init__(
@@ -56,25 +62,49 @@ class TextLogger:
         self.log_file = self.log_dir / filename
         self.also_console = also_console
 
+        # Tracking
+        self.start_time = datetime.datetime.now()
+        self.stage_start_time = None
+        self.epoch_start_time = None
+        self.current_stage = None
+        self.best_metrics = {}
+
         # Create log file
         self.log_file.touch()
 
-        # Write header
-        self.info(f"{'='*60}")
-        self.info(f"Training Log Started: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        self.info(f"Log file: {self.log_file}")
-        self.info(f"{'='*60}\n")
+        # Write enhanced header
+        self._write_header()
 
-    def _write(self, message: str):
-        """Write message to log file."""
+    def _write_header(self):
+        """Write enhanced header with system information."""
+        self._write_raw("")
+        self._write_raw("╔" + "═" * 78 + "╗")
+        self._write_raw("║" + " LP-ASRN TRAINING LOG ".center(78) + "║")
+        self._write_raw("╠" + "═" * 78 + "╣")
+        self._write_raw(f"║  Started: {self.start_time.strftime('%Y-%m-%d %H:%M:%S')}".ljust(79) + "║")
+        self._write_raw(f"║  Log file: {str(self.log_file)[:60]}...".ljust(79) + "║") if len(str(self.log_file)) > 60 else self._write_raw(f"║  Log file: {self.log_file}".ljust(79) + "║")
+        self._write_raw("╚" + "═" * 78 + "╝")
+        self._write_raw("")
+
+    def _write_raw(self, message: str):
+        """Write raw message without timestamp."""
         with open(self.log_file, "a", encoding="utf-8") as f:
             f.write(message + "\n")
+        if self.also_console:
+            print(message)
+
+    def _write(self, message: str):
+        """Write message to log file with timestamp."""
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        log_message = f"[{timestamp}] {message}"
+        with open(self.log_file, "a", encoding="utf-8") as f:
+            f.write(log_message + "\n")
 
     def info(self, message: str):
         """Log an info message."""
         timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         log_message = f"[{timestamp}] {message}"
-        self._write(log_message)
+        self._write(message)
         if self.also_console:
             print(message)
 
@@ -82,7 +112,7 @@ class TextLogger:
         """Log a debug message."""
         timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         log_message = f"[{timestamp}] [DEBUG] {message}"
-        self._write(log_message)
+        self._write(f"[DEBUG] {message}")
         if self.also_console:
             print(f"[DEBUG] {message}")
 
@@ -90,7 +120,7 @@ class TextLogger:
         """Log a warning message."""
         timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         log_message = f"[{timestamp}] [WARNING] {message}"
-        self._write(log_message)
+        self._write(f"[WARNING] {message}")
         if self.also_console:
             print(f"[WARNING] {message}")
 
@@ -98,29 +128,298 @@ class TextLogger:
         """Log an error message."""
         timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         log_message = f"[{timestamp}] [ERROR] {message}"
-        self._write(log_message)
+        self._write(f"[ERROR] {message}")
         if self.also_console:
             print(f"[ERROR] {message}", file=sys.stderr)
+
+    def log_system_info(self):
+        """Log comprehensive system information."""
+        self._write_raw("")
+        self._write_raw("┌" + "─" * 78 + "┐")
+        self._write_raw("│" + " SYSTEM INFORMATION ".center(78) + "│")
+        self._write_raw("├" + "─" * 78 + "┤")
+
+        # Python version
+        self._write_raw(f"│  Python: {sys.version.split()[0]}".ljust(79) + "│")
+
+        # PyTorch version
+        self._write_raw(f"│  PyTorch: {torch.__version__}".ljust(79) + "│")
+
+        # CUDA information
+        if torch.cuda.is_available():
+            self._write_raw(f"│  CUDA: {torch.version.cuda}".ljust(79) + "│")
+            self._write_raw(f"│  cuDNN: {torch.backends.cudnn.version()}".ljust(79) + "│")
+
+            # GPU information
+            gpu_count = torch.cuda.device_count()
+            self._write_raw(f"│  GPU Count: {gpu_count}".ljust(79) + "│")
+
+            for i in range(gpu_count):
+                gpu_name = torch.cuda.get_device_name(i)
+                gpu_mem = torch.cuda.get_device_properties(i).total_memory / (1024**3)
+                self._write_raw(f"│    GPU {i}: {gpu_name} ({gpu_mem:.1f} GB)".ljust(79) + "│")
+        else:
+            self._write_raw("│  CUDA: Not available".ljust(79) + "│")
+
+        self._write_raw("└" + "─" * 78 + "┘")
+        self._write_raw("")
+
+    def log_model_summary(self, model_name: str, model: nn.Module, input_shape: tuple = None):
+        """Log model architecture summary."""
+        self._write_raw("")
+        self._write_raw("┌" + "─" * 78 + "┐")
+        self._write_raw(f"│ MODEL: {model_name} ".ljust(79) + "│")
+        self._write_raw("├" + "─" * 78 + "┤")
+
+        # Count parameters
+        total_params = sum(p.numel() for p in model.parameters())
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        frozen_params = total_params - trainable_params
+
+        self._write_raw(f"│  Total Parameters: {total_params:,}".ljust(79) + "│")
+        self._write_raw(f"│  Trainable: {trainable_params:,}".ljust(79) + "│")
+        self._write_raw(f"│  Frozen: {frozen_params:,}".ljust(79) + "│")
+
+        # Estimate model size
+        param_size_mb = total_params * 4 / (1024**2)  # Assuming float32
+        self._write_raw(f"│  Model Size: {param_size_mb:.2f} MB (float32)".ljust(79) + "│")
+
+        self._write_raw("└" + "─" * 78 + "┘")
+        self._write_raw("")
+
+    def log_training_config(self, config: dict):
+        """Log training configuration in a formatted table."""
+        self._write_raw("")
+        self._write_raw("┌" + "─" * 78 + "┐")
+        self._write_raw("│" + " TRAINING CONFIGURATION ".center(78) + "│")
+        self._write_raw("├" + "─" * 78 + "┤")
+
+        # Progressive training stages
+        prog = config.get("progressive_training", {})
+        stages = [
+            ("Stage 0 (Pretrain)", prog.get("stage0", {})),
+            ("Stage 1 (Warmup)", prog.get("stage1", {})),
+            ("Stage 2 (LCOFL)", prog.get("stage2", {})),
+            ("Stage 3 (Finetune)", prog.get("stage3", {})),
+        ]
+
+        for stage_name, stage_config in stages:
+            epochs = stage_config.get("epochs", "?")
+            lr = stage_config.get("lr", "?")
+            self._write_raw(f"│  {stage_name}: {epochs} epochs @ lr={lr}".ljust(79) + "│")
+
+        self._write_raw("├" + "─" * 78 + "┤")
+
+        # Data configuration
+        data = config.get("data", {})
+        self._write_raw(f"│  Batch Size: {data.get('batch_size', '?')}".ljust(79) + "│")
+        self._write_raw(f"│  Num Workers: {data.get('num_workers', '?')}".ljust(79) + "│")
+        self._write_raw(f"│  LR Size: {data.get('lr_size', '?')}".ljust(79) + "│")
+
+        self._write_raw("├" + "─" * 78 + "┤")
+
+        # Loss configuration
+        loss = config.get("loss", {})
+        self._write_raw(f"│  Lambda LCOFL: {loss.get('lambda_lcofl', 1.0)}".ljust(79) + "│")
+        self._write_raw(f"│  Lambda Layout: {loss.get('lambda_layout', 0.5)}".ljust(79) + "│")
+        self._write_raw(f"│  Lambda SSIM: {loss.get('lambda_ssim', 0.2)}".ljust(79) + "│")
+
+        self._write_raw("└" + "─" * 78 + "┘")
+        self._write_raw("")
+
+    def log_stage_start(self, stage_name: str, epochs: int, lr: float, description: str = ""):
+        """Log the start of a training stage with visual separator."""
+        self.current_stage = stage_name
+        self.stage_start_time = datetime.datetime.now()
+
+        self._write_raw("")
+        self._write_raw("█" * 80)
+        self._write_raw(f"█  STAGE: {stage_name.upper()} ".ljust(79) + "█")
+        self._write_raw("█" * 80)
+        self._write_raw(f"│  Epochs: {epochs}")
+        self._write_raw(f"│  Learning Rate: {lr}")
+        if description:
+            self._write_raw(f"│  Description: {description}")
+        self._write_raw(f"│  Started: {self.stage_start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        self._write_raw("─" * 80)
+        self._write_raw("")
+
+    def log_stage_end(self, stage_name: str, best_metric: float = None, metric_name: str = ""):
+        """Log the end of a training stage."""
+        if self.stage_start_time:
+            duration = datetime.datetime.now() - self.stage_start_time
+            duration_str = str(duration).split('.')[0]  # Remove microseconds
+        else:
+            duration_str = "N/A"
+
+        self._write_raw("")
+        self._write_raw("─" * 80)
+        self._write_raw(f"│  Stage {stage_name} Complete")
+        self._write_raw(f"│  Duration: {duration_str}")
+        if best_metric is not None:
+            self._write_raw(f"│  Best {metric_name}: {best_metric:.4f}")
+        self._write_raw("─" * 80)
+        self._write_raw("")
+
+    def log_epoch_start(self, epoch: int, total_epochs: int):
+        """Log the start of an epoch."""
+        self.epoch_start_time = datetime.datetime.now()
+
+    def log_epoch_metrics(
+        self,
+        epoch: int,
+        total_epochs: int,
+        train_metrics: dict,
+        val_metrics: dict = None,
+        lr: float = None,
+        is_best: bool = False,
+    ):
+        """Log epoch metrics in a clean, tabular format."""
+        # Calculate epoch duration
+        if self.epoch_start_time:
+            epoch_duration = datetime.datetime.now() - self.epoch_start_time
+            duration_str = str(epoch_duration).split('.')[0]
+        else:
+            duration_str = "N/A"
+
+        # Build epoch header
+        stage_prefix = f"[{self.current_stage}] " if self.current_stage else ""
+        best_marker = " ★ NEW BEST" if is_best else ""
+        self._write_raw(f"\n{stage_prefix}Epoch {epoch}/{total_epochs} ({duration_str}){best_marker}")
+
+        # Training metrics
+        train_str = "  Train: "
+        train_parts = []
+        for key, value in train_metrics.items():
+            if isinstance(value, float):
+                train_parts.append(f"{key}={value:.4f}")
+            elif isinstance(value, (int, str)):
+                train_parts.append(f"{key}={value}")
+        train_str += " | ".join(train_parts)
+        self._write_raw(train_str)
+
+        # Validation metrics
+        if val_metrics:
+            val_str = "  Val:   "
+            val_parts = []
+            for key, value in val_metrics.items():
+                if isinstance(value, float):
+                    val_parts.append(f"{key}={value:.4f}")
+                elif isinstance(value, (int, str)):
+                    val_parts.append(f"{key}={value}")
+            val_str += " | ".join(val_parts)
+            self._write_raw(val_str)
+
+        # Learning rate
+        if lr is not None:
+            self._write_raw(f"  LR: {lr:.2e}")
+
+        # GPU memory usage
+        if torch.cuda.is_available():
+            allocated = torch.cuda.memory_allocated() / (1024**3)
+            reserved = torch.cuda.memory_reserved() / (1024**3)
+            self._write_raw(f"  GPU Mem: {allocated:.2f}/{reserved:.2f} GB (allocated/reserved)")
+
+    def log_checkpoint(self, path: str, metrics: dict):
+        """Log checkpoint save event."""
+        self._write_raw("")
+        self._write_raw("┌" + "─" * 78 + "┐")
+        self._write_raw("│  ✓ CHECKPOINT SAVED".ljust(79) + "│")
+        self._write_raw(f"│  Path: {path[:65]}...".ljust(79) + "│") if len(path) > 65 else self._write_raw(f"│  Path: {path}".ljust(79) + "│")
+        for key, value in metrics.items():
+            if isinstance(value, float):
+                self._write_raw(f"│  {key}: {value:.4f}".ljust(79) + "│")
+        self._write_raw("└" + "─" * 78 + "┘")
+        self._write_raw("")
+
+    def log_best_model(self, path: str, metric_name: str, metric_value: float, epoch: int):
+        """Log when a new best model is saved."""
+        self.best_metrics[metric_name] = metric_value
+
+        self._write_raw("")
+        self._write_raw("╔" + "═" * 78 + "╗")
+        self._write_raw("║  ★ NEW BEST MODEL SAVED ★".ljust(79) + "║")
+        self._write_raw("╠" + "═" * 78 + "╣")
+        self._write_raw(f"║  Epoch: {epoch}".ljust(79) + "║")
+        self._write_raw(f"║  {metric_name}: {metric_value:.4f}".ljust(79) + "║")
+        self._write_raw(f"║  Path: {path[:65]}...".ljust(79) + "║") if len(path) > 65 else self._write_raw(f"║  Path: {path}".ljust(79) + "║")
+        self._write_raw("╚" + "═" * 78 + "╝")
+        self._write_raw("")
+
+    def log_validation_summary(self, metrics: dict, sample_predictions: list = None):
+        """Log detailed validation summary."""
+        self._write_raw("")
+        self._write_raw("┌" + "─" * 78 + "┐")
+        self._write_raw("│" + " VALIDATION SUMMARY ".center(78) + "│")
+        self._write_raw("├" + "─" * 78 + "┤")
+
+        for key, value in metrics.items():
+            if isinstance(value, float):
+                self._write_raw(f"│  {key}: {value:.4f}".ljust(79) + "│")
+            elif isinstance(value, (int, str)):
+                self._write_raw(f"│  {key}: {value}".ljust(79) + "│")
+
+        if sample_predictions:
+            self._write_raw("├" + "─" * 78 + "┤")
+            self._write_raw("│  Sample Predictions:".ljust(79) + "│")
+            for i, (pred, gt) in enumerate(sample_predictions[:5]):
+                status = "✓" if pred == gt else "✗"
+                self._write_raw(f"│    {status} GT: {gt:8s} | Pred: {pred:8s}".ljust(79) + "│")
+
+        self._write_raw("└" + "─" * 78 + "┘")
+        self._write_raw("")
 
     def log_metrics(self, metrics: dict, step: int = None):
         """Log metrics dictionary."""
         step_str = f"Step {step}" if step is not None else "Metrics"
         self.info(f"{step_str}:")
         for key, value in metrics.items():
-            self.info(f"  {key}: {value}")
+            if isinstance(value, float):
+                self.info(f"  {key}: {value:.4f}")
+            else:
+                self.info(f"  {key}: {value}")
 
     def log_epoch(self, epoch: int, metrics: dict, stage: str = None):
-        """Log epoch summary."""
+        """Log epoch summary (legacy method for compatibility)."""
         stage_str = f"[{stage}] " if stage else ""
         self.info(f"{stage_str}Epoch {epoch}:")
         for key, value in metrics.items():
-            self.info(f"  {key}: {value}")
+            if isinstance(value, float):
+                self.info(f"  {key}: {value:.4f}")
+            else:
+                self.info(f"  {key}: {value}")
+
+    def log_early_stopping(self, epochs_without_improvement: int, patience: int):
+        """Log early stopping event."""
+        self._write_raw("")
+        self._write_raw("┌" + "─" * 78 + "┐")
+        self._write_raw("│  ⚠ EARLY STOPPING TRIGGERED".ljust(79) + "│")
+        self._write_raw(f"│  Epochs without improvement: {epochs_without_improvement}/{patience}".ljust(79) + "│")
+        self._write_raw("└" + "─" * 78 + "┘")
+        self._write_raw("")
 
     def close(self):
-        """Close the logger (writes footer)."""
-        self.info(f"\n{'='*60}")
-        self.info(f"Training Log Ended: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        self.info(f"{'='*60}")
+        """Close the logger with enhanced footer."""
+        end_time = datetime.datetime.now()
+        total_duration = end_time - self.start_time
+        duration_str = str(total_duration).split('.')[0]
+
+        self._write_raw("")
+        self._write_raw("╔" + "═" * 78 + "╗")
+        self._write_raw("║" + " TRAINING COMPLETE ".center(78) + "║")
+        self._write_raw("╠" + "═" * 78 + "╣")
+        self._write_raw(f"║  Started: {self.start_time.strftime('%Y-%m-%d %H:%M:%S')}".ljust(79) + "║")
+        self._write_raw(f"║  Ended: {end_time.strftime('%Y-%m-%d %H:%M:%S')}".ljust(79) + "║")
+        self._write_raw(f"║  Total Duration: {duration_str}".ljust(79) + "║")
+        self._write_raw("╠" + "═" * 78 + "╣")
+
+        if self.best_metrics:
+            self._write_raw("║  Best Metrics:".ljust(79) + "║")
+            for key, value in self.best_metrics.items():
+                self._write_raw(f"║    {key}: {value:.4f}".ljust(79) + "║")
+
+        self._write_raw("╚" + "═" * 78 + "╝")
+        self._write_raw("")
 
     def __enter__(self):
         """Context manager entry."""

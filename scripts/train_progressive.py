@@ -389,14 +389,13 @@ def train_ddp(rank, world_size, args, config):
         logger = TensorBoardLogger(log_dir=config["tensorboard"]["log_dir"])
         text_logger = TextLogger(log_dir=config["tensorboard"]["log_dir"], filename="training.log")
 
-        # Log training start
+        # Log comprehensive system and configuration info
+        text_logger.log_system_info()
+        text_logger.log_model_summary("Generator", generator.module)
+        text_logger.log_model_summary("OCR", ocr_model.module if has_trainable_params else ocr_model)
+        text_logger.log_training_config(config)
+
         text_logger.info(f"DDP Training with {world_size} GPUs")
-        text_logger.info(f"Training configuration:")
-        text_logger.info(f"  Stage 0 (Pretrain): {config['progressive_training']['stage0']['epochs']} epochs")
-        text_logger.info(f"  Stage 1 (Warmup): {config['progressive_training']['stage1']['epochs']} epochs")
-        text_logger.info(f"  Stage 2 (LCOFL): {config['progressive_training']['stage2']['epochs']} epochs")
-        text_logger.info(f"  Stage 3 (Finetune): {config['progressive_training']['stage3']['epochs']} epochs")
-        text_logger.info("")
 
     # Create trainer
     trainer = ProgressiveTrainer(
@@ -555,13 +554,11 @@ def main():
         logger = TensorBoardLogger(log_dir=config["tensorboard"]["log_dir"])
         text_logger = TextLogger(log_dir=config["tensorboard"]["log_dir"], filename="training.log")
 
-        # Log training start
-        text_logger.info(f"Training configuration:")
-        text_logger.info(f"  Stage 0 (Pretrain): {config['progressive_training']['stage0']['epochs']} epochs")
-        text_logger.info(f"  Stage 1 (Warmup): {config['progressive_training']['stage1']['epochs']} epochs")
-        text_logger.info(f"  Stage 2 (LCOFL): {config['progressive_training']['stage2']['epochs']} epochs")
-        text_logger.info(f"  Stage 3 (Finetune): {config['progressive_training']['stage3']['epochs']} epochs")
-        text_logger.info("")
+        # Log comprehensive system and configuration info
+        text_logger.log_system_info()
+        text_logger.log_model_summary("Generator", generator)
+        text_logger.log_model_summary("OCR", ocr)
+        text_logger.log_training_config(config)
 
         # Create trainer
         trainer = ProgressiveTrainer(

@@ -579,17 +579,10 @@ class ParseqOCR(nn.Module):
         input_lengths = torch.full((B,), T, dtype=torch.long, device=device)
 
         # Log softmax for CTC
+        # Fixed: Disable label smoothing for CTC - the previous temperature scaling
+        # implementation was non-standard and interfered with CTC convergence.
+        # CTC loss works best without label smoothing.
         log_probs = F.log_softmax(logits, dim=-1)
-
-        # Apply label smoothing for CTC via temperature scaling
-        if label_smoothing > 0:
-            # Temperature scaling: divide by temperature > 1 softens predictions
-            temperature = 1.0 / (1.0 - label_smoothing)
-            log_probs = F.log_softmax(logits / temperature, dim=-1)
-
-            # Add uniform distribution penalty (KL divergence to uniform)
-            uniform_probs = torch.full_like(log_probs, -math.log(log_probs.shape[-1]))
-            log_probs = (1 - label_smoothing) * log_probs + label_smoothing * uniform_probs
 
         # Transpose for CTC loss: (T, B, C)
         log_probs = log_probs.transpose(0, 1)
@@ -775,9 +768,10 @@ class SimpleCRNN(nn.Module):
         )
 
         # 3. Sequence modeling with BiLSTM
+        # Increased hidden_size from 256 to 384 for better representation capacity
         self.rnn = nn.LSTM(
             input_size=512,
-            hidden_size=256,
+            hidden_size=384,
             num_layers=2,
             batch_first=True,
             bidirectional=True,
@@ -785,7 +779,8 @@ class SimpleCRNN(nn.Module):
         )
 
         # 4. Output projection
-        self.fc = nn.Linear(512, self.output_size)
+        # Input size is hidden_size * 2 for bidirectional LSTM (384 * 2 = 768)
+        self.fc = nn.Linear(768, self.output_size)
 
     def forward(self, x: torch.Tensor, return_logits: bool = True) -> torch.Tensor:
         """
@@ -802,6 +797,10 @@ class SimpleCRNN(nn.Module):
         if x.min() < 0:
             x = (x + 1.0) / 2.0
             x = torch.clamp(x, 0, 1)
+
+        # Resize to STN expected input size if needed (STN expects 68x124)
+        if x.shape[2] != 68 or x.shape[3] != 124:
+            x = F.interpolate(x, size=(68, 124), mode='bilinear', align_corners=False)
 
         # Apply STN for text rectification
         x = self.stn(x)

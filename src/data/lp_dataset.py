@@ -84,12 +84,13 @@ class LicensePlateDataset(Dataset):
         self.samples = self._load_samples()
 
         # Setup augmentation (OCR-specific or standard)
-        if ocr_pretrain_mode and augment:
-            self.augment_transform = self._get_ocr_augment_transform()
-        elif augment:
-            self.augment_transform = self._get_augment_transform()
+        # Fixed: Split into geometric (both LR/HR) and photometric degradation (LR only)
+        if augment:
+            self.geometric_transform = self._get_geometric_transform(ocr_pretrain_mode)
+            self.photometric_degradation = self._get_photometric_degradation(ocr_pretrain_mode)
         else:
-            self.augment_transform = None
+            self.geometric_transform = None
+            self.photometric_degradation = None
 
     def _load_samples(self) -> List[Dict[str, Any]]:
         """Load all valid samples from the dataset directory."""
@@ -206,6 +207,70 @@ class LicensePlateDataset(Dataset):
             ], p=0.4),
         ])
 
+    def _get_geometric_transform(self, ocr_pretrain_mode: bool = False) -> transforms.Compose:
+        """
+        Get geometric transforms (applied to both LR and HR for consistency).
+        These preserve spatial correspondence between LR and HR.
+        """
+        if ocr_pretrain_mode:
+            return transforms.Compose([
+                transforms.RandomAffine(
+                    degrees=10,
+                    translate=(0.1, 0.15),
+                    scale=(0.85, 1.15),
+                    shear=8,
+                ),
+                transforms.RandomPerspective(
+                    distortion_scale=0.2,
+                    p=0.5
+                ),
+            ])
+        else:
+            return transforms.Compose([
+                transforms.RandomAffine(
+                    degrees=5,
+                    translate=(0.05, 0.1),
+                    scale=(0.9, 1.1),
+                    shear=5,
+                ),
+            ])
+
+    def _get_photometric_degradation(self, ocr_pretrain_mode: bool = False) -> transforms.Compose:
+        """
+        Get photometric degradation transforms (applied ONLY to LR).
+        This simulates real-world degradation while keeping HR clean.
+        """
+        if ocr_pretrain_mode:
+            return transforms.Compose([
+                transforms.ColorJitter(
+                    brightness=0.5,
+                    contrast=0.5,
+                    saturation=0.3,
+                    hue=0.15,
+                ),
+                transforms.RandomApply([
+                    transforms.GaussianBlur(kernel_size=5, sigma=(0.5, 3.0)),
+                ], p=0.4),
+                transforms.RandomApply([
+                    AddGaussianNoise(mean=0, std=0.08),
+                ], p=0.4),
+            ])
+        else:
+            return transforms.Compose([
+                transforms.ColorJitter(
+                    brightness=0.4,
+                    contrast=0.4,
+                    saturation=0.2,
+                    hue=0.1,
+                ),
+                transforms.RandomApply([
+                    transforms.GaussianBlur(kernel_size=3, sigma=(0.5, 2.0)),
+                ], p=0.3),
+                transforms.RandomApply([
+                    AddGaussianNoise(mean=0, std=0.05),
+                ], p=0.3),
+            ])
+
     def _load_image(self, path: str) -> Image.Image:
         """Load an image file."""
         return Image.open(path).convert("RGB")
@@ -278,8 +343,12 @@ class LicensePlateDataset(Dataset):
         return tensor
 
     def _apply_augmentation(self, lr: torch.Tensor, hr: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Apply same augmentation to both LR and HR images."""
-        if self.augment_transform is None:
+        """
+        Apply augmentation - geometric to both LR/HR, degradation only to LR.
+        Fixed: Previously applied same augmentation (including blur/noise) to both LR and HR,
+        which defeated the purpose of degraded→clean training.
+        """
+        if self.geometric_transform is None:
             return lr, hr
 
         # Convert to PIL for augmentation
@@ -296,13 +365,17 @@ class LicensePlateDataset(Dataset):
         lr_pil = to_pil(lr_display)
         hr_pil = to_pil(hr_display)
 
-        # Apply same random seed for consistent augmentation
+        # Apply geometric transforms to both LR and HR (same seed for consistency)
         seed = np.random.randint(2147483647)
         torch.manual_seed(seed)
-
-        lr_aug = self.augment_transform(lr_pil)
+        lr_aug = self.geometric_transform(lr_pil)
         torch.manual_seed(seed)
-        hr_aug = self.augment_transform(hr_pil)
+        hr_aug = self.geometric_transform(hr_pil)
+
+        # Apply photometric degradation ONLY to LR (blur, noise, color jitter)
+        # HR stays clean - this is the target we want the model to learn
+        if self.photometric_degradation is not None:
+            lr_aug = self.photometric_degradation(lr_aug)
 
         # Convert back to tensor
         lr_tensor = self._to_tensor(lr_aug)

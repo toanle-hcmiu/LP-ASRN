@@ -280,6 +280,10 @@ class ProgressiveTrainer:
 
             self.global_step += 1
 
+            # Periodic GPU memory cleanup to prevent OOM during long training stages
+            if self.global_step % 100 == 0:
+                torch.cuda.empty_cache()
+
         avg_loss = total_loss / len(self.train_loader)
         avg_l1 = total_l1 / len(self.train_loader)
         avg_lcofl = total_lcofl / len(self.train_loader) if "lcofl" in stage_config.loss_components else 0
@@ -348,12 +352,12 @@ class ProgressiveTrainer:
                 ocr_unwrapped = self._unwrap_model(self.ocr)
                 pred_texts = ocr_unwrapped.predict(sr_images, beam_width=beam_width)
 
-                # Store first batch for visualization
+                # Store first batch for visualization (move to CPU to save GPU memory)
                 if sample_batch is None and self.logger:
                     sample_batch = {
-                        "lr": lr_images,
-                        "sr": sr_images,
-                        "hr": hr_images,
+                        "lr": lr_images.cpu(),
+                        "sr": sr_images.detach().cpu(),
+                        "hr": hr_images.cpu(),
                         "gt_texts": gt_texts,
                         "pred_texts": pred_texts,
                     }
@@ -526,10 +530,10 @@ class ProgressiveTrainer:
         self.ocr.train()
 
         # Create optimizer for OCR only (AdamW with weight decay for better generalization)
-        # Note: LR scaled down by 10x for more stable fine-tuning (original 0.001 was too aggressive)
+        # Fixed: Use configured LR directly (removed 0.1 multiplier that was too conservative)
         self.optimizer = optim.AdamW(
             self.ocr.parameters(),
-            lr=stage_config.lr * 0.1,  # Scale down: 0.001 → 0.0001
+            lr=stage_config.lr,  # Use configured LR directly (0.001)
             weight_decay=0.01,  # Reduced from 0.05 (was preventing proper adaptation)
         )
 
@@ -538,7 +542,7 @@ class ProgressiveTrainer:
             self.optimizer,
             mode='max',       # Maximize character accuracy
             factor=0.5,       # Halve LR on plateau
-            patience=5,       # Wait 5 validations
+            patience=2,       # Wait 2 validations (reduced from 5 for 50-epoch runs)
             min_lr=1e-6,
         )
 
@@ -816,7 +820,8 @@ class ProgressiveTrainer:
 
             plt.suptitle(f"{stage_name} - SR+OCR Results (Epoch {epoch})", fontsize=14, fontweight='bold')
             plt.tight_layout()
-            self.logger.log_figure(f"{stage_name.lower()}/sr_ocr_predictions_epoch_{epoch}", fig, epoch)
+            # Use consistent tag name (step parameter tracks progression)
+            self.logger.log_figure(f"{stage_name.lower()}/sr_ocr_predictions", fig, epoch)
             plt.close(fig)
 
         except Exception as e:
@@ -857,8 +862,9 @@ class ProgressiveTrainer:
             current_lr = self.optimizer.param_groups[0]['lr']
             self.logger.log_scalar(f"{stage_prefix}/learning_rate", current_lr, epoch)
 
-        # Log model weights (less frequently)
-        if epoch % 10 == 0:
+        # Log model weights (very infrequently - creates many histogram cards)
+        # Only log at epoch 0 and every 50 epochs to reduce TensorBoard clutter
+        if epoch == 0 or epoch % 50 == 0:
             self.logger.log_model_weights(self.generator, epoch, prefix=stage_prefix)
 
         # Log comparison images for SR stages (not OCR pretraining)
@@ -873,28 +879,38 @@ class ProgressiveTrainer:
                     batch["pred_texts"],
                     max_images=8,
                 )
-                self.logger.log_image_grid(f"{stage_prefix}/comparison_epoch_{epoch}", grid, epoch)
+                # Live comparison card (uses slider to see progression)
+                self.logger.log_image_grid(f"{stage_prefix}/comparison", grid, epoch)
+                
+                # Snapshots for easy side-by-side comparison (every 5 epochs)
+                self.logger.log_image_grid(f"{stage_prefix}/epoch_{epoch:03d}", grid, epoch)
+                
+                del grid  # Free memory immediately
             except Exception as e:
                 if self.is_main:
                     print(f"Warning: Could not log comparison images: {e}")
+            finally:
+                # Clean up to prevent memory accumulation over long runs
+                torch.cuda.empty_cache()
 
         # Log confusion matrix for LCOFL and finetune stages
         if epoch % 5 == 0 and self.current_stage in [TrainingStage.LCOFL, TrainingStage.FINETUNE] and self.is_main:
             self.confusion_tracker.update(val_metrics["pred_texts"], val_metrics["gt_texts"])
             try:
                 labels = list(self.config["ocr"]["vocab"])
+                # Use consistent tag name to avoid creating new card every epoch
                 self.logger.log_confusion_matrix(
                     self.confusion_tracker.confusion_matrix,
                     labels,
                     epoch,
-                    tag=f"{stage_prefix}/confusion_matrix",
+                    tag=f"{stage_prefix}/confusion",
                 )
             except Exception as e:
                 if self.is_main:
                     print(f"Warning: Could not log confusion matrix: {e}")
 
-        # Log OCR predictions for LCOFL and finetune stages
-        if epoch % 5 == 0 and self.current_stage in [TrainingStage.LCOFL, TrainingStage.FINETUNE] and self.is_main:
+        # Log OCR predictions less frequently (only every 20 epochs to reduce clutter)
+        if epoch % 20 == 0 and self.current_stage in [TrainingStage.LCOFL, TrainingStage.FINETUNE] and self.is_main:
             if val_metrics.get("sample_batch"):
                 self._log_sr_ocr_predictions(val_metrics["sample_batch"], epoch)
 
@@ -920,8 +936,26 @@ class ProgressiveTrainer:
 
         start_epoch = self.global_epoch
 
+        # Log stage start
+        if self.text_logger and self.is_main:
+            stage_descriptions = {
+                TrainingStage.WARMUP: "Stabilize network with L1 loss only",
+                TrainingStage.LCOFL: "Character-driven training with frozen OCR",
+                TrainingStage.FINETUNE: "Joint optimization with unfrozen OCR",
+            }
+            self.text_logger.log_stage_start(
+                stage_name=stage.value,
+                epochs=config.epochs,
+                lr=config.lr,
+                description=stage_descriptions.get(stage, "")
+            )
+
         for epoch in range(config.epochs):
             current_global_epoch = start_epoch + epoch
+
+            # Log epoch start (for timing)
+            if self.text_logger and self.is_main:
+                self.text_logger.log_epoch_start(epoch + 1, config.epochs)
 
             # Train
             train_metrics = self.train_epoch(config)
@@ -951,36 +985,72 @@ class ProgressiveTrainer:
             if self.distributed:
                 dist.barrier()
 
-            # Print results (only when validation was performed)
+            # Log and print results (only when validation was performed)
+            is_best = False
             if should_validate:
-                if self.is_main:
-                    print(f"Epoch {current_global_epoch + 1}:")
-                    print(f"  Train Loss: {train_metrics['loss']:.4f}")
-                    print(f"  Val PSNR: {val_metrics['psnr']:.2f} dB")
-                    print(f"  Val SSIM: {val_metrics['ssim']:.4f}")
-                    print(f"  Val Word Acc: {val_metrics['word_acc']:.4f}")
-                    print(f"  Val Char Acc: {val_metrics['char_acc']:.4f}")
-
-                # Update best model (only when validation was performed)
+                # Check for best model
                 if val_metrics['word_acc'] > self.best_word_acc:
                     self.best_word_acc = val_metrics['word_acc']
                     self.epochs_without_improvement = 0
+                    is_best = True
 
                     self.save_checkpoint(current_global_epoch, stage)
-                    if self.is_main:
-                        print(f"  ✓ New best model: word_acc={val_metrics['word_acc']:.4f}")
+                    save_path = str(self.save_dir / "best.pth")
+
+                    if self.text_logger and self.is_main:
+                        self.text_logger.log_best_model(
+                            path=save_path,
+                            metric_name="word_acc",
+                            metric_value=val_metrics['word_acc'],
+                            epoch=epoch + 1
+                        )
                 else:
                     self.epochs_without_improvement += 1
+
+                # Log epoch metrics to text file
+                if self.text_logger and self.is_main:
+                    current_lr = self.optimizer.param_groups[0]['lr']
+                    self.text_logger.log_epoch_metrics(
+                        epoch=epoch + 1,
+                        total_epochs=config.epochs,
+                        train_metrics={
+                            "loss": train_metrics['loss'],
+                            "l1": train_metrics.get('l1', 0.0),
+                            "lcofl": train_metrics.get('lcofl', 0.0),
+                        },
+                        val_metrics={
+                            "psnr": val_metrics['psnr'],
+                            "ssim": val_metrics['ssim'],
+                            "word_acc": val_metrics['word_acc'],
+                            "char_acc": val_metrics['char_acc'],
+                        },
+                        lr=current_lr,
+                        is_best=is_best
+                    )
 
             # Learning rate scheduling
             self.scheduler.step()
 
+            # Periodic memory cleanup to prevent OOM in long stages (Stage 2: 300 epochs, Stage 3: 150 epochs)
+            if epoch % 10 == 0:
+                torch.cuda.empty_cache()
+                import gc
+                gc.collect()
+
             # Early stopping
             patience = self.config.get("training", {}).get("early_stop_patience", 20)
             if self.epochs_without_improvement >= patience:
-                if self.is_main:
-                    print(f"Early stopping after {patience} epochs without improvement")
+                if self.text_logger and self.is_main:
+                    self.text_logger.log_early_stopping(self.epochs_without_improvement, patience)
                 break
+
+        # Log stage end
+        if self.text_logger and self.is_main:
+            self.text_logger.log_stage_end(
+                stage_name=stage.value,
+                best_metric=self.best_word_acc,
+                metric_name="word_acc"
+            )
 
         self.global_epoch = start_epoch + config.epochs
 
@@ -1031,29 +1101,36 @@ class ProgressiveTrainer:
         results = {}
 
         if self.is_main:
-            print("\n" + "=" * 60)
-            print("PROGRESSIVE TRAINING START")
-            print("=" * 60 + "\n")
+            self._log("\n" + "=" * 60)
+            self._log("PROGRESSIVE TRAINING START")
+            self._log("=" * 60 + "\n")
 
         # Stage 0: OCR Pretraining
-        if self.is_main:
-            print("\nStage 0: OCR Pretraining")
-            print("Purpose: Train OCR model on license plate data")
-            print("This ensures OCR can provide meaningful guidance to the generator")
+        if self.text_logger and self.is_main:
+            self.text_logger.log_stage_start(
+                stage_name="OCR Pretrain",
+                epochs=self.stage_configs[TrainingStage.PRETRAIN].epochs,
+                lr=self.stage_configs[TrainingStage.PRETRAIN].lr,
+                description="Train OCR model on license plate data for meaningful generator guidance"
+            )
+
         best_acc_stage0 = self.train_pretrain_stage(
             self.stage_configs[TrainingStage.PRETRAIN]
         )
         results["stage0_best_acc"] = best_acc_stage0
 
+        if self.text_logger and self.is_main:
+            self.text_logger.log_stage_end(
+                stage_name="OCR Pretrain",
+                best_metric=best_acc_stage0,
+                metric_name="char_acc"
+            )
+
         # Synchronize all ranks between stages (critical for DDP)
-        # Ensures all ranks complete stage 0 before stage 1 starts
         if self.distributed:
             dist.barrier()
 
         # Stage 1: Warm-up
-        if self.is_main:
-            print("\nStage 1: Warm-up (L1 loss only)")
-            print("Purpose: Stabilize network with simple reconstruction loss")
         best_acc_stage1 = self.train_stage(TrainingStage.WARMUP)
         results["stage1_best_acc"] = best_acc_stage1
 
@@ -1062,9 +1139,6 @@ class ProgressiveTrainer:
             dist.barrier()
 
         # Stage 2: LCOFL
-        if self.is_main:
-            print("\nStage 2: LCOFL Training (Character-driven loss)")
-            print("Purpose: Optimize for character recognition with frozen OCR")
         best_acc_stage2 = self.train_stage(TrainingStage.LCOFL)
         results["stage2_best_acc"] = best_acc_stage2
 
@@ -1073,9 +1147,6 @@ class ProgressiveTrainer:
             dist.barrier()
 
         # Stage 3: Fine-tuning
-        if self.is_main:
-            print("\nStage 3: Fine-tuning (Joint optimization)")
-            print("Purpose: Refine with unfrozen OCR for joint training")
         best_acc_stage3 = self.train_stage(TrainingStage.FINETUNE)
         results["stage3_best_acc"] = best_acc_stage3
 
@@ -1086,11 +1157,21 @@ class ProgressiveTrainer:
             with open(self.save_dir / "progressive_results.json", "w") as f:
                 json.dump(results, f, indent=2)
 
-            print("\n" + "=" * 60)
-            print("PROGRESSIVE TRAINING COMPLETE")
-            print("=" * 60)
-            print(f"\nFinal Best Word Accuracy: {self.best_word_acc:.4f}")
-            print(f"Results saved to: {self.save_dir}")
+            # Log final summary
+            if self.text_logger:
+                self.text_logger._write_raw("")
+                self.text_logger._write_raw("╔" + "═" * 78 + "╗")
+                self.text_logger._write_raw("║" + " PROGRESSIVE TRAINING SUMMARY ".center(78) + "║")
+                self.text_logger._write_raw("╠" + "═" * 78 + "╣")
+                self.text_logger._write_raw(f"║  Stage 0 (OCR Pretrain): {results['stage0_best_acc']:.4f} char_acc".ljust(79) + "║")
+                self.text_logger._write_raw(f"║  Stage 1 (Warmup): {results['stage1_best_acc']:.4f} word_acc".ljust(79) + "║")
+                self.text_logger._write_raw(f"║  Stage 2 (LCOFL): {results['stage2_best_acc']:.4f} word_acc".ljust(79) + "║")
+                self.text_logger._write_raw(f"║  Stage 3 (Finetune): {results['stage3_best_acc']:.4f} word_acc".ljust(79) + "║")
+                self.text_logger._write_raw("╠" + "═" * 78 + "╣")
+                self.text_logger._write_raw(f"║  Final Best Word Accuracy: {self.best_word_acc:.4f}".ljust(79) + "║")
+                self.text_logger._write_raw(f"║  Results saved to: {str(self.save_dir)[:50]}".ljust(79) + "║")
+                self.text_logger._write_raw("╚" + "═" * 78 + "╝")
+                self.text_logger._write_raw("")
 
         return results
 

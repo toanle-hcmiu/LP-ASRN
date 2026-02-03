@@ -433,6 +433,9 @@ class Generator(nn.Module):
             mode='bilinear',
             align_corners=False,
         )
+        # Learnable skip weight (initialized to 0.1 for minimal initial impact)
+        # This allows the model to learn how much to rely on the skip connection
+        self.skip_weight = nn.Parameter(torch.tensor(0.1))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -459,9 +462,9 @@ class Generator(nn.Module):
         # Reconstruction
         output = self.reconstruction(upscaled)
 
-        # Add skip connection from input (upscaled)
+        # Add skip connection from input (upscaled) with learnable weight
         skip = self.skip_upscale(input_lr)
-        output = output + skip
+        output = output + self.skip_weight * skip
 
         # Clamp to valid range
         output = torch.clamp(output, -1.0, 1.0)

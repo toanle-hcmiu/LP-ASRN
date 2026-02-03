@@ -181,8 +181,9 @@ def add_text_to_grid(
     ax = fig.add_axes([0, 0, 1, 1])
     ax.axis('off')
 
-    # Display grid
-    ax.imshow(grid.permute(1, 2, 0).numpy())
+    # Display grid (clamp to [0, 1] to avoid imshow clipping warnings)
+    grid_display = grid.permute(1, 2, 0).numpy().clip(0, 1)
+    ax.imshow(grid_display)
 
     # Add text labels
     B = min(len(gt_texts) if gt_texts else 0, len(pred_texts) if pred_texts else 0)
@@ -213,10 +214,11 @@ def add_text_to_grid(
         plt.close(fig)
         raise ValueError(f"Invalid canvas dimensions: width={width}, height={height}")
 
-    image_array = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
+    # Use buffer_rgba() for matplotlib 3.8+ compatibility (tostring_rgb was removed)
+    image_array = np.asarray(fig.canvas.buffer_rgba(), dtype=np.uint8)
 
-    # Validate buffer size
-    expected_size = height * width * 3
+    # Validate buffer size (RGBA = 4 channels)
+    expected_size = height * width * 4
     if image_array.size != expected_size:
         plt.close(fig)
         raise ValueError(
@@ -224,7 +226,8 @@ def add_text_to_grid(
             f"(height={height}, width={width})"
         )
 
-    image_array = image_array.reshape(height, width, 3)
+    # Reshape and convert RGBA to RGB
+    image_array = image_array.reshape(height, width, 4)[:, :, :3]
     grid_with_text = torch.from_numpy(image_array).permute(2, 0, 1).float() / 255.0
 
     # Validate output tensor dimensions

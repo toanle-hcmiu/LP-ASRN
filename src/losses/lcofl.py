@@ -137,43 +137,17 @@ class ClassificationLoss(nn.Module):
 
         # Check if vocab size matches (e.g., Parseq outputs 94 chars, but our vocab is 36)
         if C != len(self.char_to_idx):
-            # Vocab size mismatch - map from larger vocab to our target vocab
-            # and compute loss using character-level matching
-
-            # Get predicted characters (argmax) from the OCR's vocabulary
-            pred_indices = pred_logits.argmax(dim=-1)  # (B, K)
-
-            # Get the probabilities for the predicted characters (for gradient flow)
-            pred_probs = pred_logits.softmax(dim=-1)  # (B, K, C)
-
-            # Compute loss by encouraging high probability for correct character positions
-            # For each position, we want the model to predict the correct character
-            total_loss = 0.0
-            count = 0
-
-            for b in range(B):
-                gt_text = gt_texts[b] if b < len(gt_texts) else ""
-                for k in range(K):
-                    if k >= len(gt_text):
-                        break
-
-                    gt_char = gt_text[k]
-                    if gt_char not in self.char_to_idx:
-                        continue
-
-                    # We want the model to be confident in its prediction at this position
-                    # Use negative log probability as loss (encourages high confidence)
-                    # Get the probability of the predicted character
-                    pred_idx = pred_indices[b, k]
-                    prob = pred_probs[b, k, pred_idx]
-
-                    # NLL loss: -log(prob)
-                    # Higher probability = lower loss
-                    total_loss += -torch.log(prob + 1e-10)
-                    count += 1
-
-            loss = total_loss / count if count > 0 else torch.tensor(0.0, device=pred_logits.device)
-            return loss, {"classification_loss": loss, "vocab_mismatch": True}
+            # Vocab size mismatch - skip classification loss and rely on CTC loss only
+            # Fixed: The previous implementation used predicted indices instead of ground truth,
+            # creating a self-reinforcing loss that rewarded confidence in wrong predictions.
+            # Proper cross-entropy with vocab mapping would require complex character mapping.
+            # For now, we skip this loss component and rely on CTC loss for training.
+            zero_loss = torch.tensor(0.0, device=pred_logits.device, requires_grad=False)
+            return zero_loss, {
+                "classification_loss": zero_loss,
+                "vocab_mismatch": True,
+                "skipped": True
+            }
 
         # Encode ground truth texts
         targets = []
