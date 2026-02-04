@@ -647,6 +647,19 @@ class ResidualBlock(nn.Module):
         return F.relu(out + identity, inplace=True)
 
 
+class SequenceAttention(nn.Module):
+    """Position-wise attention for sequence modeling."""
+
+    def __init__(self, hidden_size):
+        super().__init__()
+        self.attention = nn.Linear(hidden_size, 1)
+
+    def forward(self, x):
+        # x: (B, T, H)
+        weights = F.softmax(self.attention(x), dim=1)  # (B, T, 1)
+        return x * weights  # Broadcast multiply
+
+
 class TPS_SpatialTransformerNetwork(nn.Module):
     """Thin-Plate Spline spatial transformer for text rectification."""
 
@@ -760,27 +773,34 @@ class SimpleCRNN(nn.Module):
             ResidualBlock(256, 256),
             SEBlock(256),
             nn.MaxPool2d((2, 1), (2, 1)),  # Preserve width
-            # Block 4: 256 -> 512
+            # Block 4: 256 -> 512 (deeper for richer features)
             ResidualBlock(256, 512),
             ResidualBlock(512, 512),
+            ResidualBlock(512, 512),  # Extra block for deeper features
             SEBlock(512),
             nn.MaxPool2d((2, 1), (2, 1)),  # Preserve width
         )
 
-        # 3. Sequence modeling with BiLSTM
-        # Increased hidden_size from 256 to 384 for better representation capacity
+        # Layer normalization before LSTM (stabilizes training)
+        self.layer_norm = nn.LayerNorm(512)
+
+        # 3. Sequence modeling with BiLSTM (increased capacity for >90% word accuracy)
+        # 3 layers with 512 hidden size for better representation
         self.rnn = nn.LSTM(
             input_size=512,
-            hidden_size=384,
-            num_layers=2,
+            hidden_size=512,  # Increased from 384
+            num_layers=3,     # Increased from 2
             batch_first=True,
             bidirectional=True,
             dropout=0.3,
         )
 
+        # 3.5. Attention mechanism after LSTM (focuses on relevant positions)
+        self.attention = SequenceAttention(hidden_size=1024)  # 512 * 2 for bidirectional
+
         # 4. Output projection
-        # Input size is hidden_size * 2 for bidirectional LSTM (384 * 2 = 768)
-        self.fc = nn.Linear(768, self.output_size)
+        # Input size is hidden_size * 2 for bidirectional LSTM (512 * 2 = 1024)
+        self.fc = nn.Linear(1024, self.output_size)
 
     def forward(self, x: torch.Tensor, return_logits: bool = True) -> torch.Tensor:
         """
@@ -813,6 +833,9 @@ class SimpleCRNN(nn.Module):
         features = F.adaptive_avg_pool2d(features, (1, W))  # (B, 512, 1, W)
         features = features.squeeze(2).permute(0, 2, 1)  # (B, W, 512)
 
+        # Apply layer normalization (stabilizes deeper LSTM training)
+        features = self.layer_norm(features)  # Normalize per timestep
+
         # Pad or truncate to max_length
         if W < self.max_length:
             features = F.pad(features, (0, 0, 0, self.max_length - W))
@@ -820,7 +843,10 @@ class SimpleCRNN(nn.Module):
             features = features[:, : self.max_length, :]
 
         # RNN
-        rnn_out, _ = self.rnn(features)  # (B, max_length, 512)
+        rnn_out, _ = self.rnn(features)  # (B, max_length, 1024)
+
+        # Apply attention after RNN (focuses on relevant positions)
+        rnn_out = self.attention(rnn_out)
 
         # Apply adaptive dropout after RNN
         rnn_out = self.rnn_dropout(rnn_out)

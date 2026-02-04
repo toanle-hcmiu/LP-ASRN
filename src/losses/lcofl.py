@@ -266,12 +266,13 @@ class LayoutPenalty(nn.Module):
 
 class LCOFL(nn.Module):
     """
-    Layout and Character Oriented Focal Loss.
+    Layout and Character Oriented Focal Loss (LCOFL-EC).
 
     Combines:
     1. Classification Loss - for character recognition
     2. Layout Penalty - for layout consistency
     3. Optional SSIM Loss - for structural similarity
+    4. Optional Embedding Consistency Loss - for perceptual similarity
 
     This loss function is designed specifically for license plate
     super-resolution, guiding the network to produce images that
@@ -283,6 +284,10 @@ class LCOFL(nn.Module):
         vocab: str = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ",
         lambda_layout: float = 0.5,
         lambda_ssim: float = 0.0,
+        lambda_embed: float = 0.0,
+        embedding_dim: int = 128,
+        embed_margin: float = 2.0,
+        use_lightweight_embedder: bool = False,
         alpha: float = 0.1,
         beta: float = 1.0,
     ):
@@ -293,6 +298,10 @@ class LCOFL(nn.Module):
             vocab: Character vocabulary for OCR
             lambda_layout: Weight for layout penalty
             lambda_ssim: Weight for SSIM loss
+            lambda_embed: Weight for embedding consistency loss (will be warmed up)
+            embedding_dim: Dimension of embedding vectors
+            embed_margin: Margin for embedding contrastive loss
+            use_lightweight_embedder: Use lightweight embedder instead of ResNet
             alpha: Weight increment for confused characters
             beta: Penalty value for layout violations
         """
@@ -300,9 +309,37 @@ class LCOFL(nn.Module):
 
         self.lambda_layout = lambda_layout
         self.lambda_ssim = lambda_ssim
+        self.lambda_embed = lambda_embed
+        self.embedding_dim = embedding_dim
 
         self.classification_loss = ClassificationLoss(vocab, alpha, beta)
         self.layout_penalty = LayoutPenalty(beta)
+
+        # Initialize embedding loss components if enabled
+        if lambda_embed > 0 or embedding_dim > 0:
+            from src.models.siamese_embedder import (
+                SiameseEmbedder,
+                LightweightSiameseEmbedder
+            )
+            from src.losses.embedding_loss import EmbeddingConsistencyLoss
+
+            # Choose embedder type based on flag
+            if use_lightweight_embedder:
+                self.embedder = LightweightSiameseEmbedder(
+                    embedding_dim=embedding_dim
+                )
+            else:
+                self.embedder = SiameseEmbedder(
+                    embedding_dim=embedding_dim
+                )
+
+            self.embedding_loss_fn = EmbeddingConsistencyLoss(
+                margin=embed_margin,
+                distance="manhattan"
+            )
+        else:
+            self.embedder = None
+            self.embedding_loss_fn = None
 
     def update_weights(self, confusion_matrix: torch.Tensor):
         """Update classification weights based on confusion matrix."""
@@ -316,6 +353,41 @@ class LCOFL(nn.Module):
             pred_texts, gt_texts
         )
 
+    def set_embed_weight(self, weight: float):
+        """
+        Set the embedding loss weight dynamically.
+
+        This is used by the adaptive weight scheduler to gradually
+        increase the embedding loss weight during training.
+
+        Args:
+            weight: New weight for embedding loss
+        """
+        self.lambda_embed = weight
+
+    def get_embeddings(
+        self,
+        sr_images: torch.Tensor,
+        hr_images: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Extract embeddings from SR and HR images.
+
+        Args:
+            sr_images: Super-resolved images (B, 3, H, W)
+            hr_images: Ground truth HR images (B, 3, H, W)
+
+        Returns:
+            Tuple of (sr_embeddings, hr_embeddings)
+        """
+        if self.embedder is None:
+            return None, None
+
+        sr_emb = self.embedder(sr_images)
+        hr_emb = self.embedder(hr_images)
+
+        return sr_emb, hr_emb
+
     def forward(
         self,
         sr_images: torch.Tensor,
@@ -323,9 +395,10 @@ class LCOFL(nn.Module):
         pred_logits: torch.Tensor,
         gt_texts: List[str],
         pred_texts: Optional[List[str]] = None,
+        lambda_embed_override: Optional[float] = None,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """
-        Compute LCOFL loss.
+        Compute LCOFL loss (with optional embedding consistency).
 
         Args:
             sr_images: Super-resolved images (B, 3, H, W) in range [-1, 1]
@@ -333,6 +406,7 @@ class LCOFL(nn.Module):
             pred_logits: OCR predictions (B, K, C) where K is max length
             gt_texts: Ground truth texts
             pred_texts: Optional decoded predicted texts for layout penalty
+            lambda_embed_override: Override embedding weight for this forward pass
 
         Returns:
             Total loss and info dict
@@ -358,6 +432,17 @@ class LCOFL(nn.Module):
             weighted_ssim = self.lambda_ssim * ssim_loss
             losses.append(weighted_ssim)
             info["ssim_loss"] = ssim_loss
+
+        # Embedding Consistency Loss (optional)
+        embed_weight = lambda_embed_override if lambda_embed_override is not None else self.lambda_embed
+        if embed_weight > 0 and self.embedder is not None:
+            sr_emb, hr_emb = self.get_embeddings(sr_images, hr_images)
+            if sr_emb is not None and hr_emb is not None:
+                embed_loss, embed_info = self.embedding_loss_fn(sr_emb, hr_emb)
+                weighted_embed = embed_weight * embed_loss
+                losses.append(weighted_embed)
+                info["embedding_loss"] = embed_loss
+                info["embedding_distance"] = torch.tensor(embed_info["embedding_distance"])
 
         # Total loss
         total_loss = torch.stack(losses).sum()

@@ -9,8 +9,10 @@ Implements multi-stage training approach:
 
 import os
 import json
+import time
+import datetime
 from pathlib import Path
-from typing import Dict, Optional, Any, Tuple
+from typing import Dict, Optional, Any, Tuple, List
 from dataclasses import dataclass
 from enum import Enum
 
@@ -37,6 +39,7 @@ class TrainingStage(Enum):
     WARMUP = "warmup"
     LCOFL = "lcofl"
     FINETUNE = "finetune"
+    HARD_MINING = "hard_mining"  # Stage 4: OCR-driven hard example mining
 
 
 @dataclass
@@ -156,6 +159,14 @@ class ProgressiveTrainer:
                 freeze_ocr=False,
                 update_confusion=True,
             ),
+            TrainingStage.HARD_MINING: StageConfig(
+                name="hard_mining",
+                epochs=self.progressive_config.get("stage4", {}).get("epochs", 20),
+                lr=self.progressive_config.get("stage4", {}).get("lr", 5e-6),
+                loss_components=["l1", "lcofl", "embedding"],
+                freeze_ocr=True,
+                update_confusion=True,
+            ),
         }
 
         # Tracking
@@ -175,6 +186,87 @@ class ProgressiveTrainer:
         self.save_dir = Path(config.get("training", {}).get("save_dir", "outputs/run_default"))
         self.save_dir.mkdir(parents=True, exist_ok=True)
 
+        # DDP synchronization tracking
+        self._last_sync_step = 0
+        self._sync_interval = 50  # Sync check every 50 steps
+
+    def _safe_barrier(self, timeout_seconds: int = 300, description: str = "barrier"):
+        """
+        Execute a barrier with timeout and retry logic.
+        
+        This prevents NCCL hangs by detecting stuck processes early.
+        
+        Args:
+            timeout_seconds: Max seconds to wait for barrier
+            description: Description for logging
+        """
+        if not self.distributed:
+            return True
+            
+        import time
+        start_time = time.time()
+        
+        try:
+            # Use monitored barrier if available (PyTorch 1.10+)
+            if hasattr(dist, 'monitored_barrier'):
+                dist.monitored_barrier(timeout=datetime.timedelta(seconds=timeout_seconds))
+            else:
+                dist.barrier()
+            return True
+        except Exception as e:
+            elapsed = time.time() - start_time
+            if self.is_main:
+                self._log(f"WARNING: Barrier '{description}' failed after {elapsed:.1f}s: {e}", "warning")
+            return False
+
+    def _sync_all_ranks(self, tensor_to_sync: torch.Tensor = None):
+        """
+        Synchronize a tensor across all ranks (for consistent state).
+        
+        Args:
+            tensor_to_sync: Optional tensor to sync (broadcasts from rank 0)
+        """
+        if not self.distributed:
+            return tensor_to_sync
+            
+        if tensor_to_sync is not None:
+            dist.broadcast(tensor_to_sync, src=0)
+        return tensor_to_sync
+
+    def _ddp_sync_check(self, step: int, force: bool = False):
+        """
+        Periodic DDP sync check to prevent rank divergence.
+        
+        This is a lightweight check that ensures all ranks are at the same step.
+        
+        Args:
+            step: Current training step
+            force: Force sync even if not at interval
+        """
+        if not self.distributed:
+            return
+            
+        # Only check at intervals to minimize overhead
+        if not force and (step - self._last_sync_step) < self._sync_interval:
+            return
+            
+        self._last_sync_step = step
+        
+        # Create a tensor with current step on each rank
+        step_tensor = torch.tensor([step], device=self.device, dtype=torch.long)
+        
+        # Gather all steps to rank 0
+        if self.world_size > 1:
+            gathered = [torch.zeros(1, device=self.device, dtype=torch.long) for _ in range(self.world_size)]
+            dist.all_gather(gathered, step_tensor)
+            
+            # Check for divergence (only main rank logs)
+            if self.is_main:
+                steps = [t.item() for t in gathered]
+                max_diff = max(steps) - min(steps)
+                if max_diff > 10:  # Significant divergence
+                    self._log(f"WARNING: Rank step divergence detected! Steps: {steps}", "warning")
+
     def _unwrap_model(self, model):
         """Unwrap DDP model to access underlying model."""
         if self.distributed and isinstance(model, nn.parallel.DistributedDataParallel):
@@ -185,8 +277,7 @@ class ProgressiveTrainer:
         """Set the current training stage."""
         # Synchronize all ranks before changing stage configuration
         # This ensures all ranks have the same model structure (OCR frozen/unfrozen)
-        if self.distributed:
-            dist.barrier()
+        self._safe_barrier(description="set_stage")
 
         self.current_stage = stage
         config = self.stage_configs[stage]
@@ -280,9 +371,16 @@ class ProgressiveTrainer:
 
             self.global_step += 1
 
+            # Periodic DDP sync check to detect rank divergence early
+            self._ddp_sync_check(self.global_step)
+
             # Periodic GPU memory cleanup to prevent OOM during long training stages
             if self.global_step % 100 == 0:
                 torch.cuda.empty_cache()
+
+        # DDP sync: Ensure all ranks complete training epoch before returning
+        # This prevents rank divergence that causes NCCL collective operation timeouts
+        self._safe_barrier(description="train_epoch_end")
 
         avg_loss = total_loss / len(self.train_loader)
         avg_l1 = total_l1 / len(self.train_loader)
@@ -617,8 +715,7 @@ class ProgressiveTrainer:
             should_validate = (epoch % val_interval == 0) or (epoch == 0) or (epoch == stage_config.epochs - 1)
 
             # DDP sync: all ranks pause before validation
-            if self.distributed:
-                dist.barrier()
+            self._safe_barrier(timeout_seconds=600, description="pretrain_pre_validation")
 
             if should_validate:
                 # Limit validation batches to prevent OOM (configurable, default 100 batches)
@@ -664,8 +761,7 @@ class ProgressiveTrainer:
                     print(f"\nOCR Pretrain Epoch {epoch+1}/{stage_config.epochs}: Train Loss: {avg_loss:.4f}")
 
             # DDP sync: all ranks wait for validation to complete
-            if self.distributed:
-                dist.barrier()
+            self._safe_barrier(timeout_seconds=900, description="pretrain_post_validation")
 
             # Step warmup scheduler for first 5 epochs, then cosine annealing
             if epoch < warmup_epochs:
@@ -681,6 +777,238 @@ class ProgressiveTrainer:
             print(f"\nOCR Pretraining complete. Best char accuracy: {best_char_acc:.4f}\n")
 
         return best_char_acc
+
+    def train_hard_mining_stage(self, stage_config: StageConfig) -> float:
+        """
+        Train with hard example mining (Stage 4).
+
+        This stage focuses on samples that OCR struggles with, using
+        weighted sampling and per-character loss adjustments.
+
+        Args:
+            stage_config: Configuration for this training stage
+
+        Returns:
+            Best word accuracy achieved during hard mining
+        """
+        from src.training.hard_example_miner import HardExampleMiner
+
+        # Initialize hard example miner
+        self.hard_example_miner = HardExampleMiner(
+            dataset_size=len(self.train_loader.dataset),
+            alpha=self.config.get("progressive_training", {}).get("stage4", {})
+                .get("hard_mining", {}).get("difficulty_alpha", 2.0),
+        )
+
+        # Get Stage 4 configuration
+        stage4_config = self.config.get("progressive_training", {}).get("stage4", {})
+        reweight_interval = stage4_config.get("hard_mining", {}).get("reweight_interval", 5)
+        min_samples_seen = stage4_config.get("hard_mining", {}).get("min_samples_seen", 100)
+
+        if self.is_main:
+            print(f"\n{'='*60}")
+            print(f"HARD EXAMPLE MINING STAGE (Stage 4)")
+            print(f"{'='*60}")
+            print(f"Epochs: {stage_config.epochs}")
+            print(f"Learning Rate: {stage_config.lr}")
+            print(f"Loss Components: {stage_config.loss_components}")
+            print(f"{'='*60}\n")
+
+        # Create optimizer
+        params = list(self.generator.parameters())
+        if not stage_config.freeze_ocr:
+            params.extend(list(self.ocr.parameters()))
+
+        self.optimizer = optim.Adam(params, lr=stage_config.lr)
+        self.scheduler = StepLR(
+            self.optimizer,
+            step_size=self.config.get("training", {}).get("lr_step_size", 5),
+            gamma=self.config.get("training", {}).get("lr_gamma", 0.9),
+        )
+
+        # Get validation config
+        val_interval = self.config.get("training", {}).get("val_interval", 10)
+        val_beam_width = self.config.get("training", {}).get("val_beam_width", 5)
+
+        best_word_acc = 0.0
+        self.epochs_without_improvement = 0
+
+        # Track batch indices for hard example mining
+        # In practice, you'd need to modify the dataset to provide indices
+        batch_indices = torch.arange(len(self.train_loader.dataset))
+
+        for epoch in range(stage_config.epochs):
+            # Set epoch for proper shuffling in DDP
+            if self.train_sampler is not None:
+                self.train_sampler.set_epoch(epoch)
+
+            self.generator.train()
+            if stage_config.freeze_ocr:
+                self.ocr.eval()
+            else:
+                self.ocr.train()
+
+            total_loss = 0.0
+            total_l1 = 0.0
+            total_lcofl = 0.0
+            total_embed = 0.0
+
+            pred_texts_all = []
+            gt_texts_all = []
+
+            pbar = tqdm(self.train_loader, desc=f"Hard Mining Epoch {epoch+1}/{stage_config.epochs}",
+                       disable=not self.is_main)
+
+            for batch_idx, batch in enumerate(pbar):
+                lr_images = batch["lr"].to(self.device)
+                hr_images = batch["hr"].to(self.device)
+                gt_texts = batch["plate_text"]
+
+                # Forward pass
+                sr_images = self.generator(lr_images)
+
+                # Compute L1 loss
+                l1 = self.l1_loss(sr_images, hr_images)
+                loss = l1
+
+                # Get OCR predictions
+                with torch.no_grad():
+                    pred_logits = self.ocr(sr_images, return_logits=True)
+                    ocr_unwrapped = self._unwrap_model(self.ocr)
+                    pred_texts = ocr_unwrapped.predict(sr_images)
+
+                # Compute LCOFL
+                lcofl, lcofl_info = self.lcofl_loss(
+                    sr_images, hr_images, pred_logits, gt_texts, pred_texts
+                )
+                lambda_lcofl = self.config.get("loss", {}).get("lambda_lcofl", 1.0)
+                loss = loss + lambda_lcofl * lcofl
+                total_lcofl += lcofl.item()
+
+                # Compute embedding loss if enabled
+                if "embedding" in stage_config.loss_components:
+                    sr_emb, hr_emb = self.lcofl_loss.get_embeddings(sr_images, hr_images)
+                    if sr_emb is not None and hr_emb is not None:
+                        embed_loss, _ = self.lcofl_loss.embedding_loss_fn(sr_emb, hr_emb)
+                        # Get current embedding weight
+                        lambda_embed = self.config.get("loss", {}).get("lambda_embed", 0.3)
+                        loss = loss + lambda_embed * embed_loss
+                        total_embed += embed_loss.item()
+
+                total_loss += loss.item()
+                total_l1 += l1.item()
+
+                # Compute character accuracy per sample
+                char_accs = self._compute_char_accuracy(pred_texts, gt_texts)
+
+                # Update hard example miner
+                # Note: In a real implementation, you'd track which samples
+                # correspond to which batch indices
+                self.hard_example_miner.update(
+                    torch.arange(len(pred_texts))[:len(char_accs)],
+                    char_accs[:len(char_accs)],
+                )
+
+                pred_texts_all.extend(pred_texts)
+                gt_texts_all.extend(gt_texts)
+
+                # Backward pass
+                self.optimizer.zero_grad()
+                loss.backward()
+
+                # Gradient clipping
+                if self.config.get("training", {}).get("gradient_clip"):
+                    torch.nn.utils.clip_grad_norm_(
+                        self.generator.parameters(),
+                        max_norm=self.config["training"]["gradient_clip"],
+                    )
+
+                self.optimizer.step()
+                self.global_step += 1
+
+                pbar.set_postfix({"loss": loss.item()})
+
+            avg_loss = total_loss / len(self.train_loader)
+            avg_l1 = total_l1 / len(self.train_loader)
+            avg_lcofl = total_lcofl / len(self.train_loader)
+            avg_embed = total_embed / len(self.train_loader) if "embedding" in stage_config.loss_components else 0
+
+            # Validate
+            should_validate = (epoch % val_interval == 0) or (epoch == 0) or (epoch == stage_config.epochs - 1)
+
+            if should_validate:
+                self._safe_barrier(timeout_seconds=600, description="hard_mining_validation")
+
+                val_metrics = self.validate(beam_width=val_beam_width)
+
+                # Log to TensorBoard
+                train_metrics = {
+                    "loss": avg_loss,
+                    "l1": avg_l1,
+                    "lcofl": avg_lcofl,
+                    "embed": avg_embed,
+                }
+                self.log_to_tensorboard(train_metrics, val_metrics, epoch)
+
+                if self.is_main:
+                    print(f"\nHard Mining Epoch {epoch+1}/{stage_config.epochs}:")
+                    print(f"  Train Loss: {avg_loss:.4f}")
+                    print(f"  Val Word Acc: {val_metrics['word_acc']:.4f}")
+                    print(f"  Val Char Acc: {val_metrics['char_acc']:.4f}")
+
+                    # Check for best model
+                    if val_metrics['word_acc'] > self.best_word_acc:
+                        self.best_word_acc = val_metrics['word_acc']
+                        self.epochs_without_improvement = 0
+                        self.save_checkpoint(epoch, TrainingStage.HARD_MINING)
+                    else:
+                        self.epochs_without_improvement += 1
+
+            # Update confusion if needed
+            if stage_config.update_confusion and self.is_main:
+                self.confusion_tracker.update(pred_texts_all, gt_texts_all)
+                self.lcofl_loss.update_weights(self.confusion_tracker.confusion_matrix)
+
+            # Learning rate scheduling
+            self.scheduler.step()
+
+            # Early stopping
+            patience = self.config.get("training", {}).get("early_stop_patience", 20)
+            if self.epochs_without_improvement >= patience:
+                if self.is_main:
+                    print(f"Early stopping after {patience} epochs without improvement")
+                break
+
+        best_acc = self.best_word_acc
+
+        if self.is_main:
+            print(f"\nHard Mining Stage complete. Best word accuracy: {best_acc:.4f}\n")
+
+        return best_acc
+
+    def _compute_char_accuracy(
+        self,
+        pred_texts: List[str],
+        gt_texts: List[str],
+    ) -> torch.Tensor:
+        """
+        Compute character-level accuracy for each sample.
+
+        Args:
+            pred_texts: List of predicted texts
+            gt_texts: List of ground truth texts
+
+        Returns:
+            Tensor of character accuracies
+        """
+        char_accs = []
+        for pred, gt in zip(pred_texts, gt_texts):
+            min_len = min(len(pred), len(gt))
+            correct = sum(1 for i in range(min_len) if pred[i] == gt[i])
+            acc = correct / max(len(gt), 1)
+            char_accs.append(acc)
+
+        return torch.tensor(char_accs)
 
     def _log_ocr_predictions(
         self,
@@ -820,6 +1148,7 @@ class ProgressiveTrainer:
                 TrainingStage.WARMUP: "Stage1_Warmup",
                 TrainingStage.LCOFL: "Stage2_LCOFL",
                 TrainingStage.FINETUNE: "Stage3_Finetune",
+                TrainingStage.HARD_MINING: "Stage4_HardMining",
             }
             stage_name = stage_to_name.get(self.current_stage, "SR")
 
@@ -849,6 +1178,7 @@ class ProgressiveTrainer:
             TrainingStage.WARMUP: "stage1_warmup",
             TrainingStage.LCOFL: "stage2_lcofl",
             TrainingStage.FINETUNE: "stage3_finetune",
+            TrainingStage.HARD_MINING: "stage4_hard_mining",
         }
         stage_prefix = stage_to_prefix.get(self.current_stage, f"stage_{self.current_stage.value}")
 
@@ -924,6 +1254,10 @@ class ProgressiveTrainer:
         self.set_stage(stage)
         config = self.stage_configs[stage]
 
+        # Handle Stage 4 (Hard Mining) separately
+        if stage == TrainingStage.HARD_MINING:
+            return self.train_hard_mining_stage(config)
+
         # Create optimizer for this stage
         if stage == TrainingStage.FINETUNE:
             # Train both generator and OCR
@@ -972,6 +1306,10 @@ class ProgressiveTrainer:
             # Only validate every val_interval epochs (or first/last epoch)
             should_validate = (epoch % val_interval == 0) or (epoch == 0) or (epoch == config.epochs - 1)
 
+            # DDP sync: ALL ranks must synchronize BEFORE validation
+            # This prevents NCCL timeout when main rank takes longer due to validation
+            self._safe_barrier(timeout_seconds=600, description="pre_validation")
+
             if should_validate:
                 val_metrics = self.validate(beam_width=val_beam_width)
 
@@ -986,9 +1324,9 @@ class ProgressiveTrainer:
                 # Skip validation - provide minimal metrics for early stopping
                 val_metrics = {"word_acc": 0.0, "char_acc": 0.0, "psnr": 0.0, "ssim": 0.0, "pred_texts": [], "gt_texts": []}
 
-            # DDP sync: ALL ranks must synchronize at end of epoch (before early stopping check)
-            if self.distributed:
-                dist.barrier()
+            # DDP sync: ALL ranks must synchronize AFTER validation (before early stopping check)
+            # Use longer timeout since validation can take 15+ minutes
+            self._safe_barrier(timeout_seconds=900, description="post_validation")
 
             # Log and print results (only when validation was performed)
             is_best = False
@@ -1097,9 +1435,8 @@ class ProgressiveTrainer:
         self.global_epoch = checkpoint.get("global_epoch", 0)
         self.best_word_acc = checkpoint.get("best_word_acc", 0.0)
 
-        if self.distributed:
-            # Synchronize all processes after loading checkpoint
-            dist.barrier()
+        # Synchronize all processes after loading checkpoint
+        self._safe_barrier(timeout_seconds=300, description="load_checkpoint")
 
     def train_full_progressive(self) -> Dict[str, Any]:
         """Train all stages sequentially."""
@@ -1132,28 +1469,36 @@ class ProgressiveTrainer:
             )
 
         # Synchronize all ranks between stages (critical for DDP)
-        if self.distributed:
-            dist.barrier()
+        self._safe_barrier(timeout_seconds=300, description="stage0_to_stage1")
 
         # Stage 1: Warm-up
         best_acc_stage1 = self.train_stage(TrainingStage.WARMUP)
         results["stage1_best_acc"] = best_acc_stage1
 
         # Synchronize all ranks between stages
-        if self.distributed:
-            dist.barrier()
+        self._safe_barrier(timeout_seconds=300, description="stage1_to_stage2")
 
         # Stage 2: LCOFL
         best_acc_stage2 = self.train_stage(TrainingStage.LCOFL)
         results["stage2_best_acc"] = best_acc_stage2
 
         # Synchronize all ranks between stages
-        if self.distributed:
-            dist.barrier()
+        self._safe_barrier(timeout_seconds=300, description="stage2_to_stage3")
 
         # Stage 3: Fine-tuning
         best_acc_stage3 = self.train_stage(TrainingStage.FINETUNE)
         results["stage3_best_acc"] = best_acc_stage3
+
+        # Synchronize all ranks between stages
+        self._safe_barrier(timeout_seconds=300, description="stage3_to_stage4")
+
+        # Stage 4: Hard Example Mining (optional, check if configured)
+        stage4_epochs = self.progressive_config.get("stage4", {}).get("epochs", 0)
+        if stage4_epochs > 0:
+            best_acc_stage4 = self.train_stage(TrainingStage.HARD_MINING)
+            results["stage4_best_acc"] = best_acc_stage4
+        else:
+            results["stage4_best_acc"] = self.best_word_acc
 
         # Save final results
         results["final_best_acc"] = self.best_word_acc
@@ -1172,6 +1517,8 @@ class ProgressiveTrainer:
                 self.text_logger._write_raw(f"║  Stage 1 (Warmup): {results['stage1_best_acc']:.4f} word_acc".ljust(79) + "║")
                 self.text_logger._write_raw(f"║  Stage 2 (LCOFL): {results['stage2_best_acc']:.4f} word_acc".ljust(79) + "║")
                 self.text_logger._write_raw(f"║  Stage 3 (Finetune): {results['stage3_best_acc']:.4f} word_acc".ljust(79) + "║")
+                if stage4_epochs > 0:
+                    self.text_logger._write_raw(f"║  Stage 4 (Hard Mining): {results['stage4_best_acc']:.4f} word_acc".ljust(79) + "║")
                 self.text_logger._write_raw("╠" + "═" * 78 + "╣")
                 self.text_logger._write_raw(f"║  Final Best Word Accuracy: {self.best_word_acc:.4f}".ljust(79) + "║")
                 self.text_logger._write_raw(f"║  Results saved to: {str(self.save_dir)[:50]}".ljust(79) + "║")

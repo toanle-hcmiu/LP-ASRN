@@ -1,5 +1,6 @@
 # LP-ASRN Configuration
 # Layout-Aware and Character-Driven Super-Resolution Network
+# Enhanced with LCOFL-EC, DCNv4, Multi-Scale Character Attention, and OCR-Driven Curriculum
 
 model:
   # Number of RRDB-EA blocks in the deep feature extractor
@@ -15,6 +16,15 @@ model:
 
   # Use deformable convolutions in attention modules
   use_deformable: true
+
+  # Phase 2: DCNv4 Configuration
+  use_dcnv4: true             # Use DCNv4 instead of DCNv3 (falls back to DCNv3 if unavailable)
+  dcnv4_groups: 4             # Number of groups for DCNv4
+
+  # Phase 3: Multi-Scale Character Attention
+  use_character_attention: true  # Enable multi-scale character attention module
+  msca_scales: [1.0, 0.5, 0.25]  # Scales for multi-scale processing
+  msca_num_prototypes: 36          # Number of character prototypes
 
 data:
   # Scenarios to include in training
@@ -93,6 +103,14 @@ loss:
 
   # Weight for SSIM loss (from Paper 2)
   lambda_ssim: 0.2
+
+  # Phase 1: Embedding Consistency Loss (LCOFL-EC)
+  lambda_embed: 0.0           # Initial embedding loss weight (will be warmed up)
+  embed_target_weight: 0.3    # Target weight after warm-up
+  embed_warmup_epochs: 50     # Epochs for warm-up
+  embedding_dim: 128          # Embedding dimension
+  embed_margin: 2.0           # Contrastive loss margin
+  use_lightweight_embedder: false  # Use lightweight embedder instead of ResNet-18
 
   # Confusion weight increment (added to confused character weights)
   alpha: 0.1
@@ -174,6 +192,20 @@ progressive_training:
     loss_components: ["l1", "lcofl"]
     freeze_ocr: false
     update_confusion: true
+
+  # Phase 4: Hard Example Mining Stage (OCR-Driven Curriculum)
+  # Purpose: Focus training on samples that OCR struggles with
+  stage4:
+    name: "hard_mining"
+    epochs: 50    # Additional epochs focusing on hard examples
+    lr: 0.000005  # Lower LR for fine-tuning on hard examples
+    loss_components: ["l1", "lcofl", "embedding"]
+    freeze_ocr: true
+    update_confusion: true
+    hard_mining:
+      difficulty_alpha: 2.0      # Exponent for difficulty weighting
+      reweight_interval: 5       # Re-weight samples every N epochs
+      min_samples_seen: 100      # Min samples before weighting
 
 # TensorBoard Configuration
 tensorboard:

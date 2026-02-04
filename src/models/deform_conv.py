@@ -5,12 +5,30 @@ Adapted from: Dai et al. "Deformable Convolutional Networks" (CVPR 2017)
 and "Deformable ConvNets V2" (CVPR 2019).
 
 This implementation uses PyTorch's grid_sample for differentiable sampling.
+
+Also includes DCNv4 support with automatic fallback to DCNv3 when unavailable.
+Based on: DCNv4 (2024) - https://arxiv.org/abs/2401.06197
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional
+
+
+# Try to import DCNv4 from official package
+DCNV4_AVAILABLE = False
+_DCNv4 = None
+
+try:
+    from DCNv4 import DCNv4 as _DCNv4
+    DCNV4_AVAILABLE = True
+except ImportError:
+    try:
+        from dcnv4 import DCNv4 as _DCNv4
+        DCNV4_AVAILABLE = True
+    except ImportError:
+        DCNV4_AVAILABLE = False
 
 
 class DeformableConv2d(nn.Module):
@@ -489,6 +507,103 @@ class ModulatedDeformableConv2d(nn.Module):
         return output
 
 
+class DeformableConv2dV4(nn.Module):
+    """
+    DCNv4-based Deformable Convolution.
+
+    Key differences from DCNv3:
+    - Removed softmax normalization for unbounded dynamic weights
+    - Removed internal skip connection (use external residual)
+    - Memory-efficient kernel with flash-attention patterns
+    - ~3x faster than DCNv3
+
+    Falls back to DCNv3 (DeformableConv2d) if DCNv4 package is not available.
+
+    Reference:
+        DCNv4: The Devil is in the Details for Deformable Convolutions (2024)
+        https://arxiv.org/abs/2401.06197
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int = 3,
+        stride: int = 1,
+        padding: int = 1,
+        groups: int = 4,
+        dilation: int = 1,
+        bias: bool = True,
+    ):
+        """
+        Initialize DCNv4 Deformable Convolution.
+
+        Args:
+            in_channels: Number of input channels
+            out_channels: Number of output channels
+            kernel_size: Size of the convolving kernel
+            stride: Stride of the convolution
+            padding: Zero-padding added to both sides of the input
+            groups: Number of groups for DCNv4 (determines offset channels)
+            dilation: Spacing between kernel elements
+            bias: If True, adds a learnable bias to the output
+        """
+        super().__init__()
+
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.padding = padding
+        self.dilation = dilation
+        self.groups = groups
+
+        # Check if DCNv4 is available
+        self.use_dcnv4 = DCNV4_AVAILABLE
+
+        if self.use_dcnv4:
+            # Use official DCNv4 implementation
+            self.dcn = _DCNv4(
+                in_channels=in_channels,
+                out_channels=out_channels,
+                kernel_size=kernel_size,
+                stride=stride,
+                pad=padding,
+                dilation=dilation,
+                group=groups,
+                bias=bias,
+            )
+        else:
+            # Fallback to standard DCNv3 implementation
+            # Use the existing DeformableConv2d as fallback
+            self.fallback_dcn = DeformableConv2d(
+                in_channels=in_channels,
+                out_channels=out_channels,
+                kernel_size=kernel_size,
+                stride=stride,
+                padding=padding,
+                dilation=dilation,
+                groups=1,  # DCNv3 doesn't support groups in same way
+                bias=bias,
+            )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass.
+
+        Args:
+            x: Input tensor of shape (B, C, H, W)
+
+        Returns:
+            Output tensor of shape (B, out_channels, H', W')
+        """
+        if self.use_dcnv4:
+            return self.dcn(x)
+        else:
+            # Fallback to DCNv3
+            return self.fallback_dcn(x)
+
+
 if __name__ == "__main__":
     # Test the deformable convolution
     x = torch.randn(2, 64, 32, 64)
@@ -502,5 +617,14 @@ if __name__ == "__main__":
     mod_deform_conv = ModulatedDeformableConv2d(64, 64, kernel_size=3, padding=1)
     y2 = mod_deform_conv(x)
     print(f"Modulated Deformable Conv output shape: {y2.shape}")  # Should be (2, 64, 32, 64)
+
+    # Test DCNv4 if available
+    if DCNV4_AVAILABLE:
+        print(f"\nDCNv4 is available!")
+        dcnv4 = DeformableConv2dV4(64, 64, kernel_size=3, padding=1)
+        y3 = dcnv4(x)
+        print(f"DCNv4 output shape: {y3.shape}")
+    else:
+        print(f"\nDCNv4 is not available, using DCNv3 fallback")
 
     print("Deformable conv test passed!")

@@ -8,254 +8,179 @@ LP-ASRN (License Plate Super-Resolution Network) is a specialized super-resoluti
 
 ---
 
-## Generator Architecture
-
-### High-Level Structure
+## High-Level Architecture
 
 ```
-Input: LR Image (B, 3, H, W) → [Generator] → SR Image (B, 3, 2H, 2W)
+                    ┌─────────────────────────────────────────────────────┐
+                    │                    Generator                        │
+Input: LR Image     │  ┌────────────┐  ┌────────────┐  ┌──────────────┐  │
+   (B,3,H,W)  ───▶  │  │  Shallow   │  │    Deep    │  │    MSCA      │  │
+                    │  │  Extractor │─▶│  Extractor │─▶│  (Optional)  │  │
+                    │  └────────────┘  └────────────┘  └──────────────┘  │
+                    │         │                               │          │
+                    │         ▼                               ▼          │
+                    │  ┌────────────┐  ┌────────────────────────────┐   │
+                    │  │  Upscaler  │◀─│  Multi-Scale Char Attention│   │
+                    │  └────────────┘  └────────────────────────────┘   │
+                    │         │                                          │
+                    │         ▼                                          │
+                    │  ┌────────────┐                                    │──▶ SR Output
+                    │  │ Reconstruct│                                    │    (B,3,2H,2W)
+                    │  └────────────┘                                    │
+                    └─────────────────────────────────────────────────────┘
 ```
 
-### Components
+---
 
-#### 1. Shallow Feature Extractor
+## Generator Components
 
-```python
-LR Input (B, 3, H, W)
-    ↓
-Conv 5x5, 64 filters
-    ↓
-PixelUnshuffle (compress spatial → channels)
-    ↓
-Conv 3x3, compressed channels
-    ↓
-PixelShuffle (expand channels → spatial)
-    ↓
-Conv 3x3, 64 filters
-    ↓
-Skip Connection
-    ↓
-Shallow Features (B, 64, H, W)
-```
+### 1. Shallow Feature Extractor
 
-**Purpose**: Extract and reorganize initial features, eliminating less significant information early.
-
-#### 2. Deep Feature Extractor
+Extracts initial features using an auto-encoder structure with PixelShuffle.
 
 ```
-Shallow Features (B, 64, H, W)
-    ↓
-[16x RRDB-EA Blocks]
-    ↓
-Global Conv + Skip Connection
-    ↓
-Deep Features (B, 64, H, W)
+LR Input → Conv5x5 → PixelUnshuffle → Conv → PixelShuffle → Conv → Shallow Features
+                                                                         ↓
+                                                              Skip Connection (+)
 ```
 
-Each RRDB-EA (Residual-in-Residual Dense Block with Enhanced Attention):
+### 2. Deep Feature Extractor
+
+16 RRDB-EA blocks (Residual-in-Residual Dense Block with Enhanced Attention).
+
+```
+Shallow Features → [RRDB-EA × 16] → Global Conv → Deep Features
+                           ↓
+              Each RRDB-EA block contains:
+              - Dense layers with growth connections
+              - Enhanced Attention Module (EAM)
+              - Deformable Convolutions (DCNv4/DCNv3)
+```
+
+### 3. Enhanced Attention Module (EAM)
 
 ```
 Input Features
-    ↓
-[Dense Conv Layers (3-4 layers)]
-    ↓
-Enhanced Attention Module (EAM)
-    ↓
-Local Conv
-    ↓
-Residual Connection
+      │
+      ├──▶ Channel Attention (CA)
+      │         - Conv1x1 parallel branches
+      │         - PixelUnshuffle → Conv → PixelShuffle
+      │
+      ├──▶ Spatial/Positional Attention (POS)
+      │         - DCNv4 (or DCNv3 fallback)
+      │         - Adaptive sampling locations
+      │
+      └──▶ Geometrical Perception Unit (GP)
+                - Global avg pool (H/V directions)
+                - Point-wise convolutions
+
+      Output = Sigmoid(CA × POS + GP) × DeformConv(Input)
 ```
 
-#### 3. Enhanced Attention Module (EAM)
+### 4. Multi-Scale Character Attention (MSCA) - NEW
+
+Character-aware attention module that focuses on text regions.
 
 ```
-Input Features (B, 64, H, W)
-    ↓
-┌─────────────────────────────────────────┐
-│  Channel Unit (CA)                      │
-│  - Conv 1x1 (parallel branches)           │
-│  - PixelUnshuffle → Conv → PixelShuffle   │
-│  - Outputs: channel importance weights    │
-└─────────────────────────────────────────┘
-    ↓
-┌─────────────────────────────────────────┐
-│  Positional Unit (POS)                    │
-│  - Deformable Conv (adaptive sampling)     │
-│  - PixelUnshuffle → Conv → PixelShuffle   │
-│  - Outputs: spatial importance weights     │
-└─────────────────────────────────────────┘
-    ↓
-┌─────────────────────────────────────────┐
-│  Geometrical Perception Unit (GP)         │
-│  - Global avg pool (horizontal/vertical)  │
-│  - Point-wise conv                       │
-│  - Outputs: structural feature importance │
-└─────────────────────────────────────────┘
-    ↓
-Combine: CA × POS + GP (element-wise operations)
-    ↓
-Sigmoid activation
-    ↓
-Attention Mask
-    ↓
-Deformable Conv
-    ↓
-Enhanced Features
+Deep Features (B, C, H, W)
+      │
+      ├──▶ Scale 1.0x ──▶ CharRegionDetector ──▶ GuidedAttention ──┐
+      │                                                            │
+      ├──▶ Scale 0.5x ──▶ CharRegionDetector ──▶ GuidedAttention ──┼──▶ Fusion ──▶ Enhanced Features
+      │                                                            │
+      └──▶ Scale 0.25x ──▶ CharRegionDetector ──▶ GuidedAttention ─┘
 ```
 
-#### 4. Upscaling Module
+**CharacterRegionDetector**: Learns 36 character prototypes (0-9, A-Z) to identify text regions.
+
+### 5. Upscaling Module
 
 ```
-Deep Features (B, 64, H, W)
-    ↓
-Conv (B, 3 × r², H, W)  # r=2 for 2x upscaling
-    ↓
-PixelShuffle (rearrange channels → spatial)
-    ↓
-Upscaled Features (B, 3, 2H, 2W)
+Features → Conv(C, 3×r²) → PixelShuffle(r=2) → Upscaled (2× resolution)
 ```
 
-#### 5. Reconstruction Layer
+### 6. Reconstruction Layer
 
 ```
-Upscaled Features (B, 3, 2H, 2W)
-    ↓
-Conv 3x3, 3 filters
-    ↓
-Tanh activation (clamp to [-1, 1])
-    ↓
-Skip Connection (from input LR upsampled)
-    ↓
-SR Output (B, 3, 2H, 2W)
+Upscaled → Conv3x3 → Tanh → Skip(LR upsampled) → SR Output [-1, 1]
 ```
 
 ---
 
 ## Deformable Convolution
 
-### Standard vs Deformable Convolution
+### DCNv4 (Preferred) vs DCNv3
 
-**Standard Convolution**:
-- Fixed sampling grid (e.g., 3×3)
-- Samples at predetermined positions relative to each pixel
-- Limited ability to adapt to irregular shapes
-
-**Deformable Convolution**:
-- Learns offset parameters for each sampling location
-- Adapts receptive field to match character shapes
-- Better captures curved and irregular character strokes
+| Aspect | DCNv3 | DCNv4 |
+|--------|-------|-------|
+| Weight normalization | Softmax (bounded) | Unbounded |
+| Skip connection | Internal | External |
+| Memory access | Standard | Flash-attention optimized |
+| Speed | Baseline | **~3x faster** |
 
 ### Implementation
 
-```
-Input Features (B, C, H, W)
-    ↓
-Offset Conv (2 × k × k filters) → Offsets (B, 2k², H', W')
-    ↓
-Deformable Conv (k × k filters with learned offsets)
-    ↓
-Output Features (B, C, H', W')
+DCNv4 is preferred when available, with automatic fallback to DCNv3:
+
+```python
+if DCNV4_AVAILABLE:
+    self.deform_conv = DeformableConv2dV4(in_channels, out_channels)
+else:
+    self.deform_conv = DeformableConv2d(in_channels, out_channels)  # DCNv3
 ```
 
 ---
 
 ## Loss Functions
 
-### LCOFL (Layout and Character Oriented Focal Loss)
+### LCOFL-EC (Extended with Embedding Consistency)
 
 ```
-L_LCOFL = L_C + λ_layout × L_P + λ_ssim × L_S
+L_total = L_LCOFL + λ_embed × L_EC
+
+Where:
+- L_LCOFL = L_C + λ_layout × L_P + λ_ssim × L_S
+- L_EC = max(m - D(V_SR, V_HR), 0)²
 ```
 
 #### Classification Loss (L_C)
-
-Weighted cross-entropy that adapts to character confusions:
-
+Weighted cross-entropy adapting to character confusions:
 ```
 L_C = -(1/K) × Σ w_k × log(p(y_GT_k | x_SR))
-
 w_k = 1 + α × confusion_count(k)
 ```
 
 #### Layout Penalty (L_P)
-
 Penalizes digit/letter position mismatches:
-
 ```
 L_P = Σ [D(pred_i) × A(GT_i) + A(pred_i) × D(GT_i)]
-
-D(c) = β if c is digit
-A(c) = β if c is letter
 ```
+
+#### Embedding Consistency Loss (L_EC) - NEW
+Contrastive loss using Siamese network embeddings:
+```
+L_EC = max(margin - ManhattanDist(V_SR, V_HR), 0)²
+```
+
+**SiameseEmbedder Architecture**:
+- Frozen ResNet-18 backbone
+- 128-dim L2-normalized embeddings
+- Manhattan distance for loss computation
 
 ---
 
-## OCR Integration
+## Five-Stage Progressive Training
 
-### SimpleCRNN Model
-
-- **Architecture**: CNN feature extractor + Bidirectional LSTM + CTC decoder
-- **Vocabulary**: 36 characters (0-9, A-Z) optimized for license plates
-- **Input**: Images of shape (B, 3, H, W) in range [0, 1]
-- **Output**: Logits of shape (B, max_length, vocab_size)
-
-#### Architecture Details
-
-1. **CNN Feature Extractor**:
-   - 3 Convolutional layers (64 → 128 → 256 filters)
-   - MaxPool2d after each layer
-   - ReLU activations
-
-2. **RNN Decoder**:
-   - Bidirectional LSTM (2 layers, 256 hidden units)
-   - Processes sequential features from CNN
-
-3. **Output Layer**:
-   - Linear projection to vocabulary size (36)
-
-### OCR as Discriminator
-
-In the GAN-inspired training paradigm:
-
-1. **Generator**: Creates super-resolved images
-2. **Discriminator (OCR)**: Evaluates character recognizability
-3. **Objective**: Generator produces images that OCR can classify correctly
-
----
-
-## Training Stability Features
-
-### 1. Progressive Training
-
-Four stages prevent instability from complex loss landscapes:
-- **Stage 0**: OCR Pretraining (train OCR on HR images)
-- **Stage 1**: Warm-up with simple L1 loss
-- **Stage 2**: Introduce LCOFL gradually
-- **Stage 3**: Joint optimization (if needed)
-
-### 2. Learning Rate Scheduling
-
-StepLR based on **recognition rate** (not loss):
 ```
-Every 5 epochs:
-  IF recognition_rate NOT improved:
-    learning_rate *= 0.9
+┌──────────────────────────────────────────────────────────────────┐
+│ Stage 0   │ Stage 1   │ Stage 2   │ Stage 3    │ Stage 4        │
+│ OCR       │ Warm-up   │ LCOFL     │ Fine-tune  │ Hard Mining    │
+│ Pretrain  │ (L1)      │ Training  │ (Joint)    │ (Curriculum)   │
+│           │           │           │            │                │
+│ 50 epochs │ 30 epochs │ 300 epochs│ 150 epochs │ 50 epochs      │
+│ OCR only  │ Gen only  │ Gen only  │ Gen + OCR  │ Gen + Weighted │
+└──────────────────────────────────────────────────────────────────┘
 ```
-
-### 3. Gradient Clipping
-
-Prevents exploding gradients in deep networks:
-```
-IF gradient_norm > 1.0:
-    gradient = gradient / gradient_norm × 1.0
-```
-
-### 4. Early Stopping
-
-Monitors metrics and stops when:
-- 20 epochs without improvement (Stage 1)
-- Recognition rate plateaus (Stage 2)
-- Word accuracy plateaus (Stage 3)
 
 ---
 
@@ -264,53 +189,32 @@ Monitors metrics and stops when:
 | Component | Parameters |
 |-----------|------------|
 | Shallow Extractor | ~50K |
-| RRDB-EA Block | ~80K |
-| Total (16 blocks) | ~1.28M |
-| EAM per block | ~10K |
-| Upscaler | ~3K |
-| Reconstruction | ~3K |
-| **Total Generator** | **~1.38M** |
-
----
-
-## Input/Output Specifications
-
-### Input
-- **Format**: RGB images
-- **Range**: [-1, 1] (normalized)
-- **Size**: Variable (e.g., 17×31, 31×17)
-
-### Output
-- **Format**: RGB images
-- **Range**: [-1, 1] (normalized)
-- **Size**: 2× input (e.g., 34×62, 62×34)
-
-### Supported Formats
-
-| Layout | Pattern | Example |
-|--------|--------|---------|
-| Brazilian | LLLNNNN | ABC1234 |
-| Mercosur | LLLNLNN | ABC1D23 |
+| RRDB-EA Block (×16) | ~1.28M |
+| MSCA Module | ~100K |
+| SiameseEmbedder | ~11M (frozen backbone) |
+| Upscaler + Reconstruction | ~6K |
+| **Total Generator** | **~1.5M** |
 
 ---
 
 ## Key Design Decisions
 
 ### Why 2x Upscaling?
-
-Paper 2 achieved better recognition with 2x than Paper 1 with 4x:
-- More stable training
+- More stable training than 4x
 - Better matches real-world surveillance constraints
-- Sufficient for most OCR systems
+- Paper 2 achieved 49.8% vs Paper 1's 39.0% with 4x
 
-### Why Progressive Training?
+### Why DCNv4?
+- 3x faster training
+- Better memory efficiency
+- Unbounded weights learn more flexibly
 
-1. **Stability**: Warm-up prevents early loss landscape exploration failures
-2. **Convergence**: Each stage focuses on specific objectives
-3. **Performance**: Fine-tuning extracts final improvements
+### Why Multi-Scale Character Attention?
+- Characters appear at different sizes in LR images
+- Learned prototypes focus attention on text regions
+- Improves recognition of small/blurry characters
 
-### Why OCR-Guided Training?
-
-- Direct optimizes for the end task (recognition)
-- Avoids optimizing irrelevant features (textures, backgrounds)
-- Handles character confusion explicitly through LCOFL
+### Why Embedding Consistency?
+- Perceptual similarity beyond pixel metrics
+- Frozen backbone provides stable gradients
+- Contrastive loss prevents mode collapse

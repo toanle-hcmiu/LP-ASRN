@@ -247,12 +247,18 @@ def setup_ddp(rank, world_size):
 
     # NCCL settings for better error handling and longer timeout
     os.environ["NCCL_BLOCKING_WAIT"] = "1"  # Better error messages
-    os.environ["NCCL_TIMEOUT"] = "1800"  # 30 minutes (default is 10 min)
+    os.environ["NCCL_ASYNC_ERROR_HANDLING"] = "1"  # Async error for debugging
+    os.environ["NCCL_DEBUG"] = "WARN"  # Enable NCCL warnings for debugging
+
+    # Use longer timeout (60 minutes) to handle long validation phases
+    import datetime
+    timeout = datetime.timedelta(minutes=60)
 
     dist.init_process_group(
         backend='nccl',
         world_size=world_size,
-        rank=rank
+        rank=rank,
+        timeout=timeout  # Explicit timeout to prevent watchdog kills
     )
     torch.cuda.set_device(rank)
 

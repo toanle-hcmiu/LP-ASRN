@@ -1,291 +1,224 @@
 # LP-ASRN Training Agents
 
-This document describes the progressive training agents used in LP-ASRN and their configuration.
+This document describes the progressive training agents used in LP-ASRN v2.0.
 
 ## Overview
 
-LP-ASRN uses a three-stage progressive training approach to optimize both image quality and character recognition accuracy. Each stage focuses on specific objectives, with the final stage achieving the best recognition performance.
+LP-ASRN uses a **five-stage** progressive training approach:
+
+| Stage | Agent | Purpose | OCR |
+|-------|-------|---------|-----|
+| 0 | Pretrain | Train OCR on HR images | Training |
+| 1 | Warm-up | Stabilize generator | Frozen |
+| 2 | LCOFL | Character-driven optimization | Frozen |
+| 3 | Fine-tune | Joint optimization | Unfrozen |
+| 4 | **Hard Mining** | Focus on difficult samples | Frozen |
 
 ---
 
-## Training Stages
+## Stage 0: OCR Pretrain Agent
 
-### Stage 1: Warm-up Agent
+**Purpose**: Train OCR model on high-resolution images before SR training.
 
-**Purpose**: Initialize the network with stable features before introducing complex losses.
-
-**Configuration**:
 ```yaml
-progressive_training:
-  stage1:
-    name: "warmup"
-    epochs: 10
-    lr: 0.0001
-    loss_components: ["l1"]      # L1 reconstruction loss only
-    freeze_ocr: true           # OCR remains frozen
-    update_confusion: false
+stage0:
+  name: "pretrain"
+  epochs: 50
+  lr: 0.001
+  loss_components: ["ocr"]
+  freeze_ocr: false
 ```
 
 **Behavior**:
-- Trains generator with L1 (Mean Absolute Error) loss only
-- OCR model is frozen (no gradients)
-- Lower learning rate for stable convergence
-- Stabilizes the network before adding character supervision
+- Trains SimpleCRNN OCR on HR license plate images
+- CTC loss for sequence-to-sequence learning
+- OCR is frozen after this stage for Stages 1-2
 
-**Expected Outcomes**:
-- Generator learns basic upsampling and reconstruction
-- Stable training without oscillation
-- Foundation for LCOFL training
-
-**Duration**: 5-10 epochs
+**Duration**: 50 epochs
 
 ---
 
-### Stage 2: LCOFL Agent
+## Stage 1: Warm-up Agent
 
-**Purpose**: Optimize for character recognition using the Layout and Character Oriented Focal Loss.
+**Purpose**: Initialize generator with stable features.
 
-**Configuration**:
 ```yaml
-progressive_training:
-  stage2:
-    name: "lcofl"
-    epochs: 50
-    lr: 0.0001
-    loss_components: ["l1", "lcofl"]  # Add LCOFL loss
-    freeze_ocr: true                         # OCR still frozen
-    update_confusion: true                     # Update weights based on confusion
+stage1:
+  name: "warmup"
+  epochs: 30
+  lr: 0.0001
+  loss_components: ["l1"]
+  freeze_ocr: true
 ```
 
 **Behavior**:
-- Adds LCOFL loss with frozen OCR discriminator
-- Confusion matrix is computed after each epoch
-- Character weights are updated based on confusion frequency
-- StepLR reduces learning rate by 0.9 every 5 epochs if no recognition improvement
-- Monitors **recognition rate** (not loss) for scheduling
+- L1 reconstruction loss only
+- Stabilizes network before complex losses
 
-**Loss Components**:
-- **L1 Loss**: Pixel-level reconstruction constraint
-- **Classification Loss**: Weighted cross-entropy with adaptive weights
-- **Layout Penalty**: Penalizes digit/letter position mismatches
-- **SSIM Loss**: Structural similarity constraint
-
-**Weight Update Formula**:
-```
-w_k = w_k + α * confusion_count(k)
-```
-where α = 0.1
-
-**Expected Outcomes**:
-- Character-focused reconstruction
-- Improved OCR accuracy
-- Adaptive handling of confused character pairs
-
-**Duration**: 50+ epochs
+**Duration**: 30 epochs
 
 ---
 
-### Stage 3: Fine-tuning Agent
+## Stage 2: LCOFL Agent
 
-**Purpose**: Joint optimization of generator and OCR for final refinement.
+**Purpose**: Character-driven optimization with frozen OCR.
 
-**Configuration**:
 ```yaml
-progressive_training:
-  stage3:
-    name: "finetune"
-    epochs: 20
-    lr: 0.00001  # Lower learning rate
-    loss_components: ["l1", "lcofl"]
-    freeze_ocr: false                        # Unfreeze OCR
-    update_confusion: true
+stage2:
+  name: "lcofl"
+  epochs: 300
+  lr: 0.0001
+  loss_components: ["l1", "lcofl"]
+  freeze_ocr: true
+  update_confusion: true
 ```
 
 **Behavior**:
-- Both generator and OCR are trainable
-- Lower learning rate to prevent destabilization
-- Fine-tunes OCR to the specific generator output distribution
-- Focuses on maximizing final word accuracy
+- LCOFL loss with classification + layout penalty
+- Confusion matrix updated each epoch
+- Character weights adapt to error patterns
 
-**Expected Outcomes**:
-- Co-adaptation of generator and OCR
-- Final boost in recognition accuracy
-- Optimized for the specific use case
-
-**Duration**: 20+ epochs
+**Duration**: 300 epochs
 
 ---
 
-## Agent Configuration
+## Stage 3: Fine-tuning Agent
 
-### Stage Selection
+**Purpose**: Joint optimization of generator and OCR.
 
-Training can run:
-- **All stages sequentially**: `--stage all`
-- **Single stage**: `--stage 1`, `--stage 2`, `--stage 3`
-- **By name**: `--stage warmup`, `--stage lcofl`, `--stage finetune`
+```yaml
+stage3:
+  name: "finetune"
+  epochs: 150
+  lr: 0.00001
+  loss_components: ["l1", "lcofl"]
+  freeze_ocr: false
+```
 
-### Hyperparameters
+**Behavior**:
+- Both generator and OCR trainable
+- Lower LR prevents destabilization
+- Co-adaptation for final accuracy boost
 
-| Parameter | Stage 1 | Stage 2 | Stage 3 |
-|-----------|---------|---------|---------|
-| Learning Rate | 1e-4 | 1e-4 | 1e-5 |
-| Loss | L1 | L1 + LCOFL | L1 + LCOFL |
-| OCR Frozen | Yes | Yes | No |
-| Confusion Update | No | Yes | Yes |
-| Primary Metric | Loss | Recognition Rate | Word Accuracy |
-
-### Early Stopping
-
-Each stage uses early stopping based on:
-- **Stage 1**: Loss plateau (20 epochs without improvement)
-- **Stage 2**: Recognition rate plateau
-- **Stage 3**: Word accuracy plateau
-
-Patience can be configured via `training.early_stop_patience`.
+**Duration**: 150 epochs
 
 ---
 
-## LCOFL Loss Components
+## Stage 4: Hard Mining Agent (NEW)
 
-### Classification Loss
+**Purpose**: Focus training on samples OCR struggles with.
 
-```
-L_C = -(1/K) * Σ w_k * log(p(y_GT_k | x_SR))
-```
-
-Where:
-- `K` is the maximum sequence length (7 for license plates)
-- `w_k` are adaptive weights based on character confusion
-- `p(y_GT_k | x_SR)` is the OCR predicted probability
-
-### Layout Penalty
-
-```
-L_P = Σ [D(pred_i) * A(GT_i) + A(pred_i) * D(GT_i)]
+```yaml
+stage4:
+  name: "hard_mining"
+  epochs: 50
+  lr: 0.000005
+  loss_components: ["l1", "lcofl", "embedding"]
+  freeze_ocr: true
+  hard_mining:
+    difficulty_alpha: 2.0
+    reweight_interval: 5
 ```
 
-Where:
-- `D(c) = β` if character c is a digit
-- `A(c) = β` if character c is a letter
-- `β = 1.0` (configurable)
+**Behavior**:
+- **HardExampleMiner**: Tracks per-sample accuracy
+- **Weighted Sampling**: Prioritizes difficult samples
+- **Embedding Loss**: Added for perceptual consistency
+- **Curriculum**: Gradually shifts from easy to hard examples
 
-### Total Loss
+**Key Components**:
+- `HardExampleMiner`: Per-sample difficulty tracking
+- `CharacterConfusionTracker`: Character-level error patterns
+- `CurriculumSampler`: Progressive difficulty curriculum
 
-```
-L_LCOFL = L_C + λ_layout * L_P + λ_ssim * L_S
-```
-
-## Monitoring
-
-### TensorBoard Metrics
-
-Scalars logged:
-- `train/loss`, `train/l1`, `train/lcofl`
-- `val/psnr`, `val/ssim`, `val/char_acc`, `val/word_acc`
-- `learning_rate`, `gradients/total_norm`
-
-Images logged:
-- Comparison grids: [LR | SR | HR] with text labels
-- Sample batches for visual inspection
-
-Histograms logged:
-- Weight distributions per layer
-- Gradient norms
-
-Confusion matrices:
-- Character-to-character confusion heatmaps
-- Updated after each validation epoch in Stage 2 and 3
+**Duration**: 50 epochs
 
 ---
 
-## Training Procedure
+## New v2.0 Features
 
-### 1. Preparation
+### Embedding Consistency Loss (LCOFL-EC)
+
+Contrastive loss using Siamese network:
+
+```yaml
+loss:
+  lambda_embed: 0.3        # Warmed up from 0
+  embedding_dim: 128
+  embed_margin: 2.0
+```
+
+### DCNv4 Support
+
+3x faster deformable convolutions:
+
+```yaml
+model:
+  use_dcnv4: true          # Falls back to DCNv3 if unavailable
+```
+
+### Multi-Scale Character Attention (MSCA)
+
+Character-aware attention at multiple scales:
+
+```yaml
+model:
+  use_character_attention: true
+  msca_scales: [1.0, 0.5, 0.25]
+```
+
+---
+
+## Hyperparameter Summary
+
+| Parameter | Stage 0 | Stage 1 | Stage 2 | Stage 3 | Stage 4 |
+|-----------|---------|---------|---------|---------|---------|
+| LR | 1e-3 | 1e-4 | 1e-4 | 1e-5 | 5e-6 |
+| Loss | CTC | L1 | L1+LCOFL | L1+LCOFL | L1+LCOFL+Embed |
+| OCR | Training | Frozen | Frozen | Unfrozen | Frozen |
+| Primary Metric | Loss | Loss | Recog Rate | Word Acc | Word Acc |
+
+---
+
+## Running Agents
 
 ```bash
-# Fine-tune Parseq on HR images
-python scripts/finetune_parseq.py --epochs 10
-```
-
-### 2. Progressive Training
-
-```bash
-# Run all stages (TensorBoard starts automatically on port 6007)
+# All stages
 python scripts/train_progressive.py --stage all
 
-# Or train individual stages
-python scripts/train_progressive.py --stage 1
-python scripts/train_progressive.py --stage 2 --resume checkpoints/stage1.pth
-python scripts/train_progressive.py --stage 3 --resume checkpoints/stage2.pth
+# Individual stages
+python scripts/train_progressive.py --stage 0  # Pretrain
+python scripts/train_progressive.py --stage 1  # Warm-up
+python scripts/train_progressive.py --stage 2  # LCOFL
+python scripts/train_progressive.py --stage 3  # Fine-tune
+python scripts/train_progressive.py --stage 4  # Hard Mining
 ```
 
-### 3. Evaluation
+---
 
-```bash
-python scripts/evaluate.py --checkpoint checkpoints/lp_asrn/best.pth
-```
+## TensorBoard Metrics
+
+| Stage | Key Metrics |
+|-------|-------------|
+| Stage 0 | `stage0_pretrain/train_loss`, `stage0_pretrain/val_char_acc` |
+| Stage 1 | `stage1_warmup/train_l1`, `stage1_warmup/val_psnr` |
+| Stage 2 | `stage2_lcofl/train_lcofl`, `stage2_lcofl/val_word_acc` |
+| Stage 3 | `stage3_finetune/train_loss`, `stage3_finetune/val_word_acc` |
+| Stage 4 | `stage4_hard_mining/train_loss`, `stage4_hard_mining/embedding_loss` |
 
 ---
 
 ## Troubleshooting
 
-### Training Instability
+### Low Word Accuracy
+1. Run Stage 4 (hard mining)
+2. Enable character attention: `use_character_attention: true`
+3. Increase embedding loss: `lambda_embed: 0.5`
 
-If you encounter training instability:
-
-1. **Gradient explosion**: Enable gradient clipping (default: max_norm=1.0)
-2. **Loss oscillation**: Reduce learning rate or increase warm-up epochs
-3. **Poor character accuracy**: Check OCR fine-tuning, increase λ_layout weight
-4. **Mode collapse**: Ensure Stage 1 warm-up is long enough
+### Slow Training
+1. Install DCNv4: `pip install dcnv4`
+2. Reduce MSCA scales: `msca_scales: [1.0, 0.5]`
 
 ### Memory Issues
-
-If running out of memory:
-
-1. Reduce batch size
-2. Reduce number of RRDB blocks
-3. Use gradient checkpointing
-
-### Low Recognition Accuracy
-
-If word accuracy is low:
-
-1. Verify Parseq is fine-tuned on your dataset
-2. Check that plate text extraction is correct
-3. Increase λ_layout weight to enforce layout constraints
-4. Train for more epochs in Stage 2
-
----
-
-## Advanced Configuration
-
-### Custom Stage Configurations
-
-You can modify stage configurations in `configs/lp_asrn.yaml`:
-
-```yaml
-progressive_training:
-  enabled: true
-  stage1:
-    epochs: 5          # Shorter warm-up for already-trained models
-    lr: 5e-5          # Lower starting LR
-  stage2:
-    epochs: 100         # Longer training for difficult cases
-    lr: 5e-5          # Lower LR for stability
-  stage3:
-    epochs: 30         # Extended fine-tuning
-    lr: 1e-6          # Very low LR for joint training
-```
-
-### Loss Weight Tuning
-
-Adjust LCOFL loss weights in the config:
-
-```yaml
-loss:
-  lambda_layout: 0.5    # Layout penalty weight (try 0.2-1.0)
-  lambda_ssim: 0.2      # SSIM loss weight (try 0.1-0.5)
-  alpha: 0.1           # Confusion weight increment (try 0.05-0.2)
-  beta: 1.0            # Layout penalty value (try 0.5-2.0)
-```
+1. Use lightweight embedder: `use_lightweight_embedder: true`
+2. Disable MSCA: `use_character_attention: false`

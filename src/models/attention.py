@@ -17,7 +17,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional
 
-from .deform_conv import DeformableConv2d
+from .deform_conv import DeformableConv2d, DeformableConv2dV4, DCNV4_AVAILABLE
 
 
 class ChannelAttention(nn.Module):
@@ -256,6 +256,8 @@ class EnhancedAttentionModule(nn.Module):
         reduction_ratio: int = 16,
         kernel_size: int = 7,
         use_deformable: bool = True,
+        use_dcnv4: bool = True,
+        dcnv4_groups: int = 4,
         shared_weights: bool = False,
     ):
         """
@@ -266,11 +268,14 @@ class EnhancedAttentionModule(nn.Module):
             reduction_ratio: Ratio for channel reduction
             kernel_size: Size of spatial attention kernel
             use_deformable: Whether to use deformable convolutions
+            use_dcnv4: Whether to use DCNv4 instead of DCNv3 (if available)
+            dcnv4_groups: Number of groups for DCNv4
             shared_weights: If True, weights can be shared across modules
         """
         super().__init__()
 
         self.use_deformable = use_deformable
+        self.use_dcnv4 = use_dcnv4 and DCNV4_AVAILABLE
         self.in_channels = in_channels
 
         # Channel Unit (CA)
@@ -278,7 +283,17 @@ class EnhancedAttentionModule(nn.Module):
 
         # Positional Unit (POS) - can use deformable conv
         if use_deformable:
-            self.pos_conv = DeformableConv2d(in_channels, in_channels, kernel_size=3, padding=1)
+            if self.use_dcnv4:
+                self.pos_conv = DeformableConv2dV4(
+                    in_channels, in_channels,
+                    kernel_size=3, padding=1,
+                    groups=dcnv4_groups
+                )
+            else:
+                self.pos_conv = DeformableConv2d(
+                    in_channels, in_channels,
+                    kernel_size=3, padding=1
+                )
         else:
             self.pos_conv = nn.Sequential(
                 nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1),
@@ -290,7 +305,17 @@ class EnhancedAttentionModule(nn.Module):
 
         # Final projection
         if use_deformable:
-            self.final_conv = DeformableConv2d(in_channels, in_channels, kernel_size=3, padding=1)
+            if self.use_dcnv4:
+                self.final_conv = DeformableConv2dV4(
+                    in_channels, in_channels,
+                    kernel_size=3, padding=1,
+                    groups=dcnv4_groups
+                )
+            else:
+                self.final_conv = DeformableConv2d(
+                    in_channels, in_channels,
+                    kernel_size=3, padding=1
+                )
         else:
             self.final_conv = nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1)
 

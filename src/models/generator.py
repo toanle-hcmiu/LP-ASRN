@@ -17,10 +17,11 @@ The generator consists of:
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from .attention import EnhancedAttentionModule, ThreeFoldAttentionModule, ResidualChannelAttentionBlock
 from .deform_conv import DeformableConv2d
+from .character_attention import MultiScaleCharacterAttention
 
 
 class ShallowFeatureExtractor(nn.Module):
@@ -364,8 +365,9 @@ class Generator(nn.Module):
     Architecture:
     1. Shallow Feature Extractor - extracts initial features
     2. Deep Feature Extractor - processes with RRDB-EA blocks
-    3. Upscaling Module - upscales using PixelShuffle
-    4. Reconstruction Layer - final output
+    3. Multi-Scale Character Attention (optional) - focuses on character regions
+    4. Upscaling Module - upscales using PixelShuffle
+    5. Reconstruction Layer - final output
     """
 
     def __init__(
@@ -378,6 +380,9 @@ class Generator(nn.Module):
         upscale_factor: int = 2,
         use_enhanced_attention: bool = True,
         use_deformable: bool = True,
+        use_character_attention: bool = False,
+        msca_scales: Tuple[float, ...] = (1.0, 0.5, 0.25),
+        msca_num_prototypes: int = 36,
         use_autoencoder: bool = True,
     ):
         """
@@ -392,11 +397,15 @@ class Generator(nn.Module):
             upscale_factor: Upscaling factor (2 or 4)
             use_enhanced_attention: Whether to use Enhanced Attention Module
             use_deformable: Whether to use deformable convolutions
+            use_character_attention: Whether to use Multi-Scale Character Attention
+            msca_scales: Scales for multi-scale character attention
+            msca_num_prototypes: Number of character prototypes
             use_autoencoder: Whether to use auto-encoder in shallow extractor
         """
         super().__init__()
 
         self.upscale_factor = upscale_factor
+        self.use_character_attention = use_character_attention
 
         # Shallow Feature Extractor
         self.shallow_extractor = ShallowFeatureExtractor(
@@ -413,6 +422,16 @@ class Generator(nn.Module):
             use_enhanced_attention=use_enhanced_attention,
             use_deformable=use_deformable,
         )
+
+        # Multi-Scale Character Attention (optional)
+        if use_character_attention:
+            self.character_attention = MultiScaleCharacterAttention(
+                in_channels=num_features,
+                scales=msca_scales,
+                num_prototypes=msca_num_prototypes,
+            )
+        else:
+            self.character_attention = None
 
         # Upscaling Module
         self.upscaler = UpscalingModule(
@@ -455,6 +474,10 @@ class Generator(nn.Module):
 
         # Extract deep features
         deep_features = self.deep_extractor(shallow_features)
+
+        # Apply Multi-Scale Character Attention if enabled
+        if self.character_attention is not None:
+            deep_features = self.character_attention(deep_features)
 
         # Upscale
         upscaled = self.upscaler(deep_features)

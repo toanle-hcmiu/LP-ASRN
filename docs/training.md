@@ -8,8 +8,8 @@ Complete guide for training the Layout-Aware and Character-Driven Super-Resoluti
 
 1. [Prerequisites](#prerequisites)
 2. [Data Preparation](#data-preparation)
-3. [OCR Fine-tuning](#ocr-fine-tuning)
-4. [Progressive Training](#progressive-training)
+3. [Progressive Training](#progressive-training)
+4. [New Features (v2.0)](#new-features-v20)
 5. [Monitoring with TensorBoard](#monitoring-with-tensorboard)
 6. [Troubleshooting](#troubleshooting)
 7. [Best Practices](#best-practices)
@@ -33,10 +33,8 @@ torch >= 2.0
 torchvision
 cuda >= 11.7
 
-# Training utilities
-tensorboard >= 2.13
-tqdm
-pyyaml
+# Optional (recommended for 3x faster training)
+pip install dcnv4  # DCNv4 support
 ```
 
 Install all dependencies:
@@ -50,166 +48,137 @@ pip install -r requirements.txt
 
 ### Dataset Structure
 
-Organize your data as follows:
-
 ```
 data/train/
 ├── Scenario-A/          # Light degradation
 │   ├── Brazilian/       # LLLNNNN layout
-│   │   ├── track_001/
-│   │   │   ├── lr-001.png, lr-002.png, ...
-│   │   │   ├── hr-001.png, hr-002.png, ...
-│   │   │   └── annotations.json
-│   │   └── ...
 │   └── Mercosur/        # LLLNLNN layout
-│       └── ...
 └── Scenario-B/          # Heavy degradation
     ├── Brazilian/
     └── Mercosur/
 ```
 
-### Annotation Format
-
-Each `annotations.json` should contain:
-
-```json
-{
-  "track_id": "track_001",
-  "layout": "Brazilian",
-  "plate_text": "ABC1234",
-  "corners": [[x1,y1], [x2,y2], [x3,y3], [x4,y4]],
-  "images": [
-    {"lr": "lr-001.png", "hr": "hr-001.png"},
-    {"lr": "lr-002.png", "hr": "hr-002.png"}
-  ]
-}
-```
-
----
-
-## OCR Model
-
-LP-ASRN uses SimpleCRNN for character recognition:
-
-- **Architecture**: CNN feature extractor + Bidirectional LSTM
-- **Vocabulary**: 36 characters (0-9, A-Z) optimized for license plates
-- **Training**: Pretrained on HR images in Stage 0, then frozen for Stages 1-2
-- **Joint training**: OCR unfrozen in Stage 3 for co-adaptation
-
-The OCR is automatically pretrained during Stage 0 before any super-resolution training begins.
-
 ---
 
 ## Progressive Training
 
-LP-ASRN uses a four-stage progressive training approach for stability and performance.
+LP-ASRN uses a **five-stage** progressive training approach.
+
+### Training Stages Overview
+
+| Stage | Name | Epochs | Loss | OCR | Purpose |
+|-------|------|--------|------|-----|---------|
+| 0 | Pretrain | 50 | CTC | Training | Train OCR on HR images |
+| 1 | Warm-up | 30 | L1 | Frozen | Stabilize generator |
+| 2 | LCOFL | 300 | L1 + LCOFL | Frozen | Character-driven training |
+| 3 | Fine-tune | 150 | L1 + LCOFL | Unfrozen | Joint optimization |
+| 4 | Hard Mining | 50 | L1 + LCOFL + Embed | Frozen | Focus on hard examples |
 
 ### Stage 0: OCR Pretraining
 
-**Purpose**: Train OCR model on high-resolution license plate images to establish
-baseline recognition capability before super-resolution training begins.
-
-**Configuration**:
-- Loss: CTC (Connectionist Temporal Classification)
-- OCR: Unfrozen (being trained)
-- Learning Rate: 1e-4
-- Duration: 50 epochs
-
-**What happens**:
-- OCR learns to recognize license plates from HR images
-- Establishes baseline recognition accuracy (target: 80%+)
-- Saves pretrained OCR to checkpoints/lp_asrn/ocr_best.pth
-- OCR is frozen after this stage for Stages 1-2
-
-**Run standalone**:
+Train OCR model on high-resolution images:
 ```bash
-python scripts/train_progressive.py \
-    --stage 0 \
-    --config configs/lp_asrn.yaml
+python scripts/train_progressive.py --stage 0
 ```
 
 ### Stage 1: Warm-up
 
-**Purpose**: Stabilize the network with simple reconstruction loss before introducing character supervision.
-
-**Configuration**:
-- Loss: L1 (pixel-level reconstruction)
-- OCR: Frozen
-- Learning Rate: 1e-4
-- Duration: 10 epochs
-
-**What happens**:
-- Generator learns basic upsampling
-- Features stabilize without complex loss landscape
-- Foundation for LCOFL training
-
-**Run standalone**:
+Stabilize with simple L1 loss:
 ```bash
-python scripts/train_progressive.py \
-    --stage 1 \
-    --epochs 10 \
-    --config configs/lp_asrn.yaml
+python scripts/train_progressive.py --stage 1
 ```
 
 ### Stage 2: LCOFL Training
 
-**Purpose**: Optimize for character recognition using the Layout and Character Oriented Focal Loss.
-
-**Configuration**:
-- Loss: L1 + LCOFL
-- OCR: Frozen (provides stable gradients)
-- Learning Rate: 1e-4
-- Duration: 100 epochs
-
-**What happens**:
-- Character-focused reconstruction
-- Confusion matrix updated after each epoch
-- Adaptive weights for confused character pairs
-- StepLR reduces LR if recognition plateaus
-
-**Run standalone**:
+Character-driven optimization with frozen OCR:
 ```bash
-python scripts/train_progressive.py \
-    --stage 2 \
-    --resume checkpoints/stage1.pth \
-    --config configs/lp_asrn.yaml
+python scripts/train_progressive.py --stage 2
 ```
 
 ### Stage 3: Fine-tuning
 
-**Purpose**: Joint optimization of generator and OCR for final refinement.
-
-**Configuration**:
-- Loss: L1 + LCOFL
-- OCR: Unfrozen (joint training)
-- Learning Rate: 1e-5 (lower for stability)
-- Duration: 50 epochs
-
-**What happens**:
-- Co-adaptation of generator and OCR
-- Final boost in recognition accuracy
-- Optimized for specific use case
-
-**Run standalone**:
+Joint optimization with unfrozen OCR:
 ```bash
-python scripts/train_progressive.py \
-    --stage 3 \
-    --resume checkpoints/stage2.pth \
-    --config configs/lp_asrn.yaml
+python scripts/train_progressive.py --stage 3
 ```
 
-### Full Progressive Training
+### Stage 4: Hard Example Mining (NEW)
+
+Focus on samples OCR struggles with:
+```bash
+python scripts/train_progressive.py --stage 4
+```
+
+**Features:**
+- **HardExampleMiner**: Tracks per-sample accuracy
+- **Weighted Sampling**: Prioritizes difficult samples
+- **Embedding Loss**: Added for perceptual consistency
+
+### Full Training
 
 Run all stages sequentially:
-
 ```bash
-python scripts/train_progressive.py \
-    --stage all \
-    --config configs/lp_asrn.yaml \
-    --data-root data/train
+python scripts/train_progressive.py --stage all
 ```
 
-TensorBoard will automatically start on port 6007.
+---
+
+## New Features (v2.0)
+
+### 1. Embedding Consistency Loss (LCOFL-EC)
+
+Contrastive loss using Siamese network embeddings:
+
+```yaml
+# In lp_asrn.yaml
+loss:
+  lambda_embed: 0.3        # Target weight (warmed up from 0)
+  embedding_dim: 128       # Embedding dimension
+  embed_margin: 2.0        # Contrastive margin
+```
+
+**Adaptive Warm-up**: `λ_embed` increases from 0 → 0.3 over 50 epochs.
+
+### 2. DCNv4 Integration
+
+3x faster deformable convolutions:
+
+```yaml
+model:
+  use_dcnv4: true          # Prefer DCNv4 if available
+```
+
+Install DCNv4 (optional):
+```bash
+pip install dcnv4
+```
+
+### 3. Multi-Scale Character Attention (MSCA)
+
+Character-aware attention at multiple scales:
+
+```yaml
+model:
+  use_character_attention: true
+  msca_scales: [1.0, 0.5, 0.25]
+  msca_num_prototypes: 36    # One per character class
+```
+
+### 4. Hard Example Mining (Stage 4)
+
+Focus training on difficult samples:
+
+```yaml
+progressive_training:
+  stage4:
+    name: "hard_mining"
+    epochs: 50
+    lr: 0.000005
+    loss_components: ["l1", "lcofl", "embedding"]
+    hard_mining:
+      difficulty_alpha: 2.0      # Weight exponent
+      reweight_interval: 5       # Re-weight every N epochs
+```
 
 ---
 
@@ -217,218 +186,101 @@ TensorBoard will automatically start on port 6007.
 
 ### Starting TensorBoard
 
-TensorBoard starts automatically when training begins. Access at:
+Starts automatically with training. Access at:
 ```
 http://localhost:6007
 ```
 
-Or start manually:
-```bash
-tensorboard --logdir logs/tensorboard --port 6007
-```
+### Key Metrics
 
-### Metrics Dashboard
-
-#### Scalars
-
-| Metric | Description | Location |
-|--------|-------------|----------|
-| `train/loss` | Total training loss | Train |
-| `train/l1` | L1 reconstruction loss | Train |
-| `train/lcofl` | LCOFL character loss | Train |
-| `val/psnr` | Peak Signal-to-Noise Ratio | Validation |
-| `val/ssim` | Structural Similarity Index | Validation |
-| `val/char_acc` | Character-level accuracy | Validation |
-| `val/word_acc` | Word-level (full plate) accuracy | Validation |
-| `learning_rate` | Current learning rate | Training |
-| `gradients/total_norm` | Gradient norm (clipping indicator) | Training |
-
-#### Images
-
-- `comparison/epoch_N`: Side-by-side LR | SR | HR comparisons
-- Updated every 5 epochs
-- Shows reconstruction quality with text labels
-
-#### Histograms
-
-- Weight distributions per layer (every 10 epochs)
-- Gradient norms (for detecting issues)
-
-#### Confusion Matrix
-
-- Character-to-character confusion heatmap
-- Updated every 5 epochs in Stage 2 and 3
-- Helps identify problematic character pairs
-
-### Interpreting Metrics
-
-**Healthy Training**:
-- `val/word_acc` steadily increases
-- `train/loss` decreases without oscillation
-- `gradients/total_norm` < 1.0 (gradient clipping working)
-
-**Warning Signs**:
-- `val/word_acc` plateaus → Consider reducing LR or moving to next stage
-- `train/loss` oscillates → Enable gradient clipping
-- `gradients/total_norm` spikes → Reduce learning rate
+| Metric | Description |
+|--------|-------------|
+| `train/loss` | Total training loss |
+| `train/embedding_loss` | Embedding consistency loss |
+| `val/word_acc` | Word-level accuracy (primary metric) |
+| `val/char_acc` | Character-level accuracy |
+| `stage4_hard_mining/*` | Stage 4 specific metrics |
 
 ---
 
 ## Troubleshooting
 
-### Training Instability
-
-**Symptoms**: Loss oscillation, NaN values, poor convergence
-
-**Solutions**:
-1. **Gradient Clipping** (enabled by default):
-   ```yaml
-   training:
-     gradient_clip: 1.0
-   ```
-
-2. **Lower Learning Rate**:
-   ```bash
-   python scripts/train_progressive.py --stage 2 --lr 5e-5
-   ```
-
-3. **Extend Warm-up**:
-   ```yaml
-   progressive_training:
-     stage1:
-       epochs: 20  # Increase from 10
-   ```
-
 ### Low Recognition Accuracy
 
-**Symptoms**: High PSNR/SSIM but low word accuracy
-
-**Solutions**:
-1. **Verify OCR Fine-tuning**:
-   ```bash
-   python scripts/evaluate.py --checkpoint checkpoints/parseq/best.pth
+1. **Enable Character Attention**:
+   ```yaml
+   model:
+     use_character_attention: true
    ```
 
-2. **Increase Layout Penalty**:
+2. **Run Stage 4**:
+   ```bash
+   python scripts/train_progressive.py --stage 4
+   ```
+
+3. **Increase Embedding Loss**:
    ```yaml
    loss:
-     lambda_layout: 1.0  # Increase from 0.5
+     lambda_embed: 0.5
    ```
 
-3. **Train Longer in Stage 2**:
+### Slow Training
+
+1. **Install DCNv4**:
+   ```bash
+   pip install dcnv4
+   ```
+
+2. **Reduce MSCA scales**:
    ```yaml
-   progressive_training:
-     stage2:
-       epochs: 100  # Increase from 50
+   model:
+     msca_scales: [1.0, 0.5]  # Remove 0.25x
    ```
 
 ### Memory Issues
 
-**Symptoms**: CUDA out of memory errors
-
-**Solutions**:
-1. **Reduce Batch Size**:
-   ```bash
-   python scripts/train_progressive.py --batch-size 8
-   ```
-
-2. **Reduce Model Size**:
-   ```yaml
-   model:
-     num_rrdb_blocks: 8  # Reduce from 16
-     num_filters: 32     # Reduce from 64
-   ```
-
-3. **Enable Gradient Checkpointing**:
-   ```python
-   # In generator.py, add:
-   from torch.utils.checkpoint import checkpoint
-   ```
-
-### Poor Character Recognition
-
-**Symptoms**: Specific characters consistently misrecognized
-
-**Solutions**:
-1. **Check Confusion Matrix** in TensorBoard
-2. **Increase Alpha** (confusion weight increment):
+1. **Use Lightweight Embedder**:
    ```yaml
    loss:
-     alpha: 0.2  # Increase from 0.1
+     use_lightweight_embedder: true
    ```
-3. **Verify Vocabulary** includes all characters in your dataset
+
+2. **Disable MSCA**:
+   ```yaml
+   model:
+     use_character_attention: false
+   ```
 
 ---
 
 ## Best Practices
 
-### Hyperparameter Tuning
+### Recommended Configuration
 
-**Learning Rate**:
-- Start with 1e-4 (default)
-- Reduce by 0.9 every 5 epochs if no improvement (StepLR)
-- Use 1e-5 for Stage 3 (joint training)
-
-**Loss Weights**:
 ```yaml
+# Optimal settings for word accuracy
+model:
+  num_rrdb_blocks: 12
+  use_dcnv4: true
+  use_character_attention: true
+
 loss:
-  lambda_layout: 0.5    # Layout penalty (0.2-1.0)
-  lambda_ssim: 0.2      # SSIM loss (0.1-0.5)
-  alpha: 0.1            # Confusion increment (0.05-0.2)
-  beta: 1.0             # Layout penalty value (0.5-2.0)
+  lambda_embed: 0.3
+  lambda_layout: 0.5
+
+progressive_training:
+  stage4:
+    epochs: 50
 ```
 
-**Batch Size**:
-- Larger = more stable gradients (if VRAM allows)
-- Default: 16
-- Reduce if out of memory
-
-### Checkpointing
-
-Checkpoints are saved to `checkpoints/lp_asrn/`:
-- `best.pth`: Best model (highest word accuracy)
-- `stage_{name}_epoch_{N}.pth`: Per-epoch checkpoints
-
-**Resume Training**:
-```bash
-python scripts/train_progressive.py \
-    --stage 2 \
-    --resume checkpoints/lp_asrn/best.pth
-```
-
-### Evaluation
-
-Evaluate on test set:
-```bash
-python scripts/evaluate.py \
-    --checkpoint checkpoints/lp_asrn/best.pth \
-    --save-dir results/evaluation
-```
-
-Metrics reported:
-- PSNR (dB)
-- SSIM (0-1)
-- Character Accuracy (%)
-- Word Accuracy (%)
-
-### Common Mistakes
-
-1. **Skipping OCR Pretraining**: Results in poor LCOFL gradients (Stage 0 is essential)
-2. **Skipping Warm-up Stage**: Can cause early instability
-3. **Unfreezing OCR Too Early**: Wait until Stage 3
-4. **Monitoring Loss Instead of Recognition**: LCOFL optimizes for recognition, not pixel metrics
-5. **Using 4x Upscaling**: Paper 2 shows 2x achieves better recognition (49.8% vs 39.0%)
-
----
-
-## Training Workflow Summary
+### Training Workflow
 
 ```bash
-# 1. Run progressive training (all stages)
+# 1. Full progressive training
 python scripts/train_progressive.py --stage all
 
 # 2. Monitor in TensorBoard
-# Open http://localhost:6007
+# http://localhost:6007
 
 # 3. Evaluate final model
 python scripts/evaluate.py --checkpoint checkpoints/lp_asrn/best.pth
@@ -438,6 +290,6 @@ python scripts/evaluate.py --checkpoint checkpoints/lp_asrn/best.pth
 
 ## References
 
-- [Paper 1 (2023)](https://arxiv.org/abs/2305.17313): Super-Resolution of License Plate Images Using Attention Modules
-- [Paper 2 (2024)](https://arxiv.org/abs/2408.15103): Enhancing License Plate Super-Resolution
-- [TensorBoard PyTorch Tutorial](https://pytorch.org/tutorials/intermediate/tensorboard_tutorial.html)
+- [Paper 1 (2023)](https://arxiv.org/abs/2305.17313): Attention-based LP Super-Resolution
+- [Paper 2 (2024)](https://arxiv.org/abs/2408.15103): Layout-Aware LP Super-Resolution
+- [Sendjasni et al. (2025)](https://arxiv.org/): Embedding Consistency for SR
