@@ -192,31 +192,36 @@ class ProgressiveTrainer:
 
     def _safe_barrier(self, timeout_seconds: int = 300, description: str = "barrier"):
         """
-        Execute a barrier with timeout and retry logic.
+        Execute a barrier with appropriate timeout handling.
         
-        This prevents NCCL hangs by detecting stuck processes early.
+        Note: NCCL backend doesn't support monitored_barrier, so we use regular
+        barrier for NCCL. The timeout is handled at init_process_group level.
+        For GLOO backend, we use monitored_barrier with explicit timeout.
         
         Args:
-            timeout_seconds: Max seconds to wait for barrier
+            timeout_seconds: Max seconds to wait for barrier (GLOO only)
             description: Description for logging
         """
         if not self.distributed:
             return True
-            
-        import time
-        start_time = time.time()
         
         try:
-            # Use monitored barrier if available (PyTorch 1.10+)
-            if hasattr(dist, 'monitored_barrier'):
+            # Get current backend
+            backend = dist.get_backend()
+            
+            # NCCL doesn't support monitored_barrier, use regular barrier
+            # The timeout is set at init_process_group level (60 min)
+            if backend == "nccl":
+                dist.barrier()
+            elif hasattr(dist, 'monitored_barrier'):
+                # GLOO supports monitored_barrier with explicit timeout
                 dist.monitored_barrier(timeout=datetime.timedelta(seconds=timeout_seconds))
             else:
                 dist.barrier()
             return True
         except Exception as e:
-            elapsed = time.time() - start_time
             if self.is_main:
-                self._log(f"WARNING: Barrier '{description}' failed after {elapsed:.1f}s: {e}", "warning")
+                self._log(f"WARNING: Barrier '{description}' failed: {e}", "warning")
             return False
 
     def _sync_all_ranks(self, tensor_to_sync: torch.Tensor = None):
