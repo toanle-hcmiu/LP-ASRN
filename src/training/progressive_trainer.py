@@ -278,6 +278,64 @@ class ProgressiveTrainer:
             return model.module
         return model
 
+    def _apply_ocr_augmentation(self, images: torch.Tensor) -> torch.Tensor:
+        """
+        Apply data augmentation for OCR pretraining.
+        
+        Includes: Gaussian blur, noise, brightness/contrast, random erasing.
+        Applied with 50% probability to prevent overfitting.
+        
+        Args:
+            images: Input images (B, C, H, W) in range [-1, 1] or [0, 1]
+            
+        Returns:
+            Augmented images
+        """
+        import random
+        
+        B, C, H, W = images.shape
+        augmented = images.clone()
+        
+        for i in range(B):
+            # 50% chance to apply augmentation
+            if random.random() > 0.5:
+                continue
+                
+            img = augmented[i:i+1]
+            
+            # 1. Gaussian blur (30% chance)
+            if random.random() < 0.3:
+                kernel_size = random.choice([3, 5])
+                sigma = random.uniform(0.5, 1.5)
+                # Simple box blur approximation
+                padding = kernel_size // 2
+                img = torch.nn.functional.avg_pool2d(img, kernel_size, stride=1, padding=padding)
+            
+            # 2. Gaussian noise (40% chance)
+            if random.random() < 0.4:
+                noise_std = random.uniform(0.02, 0.08)
+                noise = torch.randn_like(img) * noise_std
+                img = img + noise
+            
+            # 3. Brightness/contrast jitter (40% chance)
+            if random.random() < 0.4:
+                brightness = random.uniform(-0.15, 0.15)
+                contrast = random.uniform(0.8, 1.2)
+                img = img * contrast + brightness
+            
+            # 4. Random erasing (20% chance) - simulates occlusion
+            if random.random() < 0.2:
+                erase_h = random.randint(2, max(3, H // 6))
+                erase_w = random.randint(4, max(5, W // 4))
+                erase_y = random.randint(0, H - erase_h)
+                erase_x = random.randint(0, W - erase_w)
+                img[:, :, erase_y:erase_y+erase_h, erase_x:erase_x+erase_w] = 0
+            
+            # Clamp to valid range
+            augmented[i:i+1] = torch.clamp(img, -1.0, 1.0)
+        
+        return augmented
+
     def set_stage(self, stage: TrainingStage):
         """Set the current training stage."""
         # Synchronize all ranks before changing stage configuration
@@ -689,6 +747,10 @@ class ProgressiveTrainer:
             for batch in pbar:
                 hr_images = batch["hr"].to(self.device)
                 gt_texts = batch["plate_text"]
+
+                # Apply data augmentation for OCR pretraining (prevents overfitting)
+                if self.training:
+                    hr_images = self._apply_ocr_augmentation(hr_images)
 
                 # Forward pass
                 logits = self.ocr(hr_images, return_logits=True)
