@@ -647,12 +647,14 @@ class ProgressiveTrainer:
             lr_lambda=lambda epoch: min(1.0, (epoch + 1) / warmup_epochs)
         )
 
-        # Main scheduler: Cosine annealing with warm restarts for gradual decay
-        ocr_scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        # Main scheduler: ReduceLROnPlateau for stable convergence
+        # Reduces LR only when char_acc stops improving (no sudden LR spikes)
+        ocr_scheduler = optim.lr_scheduler.ReduceLROnPlateau(
             self.optimizer,
-            T_0=10,  # Restart every 10 epochs
-            T_mult=2,  # Double period after each restart
-            eta_min=1e-6,
+            mode='max',      # Maximize char_acc
+            factor=0.5,      # Halve LR when stuck
+            patience=10,     # Wait 10 epochs before reducing
+            min_lr=1e-6,
         )
 
         # Use char_acc for early stopping (more granular than word_acc)
@@ -768,11 +770,12 @@ class ProgressiveTrainer:
             # DDP sync: all ranks wait for validation to complete
             self._safe_barrier(timeout_seconds=900, description="pretrain_post_validation")
 
-            # Step warmup scheduler for first 5 epochs, then cosine annealing
+            # Step warmup scheduler for first 5 epochs
             if epoch < warmup_epochs:
                 warmup_scheduler.step()
-            else:
-                ocr_scheduler.step()
+            elif should_validate:
+                # ReduceLROnPlateau needs the metric value
+                ocr_scheduler.step(val_metrics.get('char_acc', 0.0))
 
         # Freeze OCR after pretraining for subsequent stages
         for param in self.ocr.parameters():

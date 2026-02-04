@@ -41,8 +41,8 @@ data:
   # Increased from 17x31 to 34x62 (2x) for better OCR - each character now ~10-12 pixels instead of ~5-6
   lr_size: [34, 62]
 
-  # Batch size for training (reduced from 128 to 32 due to 4x larger images)
-  batch_size: 32
+  # Batch size for training (64 per GPU, effective 128 with 2x A100)
+  batch_size: 64
 
   # Number of data loading workers (reduced for DDP stability)
   num_workers: 4
@@ -62,7 +62,7 @@ training:
   lr: 0.0001
 
   # Validation interval (validate every N epochs to save time)
-  val_interval: 3  # Reduced from 5 for better monitoring during OCR pretraining
+  val_interval: 5  # Reduced validation frequency for faster training
 
   # Beam width for validation (higher = more accurate but slower)
   val_beam_width: 5
@@ -142,11 +142,11 @@ ocr:
 
   # Label smoothing for CTC loss (prevents overconfidence)
   # 0.0 = disabled, 0.1 = recommended, 0.2 = strong
-  label_smoothing: 0.15  # Increased from 0.1 for better generalization
+  label_smoothing: 0.1  # Mild smoothing for better generalization
 
   # Dropout rate for RNN layer in SimpleCRNN (prevents overfitting)
   # 0.0 = disabled, 0.3 = recommended, 0.5 = strong
-  rnn_dropout: 0.5  # Increased from 0.3 for stronger regularization
+  rnn_dropout: 0.3  # Balanced dropout for OCR pretraining
 
 # Progressive Training Configuration
 progressive_training:
@@ -157,8 +157,8 @@ progressive_training:
   # This ensures OCR can provide meaningful guidance to the generator
   stage0:
     name: "pretrain"
-    epochs: 50   # Reduced: OCR converges fast, no need for 150
-    lr: 0.001  # Increased from 0.0001 for faster convergence
+    epochs: 150  # Increased for better convergence to 85%+ word accuracy
+    lr: 0.0005   # Reduced from 0.001 to prevent loss spikes
     loss_components: ["ocr"]
     freeze_ocr: false
     update_confusion: false
@@ -167,7 +167,7 @@ progressive_training:
   # Purpose: Stabilize network before introducing complex losses
   stage1:
     name: "warmup"
-    epochs: 30    # Increased: More warm-up for stability
+    epochs: 50    # Increased: More warm-up for stability
     lr: 0.0001
     loss_components: ["l1"]
     freeze_ocr: true
@@ -215,9 +215,9 @@ tensorboard:
   port: 6007
 
   # Logging intervals
-  log_interval: 10      # Log scalars every N steps
+  log_interval: 5      # Log scalars every N steps
   log_images_every: 5   # Log images every N epochs
-  log_histograms_every: 10  # Log histograms every N epochs
+  log_histograms_every: 5  # Log histograms every N epochs
 
   # Maximum images to log per batch
   max_images: 16
