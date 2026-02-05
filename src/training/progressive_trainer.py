@@ -755,11 +755,11 @@ class ProgressiveTrainer:
                 # Forward pass
                 logits = self.ocr(hr_images, return_logits=True)
 
-                # Compute CTC loss (unwrap DDP to access custom method)
+                # Compute loss (uses CTC for SimpleCRNN, cross-entropy for Parseq)
                 ocr_unwrapped = self._unwrap_model(self.ocr)
                 label_smoothing = self.config.get("ocr", {}).get("label_smoothing", 0.1)
-                loss = ocr_unwrapped.compute_ctc_loss(logits, gt_texts, device=self.device,
-                                                       label_smoothing=label_smoothing)
+                loss = ocr_unwrapped.compute_loss(logits, gt_texts, device=self.device,
+                                                   label_smoothing=label_smoothing)
 
                 # Backward pass
                 self.optimizer.zero_grad()
@@ -839,9 +839,15 @@ class ProgressiveTrainer:
                 # ReduceLROnPlateau needs the metric value
                 ocr_scheduler.step(val_metrics.get('char_acc', 0.0))
 
+        # CRITICAL: Sync all ranks before modifying model state
+        self._safe_barrier(timeout_seconds=300, description="pretrain_before_freeze")
+
         # Freeze OCR after pretraining for subsequent stages
         for param in self.ocr.parameters():
             param.requires_grad = False
+
+        # CRITICAL: Sync all ranks after pretrain stage completes
+        self._safe_barrier(timeout_seconds=300, description="pretrain_complete")
 
         if self.is_main:
             print(f"\nOCR Pretraining complete. Best char accuracy: {best_char_acc:.4f}\n")

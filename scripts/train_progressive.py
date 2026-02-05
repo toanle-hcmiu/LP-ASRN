@@ -350,6 +350,7 @@ def train_ddp(rank, world_size, args, config):
         vocab=ocr_config.get("vocab", "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"),
         max_length=ocr_config.get("max_length", 7),
         rnn_dropout=ocr_config.get("rnn_dropout", 0.3),
+        use_parseq=ocr_config.get("use_parseq", True),  # Enable real Parseq model
     )
 
     # Load fine-tuned OCR if available (all ranks need this)
@@ -549,6 +550,7 @@ def main():
             vocab=ocr_config.get("vocab", "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"),
             max_length=ocr_config.get("max_length", 7),
             rnn_dropout=ocr_config.get("rnn_dropout", 0.3),
+            use_parseq=ocr_config.get("use_parseq", True),  # Enable real Parseq model
         )
 
         # Load fine-tuned OCR if available

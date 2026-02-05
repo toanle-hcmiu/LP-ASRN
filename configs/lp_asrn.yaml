@@ -122,6 +122,9 @@ ocr:
   # OCR model type
   model_type: "parseq"
 
+  # Use real Parseq model from HuggingFace (true) or SimpleCRNN fallback (false)
+  use_parseq: true
+
   # Pre-trained model path (HuggingFace model ID or local path)
   pretrained_path: "baudm/parseq-base"
 
@@ -140,11 +143,11 @@ ocr:
   # Character vocabulary
   vocab: "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
-  # Label smoothing for CTC loss (prevents overconfidence)
+  # Label smoothing for loss (CE for Parseq, CTC for SimpleCRNN)
   # 0.0 = disabled, 0.1 = recommended, 0.2 = strong
   label_smoothing: 0.1  # Mild smoothing for better generalization
 
-  # Dropout rate for RNN layer in SimpleCRNN (prevents overfitting)
+  # Dropout rate for RNN layer in SimpleCRNN (only used if use_parseq=false)
   # 0.0 = disabled, 0.3 = recommended, 0.5 = strong
   rnn_dropout: 0.3  # Balanced dropout for OCR pretraining
 
