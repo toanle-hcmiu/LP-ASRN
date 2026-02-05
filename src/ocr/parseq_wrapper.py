@@ -657,7 +657,8 @@ class ParseqOCR(nn.Module):
         # Transpose for CTC loss: (T, B, C)
         log_probs = log_probs.transpose(0, 1)
 
-        # Compute CTC loss
+        # Compute CTC loss with focal weighting for hard examples
+        # Focal CTC: weight = (1 - p)^gamma where p is the probability of correct prediction
         ctc_loss = F.ctc_loss(
             log_probs,
             target_indices,
@@ -665,10 +666,21 @@ class ParseqOCR(nn.Module):
             target_lengths,
             blank=self.blank_idx,
             zero_infinity=True,
-            reduction='mean',
+            reduction='none',  # Per-sample loss for focal weighting
         )
 
-        return ctc_loss
+        # Apply focal weighting (gamma=2 focuses on hard examples)
+        # Higher loss = harder example = higher weight
+        gamma = 2.0
+        with torch.no_grad():
+            # Normalize loss to [0, 1] range for focal weight
+            loss_normalized = torch.clamp(ctc_loss / (ctc_loss.max() + 1e-8), 0, 1)
+            focal_weight = (loss_normalized ** gamma) + 0.5  # Base weight + focal bonus
+            focal_weight = focal_weight / focal_weight.mean()  # Normalize weights
+
+        focal_ctc_loss = (ctc_loss * focal_weight).mean()
+
+        return focal_ctc_loss
 
     def compute_loss(
         self,
@@ -818,16 +830,48 @@ class ResidualBlock(nn.Module):
 
 
 class SequenceAttention(nn.Module):
-    """Position-wise attention for sequence modeling."""
+    """Multi-head self-attention for improved sequence modeling."""
 
-    def __init__(self, hidden_size):
+    def __init__(self, hidden_size, num_heads=8, dropout=0.1):
         super().__init__()
-        self.attention = nn.Linear(hidden_size, 1)
+        self.hidden_size = hidden_size
+        self.num_heads = num_heads
+        self.head_dim = hidden_size // num_heads
+        
+        assert hidden_size % num_heads == 0, "hidden_size must be divisible by num_heads"
+        
+        self.q_proj = nn.Linear(hidden_size, hidden_size)
+        self.k_proj = nn.Linear(hidden_size, hidden_size)
+        self.v_proj = nn.Linear(hidden_size, hidden_size)
+        self.out_proj = nn.Linear(hidden_size, hidden_size)
+        self.dropout = nn.Dropout(dropout)
+        self.layer_norm = nn.LayerNorm(hidden_size)
 
     def forward(self, x):
         # x: (B, T, H)
-        weights = F.softmax(self.attention(x), dim=1)  # (B, T, 1)
-        return x * weights  # Broadcast multiply
+        B, T, H = x.shape
+        
+        # Residual connection
+        residual = x
+        
+        # Project to Q, K, V
+        q = self.q_proj(x).view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(x).view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(x).view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+        
+        # Scaled dot-product attention
+        scale = self.head_dim ** -0.5
+        attn = torch.matmul(q, k.transpose(-2, -1)) * scale
+        attn = F.softmax(attn, dim=-1)
+        attn = self.dropout(attn)
+        
+        # Apply attention to values
+        out = torch.matmul(attn, v)
+        out = out.transpose(1, 2).contiguous().view(B, T, H)
+        out = self.out_proj(out)
+        
+        # Residual + LayerNorm
+        return self.layer_norm(out + residual)
 
 
 class TPS_SpatialTransformerNetwork(nn.Module):

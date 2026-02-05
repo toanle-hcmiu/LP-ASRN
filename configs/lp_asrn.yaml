@@ -123,7 +123,9 @@ ocr:
   model_type: "parseq"
 
   # Use real Parseq model from HuggingFace (true) or SimpleCRNN fallback (false)
-  use_parseq: true
+  # NOTE: Parseq requires teacher forcing for training which is not implemented.
+  # Use SimpleCRNN (false) for training, Parseq is only suitable for frozen inference.
+  use_parseq: false
 
   # Pre-trained model path (HuggingFace model ID or local path)
   pretrained_path: "baudm/parseq-base"

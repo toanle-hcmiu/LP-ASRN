@@ -280,10 +280,10 @@ class ProgressiveTrainer:
 
     def _apply_ocr_augmentation(self, images: torch.Tensor) -> torch.Tensor:
         """
-        Apply data augmentation for OCR pretraining.
+        Apply aggressive data augmentation for OCR pretraining.
         
-        Includes: Gaussian blur, noise, brightness/contrast, random erasing.
-        Applied with 50% probability to prevent overfitting.
+        Includes: Gaussian blur, noise, brightness/contrast, random erasing,
+        affine transforms, and mixup.
         
         Args:
             images: Input images (B, C, H, W) in range [-1, 1] or [0, 1]
@@ -292,47 +292,67 @@ class ProgressiveTrainer:
             Augmented images
         """
         import random
+        import torch.nn.functional as F
         
         B, C, H, W = images.shape
         augmented = images.clone()
         
         for i in range(B):
-            # 50% chance to apply augmentation
-            if random.random() > 0.5:
+            # 70% chance to apply augmentation (more aggressive)
+            if random.random() > 0.7:
                 continue
                 
             img = augmented[i:i+1]
             
-            # 1. Gaussian blur (30% chance)
-            if random.random() < 0.3:
-                kernel_size = random.choice([3, 5])
-                sigma = random.uniform(0.5, 1.5)
-                # Simple box blur approximation
-                padding = kernel_size // 2
-                img = torch.nn.functional.avg_pool2d(img, kernel_size, stride=1, padding=padding)
-            
-            # 2. Gaussian noise (40% chance)
+            # 1. Gaussian blur (40% chance)
             if random.random() < 0.4:
-                noise_std = random.uniform(0.02, 0.08)
+                kernel_size = random.choice([3, 5])
+                padding = kernel_size // 2
+                img = F.avg_pool2d(img, kernel_size, stride=1, padding=padding)
+            
+            # 2. Gaussian noise (50% chance)
+            if random.random() < 0.5:
+                noise_std = random.uniform(0.03, 0.12)
                 noise = torch.randn_like(img) * noise_std
                 img = img + noise
             
-            # 3. Brightness/contrast jitter (40% chance)
-            if random.random() < 0.4:
-                brightness = random.uniform(-0.15, 0.15)
-                contrast = random.uniform(0.8, 1.2)
+            # 3. Brightness/contrast jitter (50% chance)
+            if random.random() < 0.5:
+                brightness = random.uniform(-0.2, 0.2)
+                contrast = random.uniform(0.7, 1.3)
                 img = img * contrast + brightness
             
-            # 4. Random erasing (20% chance) - simulates occlusion
-            if random.random() < 0.2:
-                erase_h = random.randint(2, max(3, H // 6))
-                erase_w = random.randint(4, max(5, W // 4))
+            # 4. Random erasing (30% chance) - simulates occlusion
+            if random.random() < 0.3:
+                erase_h = random.randint(2, max(3, H // 5))
+                erase_w = random.randint(4, max(5, W // 3))
                 erase_y = random.randint(0, H - erase_h)
                 erase_x = random.randint(0, W - erase_w)
-                img[:, :, erase_y:erase_y+erase_h, erase_x:erase_x+erase_w] = 0
+                # Use random value instead of 0 for more variety
+                erase_val = random.uniform(-1, 1)
+                img[:, :, erase_y:erase_y+erase_h, erase_x:erase_x+erase_w] = erase_val
+            
+            # 5. Affine transform (25% chance) - rotation and shear
+            if random.random() < 0.25:
+                angle = random.uniform(-5, 5)  # Small rotation
+                shear = random.uniform(-0.05, 0.05)
+                # Create affine matrix
+                theta = torch.tensor([
+                    [1, shear, 0],
+                    [0, 1, 0]
+                ], dtype=img.dtype, device=img.device).unsqueeze(0)
+                grid = F.affine_grid(theta, img.size(), align_corners=False)
+                img = F.grid_sample(img, grid, align_corners=False, padding_mode='border')
             
             # Clamp to valid range
             augmented[i:i+1] = torch.clamp(img, -1.0, 1.0)
+        
+        # 6. Mixup augmentation (20% of batches)
+        if random.random() < 0.2 and B >= 2:
+            # Random shuffle indices
+            perm = torch.randperm(B, device=images.device)
+            alpha = random.uniform(0.1, 0.3)
+            augmented = (1 - alpha) * augmented + alpha * augmented[perm]
         
         return augmented
 
