@@ -163,7 +163,7 @@ progressive_training:
   # This ensures OCR can provide meaningful guidance to the generator
   stage0:
     name: "pretrain"
-    epochs: 150  # Increased for better convergence to 85%+ word accuracy
+    epochs: 50  # Reduced - model plateaus around epoch 50
     lr: 0.0005   # Reduced from 0.001 to prevent loss spikes
     loss_components: ["ocr"]
     freeze_ocr: false
