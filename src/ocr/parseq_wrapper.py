@@ -718,19 +718,47 @@ class ParseqOCR(nn.Module):
 
         B, T, C = logits.shape
 
-        # Encode targets using Parseq vocabulary
-        target_tensor = torch.zeros(B, T, dtype=torch.long, device=device)
-        
-        for i, text in enumerate(targets):
-            for j, char in enumerate(text):
-                if j >= T:
-                    break
-                if char in self.tokenizer.char_to_idx:
-                    target_tensor[i, j] = self.tokenizer.char_to_idx[char]
+        # Use Parseq's native tokenizer if available
+        if hasattr(self.model, 'tokenizer') and self.model.tokenizer is not None:
+            # Parseq's tokenizer expects a list of strings
+            # Encode targets using Parseq's native tokenizer
+            target_tensor = torch.zeros(B, T, dtype=torch.long, device=device)
+            
+            for i, text in enumerate(targets):
+                # Pad/truncate to T positions
+                text_padded = text[:T] if len(text) > T else text
+                # Encode using Parseq's tokenizer
+                try:
+                    encoded = self.model.tokenizer.encode([text_padded], device=device)
+                    # encoded is (1, seq_len), we need to extract and pad
+                    enc_len = min(encoded.shape[1], T)
+                    target_tensor[i, :enc_len] = encoded[0, :enc_len]
+                except:
+                    # Fallback: manual encoding using PARSEQ_VOCAB
+                    for j, char in enumerate(text_padded):
+                        if j >= T:
+                            break
+                        if char in self.tokenizer.char_to_idx:
+                            target_tensor[i, j] = self.tokenizer.char_to_idx[char]
+        else:
+            # Fallback: encode using our tokenizer (make sure indices are valid)
+            target_tensor = torch.zeros(B, T, dtype=torch.long, device=device)
+            
+            for i, text in enumerate(targets):
+                for j, char in enumerate(text):
+                    if j >= T:
+                        break
+                    if char in self.tokenizer.char_to_idx:
+                        idx = self.tokenizer.char_to_idx[char]
+                        # Clamp to valid range
+                        target_tensor[i, j] = min(idx, C - 1)
 
         # Flatten for cross-entropy: (B*T, C) and (B*T,)
         logits_flat = logits.reshape(-1, C)
         targets_flat = target_tensor.reshape(-1)
+
+        # Clamp targets to valid range (safety check)
+        targets_flat = torch.clamp(targets_flat, 0, C - 1)
 
         # Use cross-entropy with label smoothing
         loss = F.cross_entropy(
