@@ -749,7 +749,7 @@ class ProgressiveTrainer:
                 gt_texts = batch["plate_text"]
 
                 # Apply data augmentation for OCR pretraining (prevents overfitting)
-                if self.training:
+                if self.ocr.training:
                     hr_images = self._apply_ocr_augmentation(hr_images)
 
                 # Forward pass
