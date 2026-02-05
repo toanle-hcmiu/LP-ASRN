@@ -972,7 +972,7 @@ class SimpleCRNN(nn.Module):
             num_fiducial=20,
         )
 
-        # 2. Deep CNN backbone with SE attention (INCREASED CAPACITY for 80%+ word acc)
+        # 2. CNN backbone with SE attention (balanced capacity for ~20M params)
         self.backbone = nn.Sequential(
             # Block 1: 3 -> 64
             ConvBNReLU(3, 64, 3),
@@ -980,47 +980,40 @@ class SimpleCRNN(nn.Module):
             nn.MaxPool2d(2, 2),
             # Block 2: 64 -> 128
             ResidualBlock(64, 128),
-            ResidualBlock(128, 128),  # Extra block
             SEBlock(128),
             nn.MaxPool2d(2, 2),
             # Block 3: 128 -> 256
             ResidualBlock(128, 256),
             ResidualBlock(256, 256),
-            ResidualBlock(256, 256),  # Extra block
             SEBlock(256),
             nn.MaxPool2d((2, 1), (2, 1)),  # Preserve width
-            # Block 4: 256 -> 512
-            ResidualBlock(256, 512),
-            ResidualBlock(512, 512),
-            ResidualBlock(512, 512),
-            SEBlock(512),
+            # Block 4: 256 -> 384 (reduced from 512/768)
+            ResidualBlock(256, 384),
+            ResidualBlock(384, 384),
+            SEBlock(384),
             nn.MaxPool2d((2, 1), (2, 1)),  # Preserve width
-            # Block 5: 512 -> 768 (NEW - deeper for richer features)
-            ResidualBlock(512, 768),
-            ResidualBlock(768, 768),
-            SEBlock(768),
         )
 
         # Layer normalization before LSTM (stabilizes training)
-        self.layer_norm = nn.LayerNorm(768)
+        self.layer_norm = nn.LayerNorm(384)
 
-        # 3. Sequence modeling with BiLSTM (INCREASED CAPACITY for 80%+ word accuracy)
-        # 4 layers with 768 hidden size for better representation
+        # 3. Sequence modeling with BiLSTM (balanced capacity)
+        # 2 layers with 384 hidden size
         self.rnn = nn.LSTM(
-            input_size=768,
-            hidden_size=768,   # Increased from 512
-            num_layers=4,      # Increased from 3
+            input_size=384,
+            hidden_size=384,
+            num_layers=2,
             batch_first=True,
             bidirectional=True,
             dropout=0.3,
         )
 
         # 3.5. Attention mechanism after LSTM (focuses on relevant positions)
-        self.attention = SequenceAttention(hidden_size=1536)  # 768 * 2 for bidirectional
+        self.attention = SequenceAttention(hidden_size=768)  # 384 * 2 for bidirectional
 
         # 4. Output projection
-        # Input size is hidden_size * 2 for bidirectional LSTM (768 * 2 = 1536)
-        self.fc = nn.Linear(1536, self.output_size)
+        # Input size is hidden_size * 2 for bidirectional LSTM (384 * 2 = 768)
+        self.fc = nn.Linear(768, self.output_size)
 
     def forward(self, x: torch.Tensor, return_logits: bool = True) -> torch.Tensor:
         """

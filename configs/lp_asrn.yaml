@@ -4,11 +4,12 @@
 
 model:
   # Number of RRDB-EA blocks in the deep feature extractor
-  # Full 16 blocks for maximum accuracy (A100 80GB can handle it)
-  num_rrdb_blocks: 16
+  # Increased from 16 to 24 for more expressive power
+  num_rrdb_blocks: 24
 
-  # Number of feature channels
-  num_filters: 64
+  # Number of feature channels (INCREASED from 64 to 128 for better SR quality)
+  # This significantly increases model capacity to match OCR params
+  num_filters: 128
 
   # Upscaling factor (2 for 2x, 4 for 4x)
   # Paper 2 uses 2x which achieved 49.8% recognition rate
