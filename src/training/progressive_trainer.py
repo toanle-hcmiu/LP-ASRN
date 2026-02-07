@@ -1538,8 +1538,9 @@ class ProgressiveTrainer:
             "global_epoch": self.global_epoch,
         }
 
-        if not self.config.get("ocr", {}).get("freeze_ocr", True):
-            checkpoint["ocr_state_dict"] = self.ocr.state_dict()
+        # Always save OCR state_dict (even when frozen) for proper resume
+        # The trained OCR from stage0/pretraining is critical for validation
+        checkpoint["ocr_state_dict"] = self.ocr.state_dict()
 
         if emergency:
             # Emergency checkpoint - add timestamp and save to special location
@@ -1617,6 +1618,43 @@ class ProgressiveTrainer:
                 self.ocr.load_state_dict(ocr_state)
             else:
                 self.ocr.load_state_dict(ocr_state)
+        else:
+            # OCR not in checkpoint - try loading from separate ocr_best.pth file
+            # This handles old checkpoints where OCR wasn't saved when freeze_ocr=true
+            checkpoint_dir = Path(checkpoint_path).parent
+            ocr_best_path = checkpoint_dir / "ocr_best.pth"
+
+            if ocr_best_path.exists():
+                if self.is_main:
+                    self._log(f"OCR not in checkpoint, loading from {ocr_best_path}...")
+
+                ocr_checkpoint = torch.load(ocr_best_path, map_location=self.device)
+
+                # ocr_best.pth might be a full checkpoint or just a state_dict
+                if isinstance(ocr_checkpoint, dict) and "ocr_state_dict" in ocr_checkpoint:
+                    ocr_state = ocr_checkpoint["ocr_state_dict"]
+                else:
+                    # Assume it's just the state_dict
+                    ocr_state = ocr_checkpoint
+
+                # Check if state dict has "module." prefix
+                has_module_prefix = any(k.startswith("module.") for k in ocr_state.keys())
+                is_ddp_wrapped = isinstance(self.ocr, nn.parallel.DistributedDataParallel)
+
+                # Handle DDP prefix for OCR
+                if has_module_prefix and not is_ddp_wrapped:
+                    ocr_state = {k.replace("module.", ""): v for k, v in ocr_state.items()}
+                    self.ocr.load_state_dict(ocr_state)
+                elif not has_module_prefix and is_ddp_wrapped:
+                    ocr_state = {"module." + k: v for k, v in ocr_state.items()}
+                    self.ocr.load_state_dict(ocr_state)
+                elif has_module_prefix and is_ddp_wrapped:
+                    self.ocr.load_state_dict(ocr_state)
+                else:
+                    self.ocr.load_state_dict(ocr_state)
+
+                if self.is_main:
+                    self._log(f"OCR state loaded from {ocr_best_path}")
 
         self.global_epoch = checkpoint.get("global_epoch", 0)
         self.best_word_acc = checkpoint.get("best_word_acc", 0.0)
