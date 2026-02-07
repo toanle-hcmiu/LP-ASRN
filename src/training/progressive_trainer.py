@@ -1375,6 +1375,9 @@ class ProgressiveTrainer:
             gamma=self.config.get("training", {}).get("lr_gamma", 0.9),
         )
 
+        # Load optimizer state if resuming from checkpoint
+        self._load_optimizer_state()
+
         start_epoch = self.global_epoch
 
         # Log stage start
@@ -1391,7 +1394,21 @@ class ProgressiveTrainer:
                 description=stage_descriptions.get(stage, "")
             )
 
-        for epoch in range(config.epochs):
+        # Calculate starting epoch within this stage
+        # If global_epoch is within this stage, start from that point
+        # Otherwise start from 0
+        stage_start_epoch = 0
+        if hasattr(self, '_checkpoint_state') and 'stage' in self._checkpoint_state:
+            checkpoint_stage = self._checkpoint_state.get('stage', '')
+            if checkpoint_stage == stage.value:
+                # Same stage - continue from global_epoch
+                stage_start_epoch = self.global_epoch
+            else:
+                # Different stage - start from 0
+                stage_start_epoch = 0
+                self.global_epoch = 0  # Reset for new stage
+
+        for epoch in range(stage_start_epoch, config.epochs):
             current_global_epoch = start_epoch + epoch
 
             # Log epoch start (for timing)
@@ -1555,6 +1572,9 @@ class ProgressiveTrainer:
 
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
 
+        # Store checkpoint state for later use (after optimizer is created)
+        self._checkpoint_state = checkpoint
+
         # Handle DDP wrapper mismatch - checkpoint might have "module." prefix
         generator_state = checkpoint["generator_state_dict"]
 
@@ -1601,10 +1621,25 @@ class ProgressiveTrainer:
         self.global_epoch = checkpoint.get("global_epoch", 0)
         self.best_word_acc = checkpoint.get("best_word_acc", 0.0)
 
+        # Load the stage that was saved
+        checkpoint_stage = checkpoint.get("stage", None)
+        if checkpoint_stage:
+            try:
+                self.current_stage = TrainingStage(checkpoint_stage)
+            except ValueError:
+                pass  # Keep default if stage name not recognized
+
         if self.is_main:
-            self._log(f"Checkpoint loaded: epoch={self.global_epoch}, best_acc={self.best_word_acc:.4f}")
+            self._log(f"Checkpoint loaded: epoch={self.global_epoch}, stage={checkpoint_stage}, best_acc={self.best_word_acc:.4f}")
 
         # Note: No barrier here - the caller (train_progressive.py) handles synchronization
+
+    def _load_optimizer_state(self):
+        """Load optimizer state from checkpoint (must be called after optimizer is created)."""
+        if hasattr(self, '_checkpoint_state') and 'optimizer_state_dict' in self._checkpoint_state:
+            self.optimizer.load_state_dict(self._checkpoint_state['optimizer_state_dict'])
+            if self.is_main:
+                self._log("Optimizer state loaded from checkpoint")
 
     def train_full_progressive(self) -> Dict[str, Any]:
         """Train all stages sequentially."""
