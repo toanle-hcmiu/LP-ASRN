@@ -389,6 +389,14 @@ class ProgressiveTrainer:
         else:
             print(message)
 
+    def _check_gradients(self) -> bool:
+        """Check if gradients contain NaN or Inf values."""
+        for param in self.generator.parameters():
+            if param.grad is not None:
+                if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
+                    return False
+        return True
+
     def train_epoch(self, stage_config: StageConfig) -> Dict[str, float]:
         """Train for one epoch."""
         self.generator.train()
@@ -396,70 +404,121 @@ class ProgressiveTrainer:
         total_loss = 0.0
         total_l1 = 0.0
         total_lcofl = 0.0
+        nan_count = 0  # Track batches with NaN gradients
 
         pred_texts_all = []
         gt_texts_all = []
 
         pbar = tqdm(self.train_loader, desc=f"Stage {self.current_stage.value}")
-        for batch in pbar:
-            lr_images = batch["lr"].to(self.device)
-            hr_images = batch["hr"].to(self.device)
-            gt_texts = batch["plate_text"]
+        for batch_idx, batch in enumerate(pbar):
+            loss = None  # Initialize to avoid undefined variable
+            try:
+                lr_images = batch["lr"].to(self.device)
+                hr_images = batch["hr"].to(self.device)
+                gt_texts = batch["plate_text"]
 
-            # Forward pass
-            sr_images = self.generator(lr_images)
+                # Forward pass
+                sr_images = self.generator(lr_images)
 
-            # Compute losses based on stage
-            l1 = self.l1_loss(sr_images, hr_images)
-            loss = l1
+                # Compute losses based on stage
+                l1 = self.l1_loss(sr_images, hr_images)
+                loss = l1
 
-            if "lcofl" in stage_config.loss_components:
-                # Get OCR predictions
-                with torch.no_grad():
-                    pred_logits = self.ocr(sr_images, return_logits=True)
-                    ocr_unwrapped = self._unwrap_model(self.ocr)
-                    pred_texts = ocr_unwrapped.predict(sr_images)
+                if "lcofl" in stage_config.loss_components:
+                    # Get OCR predictions
+                    with torch.no_grad():
+                        pred_logits = self.ocr(sr_images, return_logits=True)
+                        ocr_unwrapped = self._unwrap_model(self.ocr)
+                        pred_texts = ocr_unwrapped.predict(sr_images)
 
-                # Compute LCOFL
-                lcofl, lcofl_info = self.lcofl_loss(
-                    sr_images, hr_images, pred_logits, gt_texts, pred_texts
-                )
-                # Use configurable lambda_lcofl weight (default 1.0 instead of 0.1)
-                lambda_lcofl = self.config.get("loss", {}).get("lambda_lcofl", 1.0)
-                loss = loss + lambda_lcofl * lcofl
-                total_lcofl += lcofl.item()
+                    # Compute LCOFL
+                    lcofl, lcofl_info = self.lcofl_loss(
+                        sr_images, hr_images, pred_logits, gt_texts, pred_texts
+                    )
+                    # Use configurable lambda_lcofl weight (default 1.0 instead of 0.1)
+                    lambda_lcofl = self.config.get("loss", {}).get("lambda_lcofl", 1.0)
+                    loss = loss + lambda_lcofl * lcofl
+                    total_lcofl += lcofl.item()
 
-                pred_texts_all.extend(pred_texts)
-                gt_texts_all.extend(gt_texts)
+                    pred_texts_all.extend(pred_texts)
+                    gt_texts_all.extend(gt_texts)
 
-            total_loss += loss.item()
-            total_l1 += l1.item()
+                # Check for NaN/Inf loss BEFORE backward pass
+                if torch.isnan(loss) or torch.isinf(loss):
+                    self._log(f"WARNING: NaN/Inf loss detected at batch {batch_idx}, skipping", "warning")
+                    nan_count += 1
+                    continue
 
-            # Backward pass
-            self.optimizer.zero_grad()
-            loss.backward()
+                total_loss += loss.item()
+                total_l1 += l1.item()
 
-            # Gradient clipping
-            if self.config.get("training", {}).get("gradient_clip"):
-                torch.nn.utils.clip_grad_norm_(
-                    self.generator.parameters(),
-                    max_norm=self.config["training"]["gradient_clip"],
-                )
+                # Backward pass with error handling
+                self.optimizer.zero_grad()
 
-            self.optimizer.step()
+                # DDP sync check before backward to detect rank divergence early
+                if batch_idx > 0 and batch_idx % 20 == 0:
+                    self._ddp_sync_check(self.global_step, force=True)
 
-            # Update progress
-            if self.logger and self.global_step % 10 == 0:
-                pbar.set_postfix({"loss": loss.item()})
+                loss.backward()
 
-            self.global_step += 1
+                # Check for NaN/Inf gradients AFTER backward pass
+                if not self._check_gradients():
+                    self._log(f"WARNING: NaN/Inf gradients detected at batch {batch_idx}, skipping optimizer step", "warning")
+                    nan_count += 1
+                    continue
 
-            # Periodic DDP sync check to detect rank divergence early
-            self._ddp_sync_check(self.global_step)
+                # Gradient clipping
+                if self.config.get("training", {}).get("gradient_clip"):
+                    torch.nn.utils.clip_grad_norm_(
+                        self.generator.parameters(),
+                        max_norm=self.config["training"]["gradient_clip"],
+                    )
 
-            # Periodic GPU memory cleanup to prevent OOM during long training stages
-            if self.global_step % 100 == 0:
-                torch.cuda.empty_cache()
+                self.optimizer.step()
+
+                # Update progress (only if we successfully processed this batch)
+                if loss is not None:
+                    if self.logger and self.global_step % 10 == 0:
+                        pbar.set_postfix({"loss": loss.item()})
+
+                    self.global_step += 1
+
+                    # Periodic DDP sync check to detect rank divergence early
+                    self._ddp_sync_check(self.global_step)
+
+                    # Periodic GPU memory cleanup to prevent OOM during long training stages
+                    if self.global_step % 100 == 0:
+                        torch.cuda.empty_cache()
+
+                    # Periodic checkpoint save during epoch (every 1000 steps) for crash recovery
+                    if self.global_step % 1000 == 0 and self.is_main:
+                        self.save_checkpoint(self.global_epoch, self.current_stage, emergency=False)
+                        # Also save a mid-epoch checkpoint that can be used for recovery
+                        mid_epoch_path = self.save_dir / f"mid_epoch_{self.current_stage.value}_step_{self.global_step}.pth"
+                        checkpoint = {
+                            "epoch": self.global_epoch,
+                            "stage": self.current_stage.value,
+                            "global_step": self.global_step,
+                            "generator_state_dict": self.generator.state_dict(),
+                            "optimizer_state_dict": self.optimizer.state_dict(),
+                            "best_word_acc": self.best_word_acc,
+                        }
+                        torch.save(checkpoint, mid_epoch_path)
+
+            except RuntimeError as e:
+                if "NCCL" in str(e) or "timeout" in str(e).lower():
+                    # NCCL error - log and attempt to recover
+                    self._log(f"CRITICAL: NCCL error at batch {batch_idx}: {e}", "error")
+                    self._log(f"Attempting to save emergency checkpoint...", "error")
+                    self.save_checkpoint(self.global_epoch, self.current_stage, emergency=True)
+                    raise  # Re-raise to trigger training restart
+                else:
+                    self._log(f"RuntimeError at batch {batch_idx}: {e}", "error")
+                    raise
+
+        # Log nan_count if any batches were skipped
+        if nan_count > 0 and self.is_main:
+            self._log(f"WARNING: Skipped {nan_count} batches due to NaN/Inf gradients or loss", "warning")
 
         # DDP sync: Ensure all ranks complete training epoch before returning
         # This prevents rank divergence that causes NCCL collective operation timeouts
@@ -1495,8 +1554,14 @@ class ProgressiveTrainer:
 
         return self.best_word_acc
 
-    def save_checkpoint(self, epoch: int, stage: TrainingStage):
-        """Save a checkpoint (main process only for DDP)."""
+    def save_checkpoint(self, epoch: int, stage: TrainingStage, emergency: bool = False):
+        """Save a checkpoint (main process only for DDP).
+
+        Args:
+            epoch: Current epoch number
+            stage: Current training stage
+            emergency: If True, save as emergency checkpoint with timestamp
+        """
         if self.distributed and not self.is_main:
             return
 
@@ -1512,12 +1577,23 @@ class ProgressiveTrainer:
         if not self.config.get("ocr", {}).get("freeze_ocr", True):
             checkpoint["ocr_state_dict"] = self.ocr.state_dict()
 
-        save_path = self.save_dir / f"stage_{stage.value}_epoch_{epoch}.pth"
-        torch.save(checkpoint, save_path)
+        if emergency:
+            # Emergency checkpoint - add timestamp and save to special location
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            save_path = self.save_dir / f"emergency_{timestamp}_stage_{stage.value}_epoch_{epoch}.pth"
+            torch.save(checkpoint, save_path)
+            self._log(f"Emergency checkpoint saved: {save_path}", "error")
+            # Also save as latest emergency for easy resume
+            save_path = self.save_dir / "emergency_latest.pth"
+            torch.save(checkpoint, save_path)
+        else:
+            # Regular checkpoint
+            save_path = self.save_dir / f"stage_{stage.value}_epoch_{epoch}.pth"
+            torch.save(checkpoint, save_path)
 
-        # Save best
-        save_path = self.save_dir / "best.pth"
-        torch.save(checkpoint, save_path)
+            # Save best
+            save_path = self.save_dir / "best.pth"
+            torch.save(checkpoint, save_path)
 
     def load_checkpoint(self, checkpoint_path: str):
         """Load a checkpoint."""

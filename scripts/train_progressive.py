@@ -250,9 +250,15 @@ def setup_ddp(rank, world_size):
     os.environ["NCCL_ASYNC_ERROR_HANDLING"] = "1"  # Async error for debugging
     os.environ["NCCL_DEBUG"] = "WARN"  # Enable NCCL warnings for debugging
 
-    # Use longer timeout (60 minutes) to handle long validation phases
+    # Additional NCCL settings to prevent timeouts
+    os.environ["NCCL_P2P_LEVEL"] = "NVL"  # Use NVLink for faster P2P
+    os.environ["NCCL_IB_DISABLE"] = "1"  # Disable InfiniBand for single-node
+    os.environ["NCCL_SOCKET_NTHREADS"] = "4"  # More threads for socket comm
+    os.environ["NCCL_NSOCKS_PERTHREAD"] = "4"  # More sockets per thread
+
+    # Use longer timeout (120 minutes) to handle long validation phases and potential hangs
     import datetime
-    timeout = datetime.timedelta(minutes=60)
+    timeout = datetime.timedelta(minutes=120)
 
     dist.init_process_group(
         backend='nccl',
@@ -467,11 +473,56 @@ def train_ddp(rank, world_size, args, config):
     cleanup_ddp()
 
 
+def find_latest_checkpoint(save_dir: str) -> str:
+    """Find the latest checkpoint in the save directory."""
+    save_path = Path(save_dir)
+    if not save_path.exists():
+        return None
+
+    # Check for emergency_latest first (most recent crash recovery)
+    emergency_path = save_path / "emergency_latest.pth"
+    if emergency_path.exists():
+        return str(emergency_path)
+
+    # Check for mid-epoch checkpoints
+    mid_epoch_files = list(save_path.glob("mid_epoch_*_step_*.pth"))
+    if mid_epoch_files:
+        # Sort by step number and get the latest
+        latest = max(mid_epoch_files, key=lambda p: int(p.stem.split('_')[-1]))
+        return str(latest)
+
+    # Check for best.pth
+    best_path = save_path / "best.pth"
+    if best_path.exists():
+        return str(best_path)
+
+    return None
+
+
 def main():
     args = parse_args()
 
     # Load configuration
     config = load_config(args.config, args)
+
+    # Auto-resume from latest checkpoint if no explicit resume path and save_dir exists
+    save_dir = Path(config["training"]["save_dir"])
+    if not args.resume and save_dir.exists():
+        latest_checkpoint = find_latest_checkpoint(config["training"]["save_dir"])
+        if latest_checkpoint:
+            print(f"\n{'='*60}")
+            print(f"Found existing checkpoint: {latest_checkpoint}")
+            print(f"Resume training? (Press Enter to resume, or 'n' to start fresh)")
+            print(f"{'='*60}")
+            # For automation, you can also set an environment variable
+            if os.environ.get("LP_ASRN_AUTO_RESUME", "1") == "1":
+                args.resume = latest_checkpoint
+                print(f"Auto-resuming from: {latest_checkpoint}\n")
+            else:
+                response = input().strip().lower()
+                if response != 'n':
+                    args.resume = latest_checkpoint
+                    print(f"Resuming from: {latest_checkpoint}\n")
 
     # Check if using DDP (multiple GPUs)
     gpu_ids = args.gpus.split(',')
