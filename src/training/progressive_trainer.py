@@ -410,7 +410,7 @@ class ProgressiveTrainer:
         pred_texts_all = []
         gt_texts_all = []
 
-        pbar = tqdm(self.train_loader, desc=f"Stage {self.current_stage.value}")
+        pbar = tqdm(self.train_loader, desc=f"Stage {self.current_stage.value} Epoch {self.global_epoch}/{config.epochs}")
         for batch in pbar:
             lr_images = batch["lr"].to(self.device)
             hr_images = batch["hr"].to(self.device)
@@ -1378,8 +1378,6 @@ class ProgressiveTrainer:
         # Load optimizer state if resuming from checkpoint
         self._load_optimizer_state()
 
-        start_epoch = self.global_epoch
-
         # Log stage start
         if self.text_logger and self.is_main:
             stage_descriptions = {
@@ -1395,13 +1393,12 @@ class ProgressiveTrainer:
             )
 
         # Calculate starting epoch within this stage
-        # If global_epoch is within this stage, start from that point
-        # Otherwise start from 0
+        # The checkpoint stores the stage-specific epoch, not global epoch
         stage_start_epoch = 0
         if hasattr(self, '_checkpoint_state') and 'stage' in self._checkpoint_state:
             checkpoint_stage = self._checkpoint_state.get('stage', '')
             if checkpoint_stage == stage.value:
-                # Same stage - continue from global_epoch
+                # Same stage - continue from saved epoch (checkpoint stores stage-specific epoch)
                 stage_start_epoch = self.global_epoch
             else:
                 # Different stage - start from 0
@@ -1409,7 +1406,9 @@ class ProgressiveTrainer:
                 self.global_epoch = 0  # Reset for new stage
 
         for epoch in range(stage_start_epoch, config.epochs):
-            current_global_epoch = start_epoch + epoch
+            # epoch is stage-specific (0 to config.epochs-1)
+            # Update global_epoch after each epoch for tracking
+            self.global_epoch = epoch + 1
 
             # Log epoch start (for timing)
             if self.text_logger and self.is_main:
@@ -1456,7 +1455,7 @@ class ProgressiveTrainer:
                     self.epochs_without_improvement = 0
                     is_best = True
 
-                    self.save_checkpoint(current_global_epoch, stage)
+                    self.save_checkpoint(epoch, stage)
                     save_path = str(self.save_dir / "best.pth")
 
                     if self.text_logger and self.is_main:
