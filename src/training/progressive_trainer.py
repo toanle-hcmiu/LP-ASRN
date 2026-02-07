@@ -410,7 +410,7 @@ class ProgressiveTrainer:
         pred_texts_all = []
         gt_texts_all = []
 
-        pbar = tqdm(self.train_loader, desc=f"Stage {self.current_stage.value} Epoch {self.global_epoch}/{config.epochs}")
+        pbar = tqdm(self.train_loader, desc=f"Stage {self.current_stage.value} Epoch {self.global_epoch}/{stage_config.epochs}")
         for batch in pbar:
             lr_images = batch["lr"].to(self.device)
             hr_images = batch["hr"].to(self.device)
