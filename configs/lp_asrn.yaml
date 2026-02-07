@@ -79,8 +79,8 @@ training:
   # Reduces LR by this factor every lr_step_size epochs
   # Paper 2 uses this to prevent oscillations
   lr_scheduler: "StepLR"
-  lr_step_size: 5
-  lr_gamma: 0.9
+  lr_step_size: 10
+  lr_gamma: 0.95
 
   # Early stopping patience (from Paper 1)
   # Stops after 30 epochs without improvement (increased for 98% target)
@@ -184,7 +184,7 @@ progressive_training:
   stage2:
     name: "lcofl"
     epochs: 300   # Increased: model was still improving at epoch 60+
-    lr: 0.0001
+    lr: 0.0002   # Increased for faster convergence
     loss_components: ["l1", "lcofl"]
     freeze_ocr: true
     update_confusion: true
