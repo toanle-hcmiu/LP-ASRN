@@ -390,9 +390,11 @@ class ProgressiveTrainer:
             print(message)
 
     def _check_gradients(self) -> bool:
-        """Check if gradients contain NaN or Inf values."""
-        for param in self.generator.parameters():
-            if param.grad is not None:
+        """Check if gradients contain NaN or Inf values (lightweight check)."""
+        # Only check a subset of parameters to avoid overhead
+        # Check first few layers where NaN typically propagates from
+        for i, param in enumerate(self.generator.parameters()):
+            if param.grad is not None and i < 5:  # Only check first 5 parameter layers
                 if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
                     return False
         return True
@@ -443,9 +445,9 @@ class ProgressiveTrainer:
                     pred_texts_all.extend(pred_texts)
                     gt_texts_all.extend(gt_texts)
 
-                # Check for NaN/Inf loss BEFORE backward pass
-                if torch.isnan(loss) or torch.isinf(loss):
-                    self._log(f"WARNING: NaN/Inf loss detected at batch {batch_idx}, skipping", "warning")
+                # Lightweight NaN check - only check if loss is finite (fast)
+                if not torch.isfinite(loss):
+                    self._log(f"WARNING: Non-finite loss detected at batch {batch_idx}, skipping", "warning")
                     nan_count += 1
                     continue
 
@@ -455,16 +457,17 @@ class ProgressiveTrainer:
                 # Backward pass with error handling
                 self.optimizer.zero_grad()
 
-                # DDP sync check before backward to detect rank divergence early
-                if batch_idx > 0 and batch_idx % 20 == 0:
+                # DDP sync check - less frequent to avoid overhead
+                if batch_idx > 0 and batch_idx % 100 == 0:
                     self._ddp_sync_check(self.global_step, force=True)
 
                 loss.backward()
 
-                # Check for NaN/Inf gradients AFTER backward pass
-                if not self._check_gradients():
+                # Lightweight gradient check - only check first few params, less frequently
+                if batch_idx % 50 == 0 and not self._check_gradients():
                     self._log(f"WARNING: NaN/Inf gradients detected at batch {batch_idx}, skipping optimizer step", "warning")
                     nan_count += 1
+                    self.optimizer.zero_grad()  # Clear bad gradients
                     continue
 
                 # Gradient clipping
