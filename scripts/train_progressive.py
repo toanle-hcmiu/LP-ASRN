@@ -569,11 +569,12 @@ def main():
 
         # Create data loaders
         print("\nLoading data...")
-        train_loader, val_loader = create_dataloaders(
+        train_loader, val_loader, _ = create_dataloaders(
             root_dir=args.data_root,
             batch_size=config["data"].get("batch_size", 16),
             num_workers=config["data"].get("num_workers", 4),
             image_size=tuple(config["data"].get("lr_size", [17, 31])),
+            distributed=False,
             ocr_pretrain_mode=config["data"].get("ocr_pretrain_augmentation", False),
         )
 
