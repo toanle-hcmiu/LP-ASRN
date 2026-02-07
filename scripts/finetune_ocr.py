@@ -1,7 +1,7 @@
 """
-Fine-tune Parseq OCR on License Plate Data
+Fine-tune OCR Model on License Plate Data
 
-This script fine-tunes the Parseq model on the high-resolution
+This script fine-tunes the OCR model on the high-resolution
 license plate images before using it for super-resolution training.
 """
 
@@ -19,12 +19,12 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from src.data.lp_dataset import create_dataloaders
-from src.ocr.parseq_wrapper import ParseqOCR
+from src.ocr.ocr_model import OCRModel
 from src.ocr.confusion_tracker import MetricsTracker
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Fine-tune Parseq on license plate data")
+    parser = argparse.ArgumentParser(description="Fine-tune OCR on license plate data")
     parser.add_argument("--config", type=str, default="configs/lp_asrn.yaml")
     parser.add_argument("--data-root", type=str, default="data/train")
     parser.add_argument("--epochs", type=int, default=10)
@@ -32,7 +32,7 @@ def parse_args():
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--save-dir", type=str, default="checkpoints/parseq")
+    parser.add_argument("--save-dir", type=str, default="checkpoints/ocr")
     parser.add_argument("--resume", type=str, default=None)
     return parser.parse_args()
 
@@ -67,8 +67,8 @@ def finetune(args):
     print(f"Val batches: {len(val_loader)}")
 
     # Create model
-    print("Creating Parseq model...")
-    ocr = ParseqOCR(
+    print("Creating OCR model...")
+    ocr = OCRModel(
         vocab=vocab,
         max_length=max_length,
         frozen=False,  # Unfreeze for fine-tuning

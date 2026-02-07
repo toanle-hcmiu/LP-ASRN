@@ -36,7 +36,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from src.training.progressive_trainer import ProgressiveTrainer, TrainingStage
 from src.data.lp_dataset import create_dataloaders
 from src.models.generator import Generator
-from src.ocr.parseq_wrapper import ParseqOCR
+from src.ocr.ocr_model import OCRModel
 from src.utils.logger import TensorBoardLogger, TextLogger
 
 
@@ -352,11 +352,11 @@ def train_ddp(rank, world_size, args, config):
         print("\nCreating OCR model...")
 
     ocr_config = config.get("ocr", {})
-    ocr = ParseqOCR(
+    ocr = OCRModel(
         vocab=ocr_config.get("vocab", "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"),
         max_length=ocr_config.get("max_length", 7),
         rnn_dropout=ocr_config.get("rnn_dropout", 0.3),
-        use_parseq=ocr_config.get("use_parseq", True),  # Enable real Parseq model
+        use_parseq=ocr_config.get("use_pretrained", False),  # Use external pretrained model
     )
 
     # Load fine-tuned OCR if available (all ranks need this)
@@ -598,11 +598,11 @@ def main():
         # Create OCR
         print("\nCreating OCR model...")
         ocr_config = config.get("ocr", {})
-        ocr = ParseqOCR(
+        ocr = OCRModel(
             vocab=ocr_config.get("vocab", "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"),
             max_length=ocr_config.get("max_length", 7),
             rnn_dropout=ocr_config.get("rnn_dropout", 0.3),
-            use_parseq=ocr_config.get("use_parseq", True),  # Enable real Parseq model
+            use_parseq=ocr_config.get("use_pretrained", False),  # Use external pretrained model
         )
 
         # Load fine-tuned OCR if available

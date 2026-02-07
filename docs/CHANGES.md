@@ -63,10 +63,10 @@
 ### Breaking Changes
 
 #### SimpleCRNN as Primary OCR
-- Switched from Parseq to SimpleCRNN for vocabulary compatibility
+- Uses SimpleCRNN for vocabulary compatibility
 - 36-character vocabulary (0-9, A-Z) optimized for license plates
 - CNN+BiLSTM architecture designed specifically for license plates
 
 **Files Modified:**
-- `src/ocr/parseq_wrapper.py`: SimpleCRNN fallback
-- `requirements.txt`: Removed Parseq-specific dependencies
+- `src/ocr/ocr_model.py`: SimpleCRNN implementation
+- `requirements.txt`: Removed external model-specific dependencies

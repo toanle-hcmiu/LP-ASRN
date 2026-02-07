@@ -1,9 +1,9 @@
 # OCR module
-from .parseq_wrapper import ParseqOCR, ParseqTokenizer
+from .ocr_model import OCRModel, ParseqTokenizer
 from .confusion_tracker import ConfusionTracker
 
 __all__ = [
-    "ParseqOCR",
+    "OCRModel",
     "ParseqTokenizer",
     "ConfusionTracker",
 ]

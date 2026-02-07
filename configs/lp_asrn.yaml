@@ -121,21 +121,21 @@ loss:
 
 ocr:
   # OCR model type
-  model_type: "parseq"
+  model_type: "simplecrnn"
 
-  # Use real Parseq model from HuggingFace (true) or SimpleCRNN fallback (false)
-  # NOTE: Parseq requires teacher forcing for training which is not implemented.
-  # Use SimpleCRNN (false) for training, Parseq is only suitable for frozen inference.
-  use_parseq: false
+  # Use external pretrained model from HuggingFace (true) or SimpleCRNN (false)
+  # NOTE: External model requires teacher forcing for training which is not implemented.
+  # Use SimpleCRNN (false) for training.
+  use_pretrained: false
 
   # Pre-trained model path (HuggingFace model ID or local path)
   pretrained_path: "baudm/parseq-base"
 
-  # Fine-tune Parseq on HR images before SR training
+  # Fine-tune OCR on HR images before SR training
   finetune_first: true
 
   # Path to fine-tuned model (after fine-tuning)
-  finetuned_path: "checkpoints/parseq/best.pth"
+  finetuned_path: "checkpoints/ocr/best.pth"
 
   # Keep OCR frozen during SR training (critical for stability)
   freeze_ocr: true
@@ -146,11 +146,11 @@ ocr:
   # Character vocabulary
   vocab: "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
-  # Label smoothing for loss (CE for Parseq, CTC for SimpleCRNN)
+  # Label smoothing for loss (CTT for SimpleCRNN)
   # 0.0 = disabled, 0.1 = recommended, 0.2 = strong
   label_smoothing: 0.1  # Mild smoothing for better generalization
 
-  # Dropout rate for RNN layer in SimpleCRNN (only used if use_parseq=false)
+  # Dropout rate for RNN layer in SimpleCRNN
   # 0.0 = disabled, 0.3 = recommended, 0.5 = strong
   rnn_dropout: 0.3  # Balanced dropout for OCR pretraining
 

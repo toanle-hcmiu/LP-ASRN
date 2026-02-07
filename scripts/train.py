@@ -31,7 +31,7 @@ from src.data.lp_dataset import create_dataloaders
 from src.models.generator import Generator
 from src.losses.lcofl import LCOFL
 from src.losses.basic import L1Loss
-from src.ocr.parseq_wrapper import ParseqOCR
+from src.ocr.ocr_model import OCRModel
 from src.ocr.confusion_tracker import ConfusionTracker, MetricsTracker
 
 
@@ -230,7 +230,7 @@ def main(args):
 
     # Create OCR model (frozen)
     print("Creating OCR model...")
-    ocr = ParseqOCR(
+    ocr = OCRModel(
         vocab=ocr_config.get("vocab", "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"),
         max_length=ocr_config.get("max_length", 7),
         frozen=ocr_config.get("freeze_ocr", True),

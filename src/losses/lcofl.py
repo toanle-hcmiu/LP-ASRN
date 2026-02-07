@@ -135,7 +135,7 @@ class ClassificationLoss(nn.Module):
         """
         B, K, C = pred_logits.shape
 
-        # Check if vocab size matches (e.g., Parseq outputs 94 chars, but our vocab is 36)
+        # Check if vocab size matches (e.g., external pretrained model outputs 94 chars, but our vocab is 36)
         if C != len(self.char_to_idx):
             # Vocab size mismatch - skip classification loss and rely on CTC loss only
             # Fixed: The previous implementation used predicted indices instead of ground truth,

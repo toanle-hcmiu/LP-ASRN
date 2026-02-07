@@ -22,7 +22,7 @@ from tqdm import tqdm
 
 from src.data.lp_dataset import LicensePlateDataset
 from src.models.generator import Generator
-from src.ocr.parseq_wrapper import ParseqOCR
+from src.ocr.ocr_model import OCRModel
 from src.ocr.confusion_tracker import ConfusionTracker
 
 
@@ -113,7 +113,7 @@ def evaluate(args):
 
     # Create OCR model
     ocr_config = config.get("ocr", {})
-    ocr = ParseqOCR(
+    ocr = OCRModel(
         vocab=ocr_config.get("vocab", "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"),
         max_length=ocr_config.get("max_length", 7),
     ).to(device)

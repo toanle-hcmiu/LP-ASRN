@@ -25,7 +25,7 @@ from torch.optim.lr_scheduler import StepLR, ReduceLROnPlateau
 from tqdm import tqdm
 
 from src.models.generator import Generator
-from src.ocr.parseq_wrapper import ParseqOCR
+from src.ocr.ocr_model import OCRModel
 from src.losses.lcofl import LCOFL
 from src.losses.basic import L1Loss
 from src.ocr.confusion_tracker import ConfusionTracker, MetricsTracker
@@ -68,7 +68,7 @@ class ProgressiveTrainer:
     def __init__(
         self,
         generator: Generator,
-        ocr: ParseqOCR,
+        ocr: OCRModel,
         train_loader: DataLoader,
         val_loader: DataLoader,
         config: Dict[str, Any],
@@ -781,7 +781,7 @@ class ProgressiveTrainer:
                 # Forward pass
                 logits = self.ocr(hr_images, return_logits=True)
 
-                # Compute loss (uses CTC for SimpleCRNN, cross-entropy for Parseq)
+                # Compute loss (uses CTC for SimpleCRNN)
                 ocr_unwrapped = self._unwrap_model(self.ocr)
                 label_smoothing = self.config.get("ocr", {}).get("label_smoothing", 0.1)
                 loss = ocr_unwrapped.compute_loss(logits, gt_texts, device=self.device,
@@ -1628,30 +1628,9 @@ class ProgressiveTrainer:
                 if self.is_main:
                     self._log(f"OCR not in checkpoint, loading from {ocr_best_path}...")
 
-                ocr_checkpoint = torch.load(ocr_best_path, map_location=self.device)
-
-                # ocr_best.pth might be a full checkpoint or just a state_dict
-                if isinstance(ocr_checkpoint, dict) and "ocr_state_dict" in ocr_checkpoint:
-                    ocr_state = ocr_checkpoint["ocr_state_dict"]
-                else:
-                    # Assume it's just the state_dict
-                    ocr_state = ocr_checkpoint
-
-                # Check if state dict has "module." prefix
-                has_module_prefix = any(k.startswith("module.") for k in ocr_state.keys())
-                is_ddp_wrapped = isinstance(self.ocr, nn.parallel.DistributedDataParallel)
-
-                # Handle DDP prefix for OCR
-                if has_module_prefix and not is_ddp_wrapped:
-                    ocr_state = {k.replace("module.", ""): v for k, v in ocr_state.items()}
-                    self.ocr.load_state_dict(ocr_state)
-                elif not has_module_prefix and is_ddp_wrapped:
-                    ocr_state = {"module." + k: v for k, v in ocr_state.items()}
-                    self.ocr.load_state_dict(ocr_state)
-                elif has_module_prefix and is_ddp_wrapped:
-                    self.ocr.load_state_dict(ocr_state)
-                else:
-                    self.ocr.load_state_dict(ocr_state)
+                # Use OCRModel.load() method which properly handles model_state_dict format
+                # This loads the state_dict, vocab, and max_length correctly
+                self.ocr.load(str(ocr_best_path))
 
                 if self.is_main:
                     self._log(f"OCR state loaded from {ocr_best_path}")
@@ -1809,7 +1788,7 @@ if __name__ == "__main__":
 
     # Create models
     generator = Generator(num_filters=32, num_blocks=2)
-    ocr = ParseqOCR(frozen=True)
+    ocr = OCRModel(frozen=True)
 
     # Create logger
     logger = TensorBoardLogger(log_dir="outputs/test_progressive/logs")

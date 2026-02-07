@@ -1,12 +1,13 @@
 """
-Parseq OCR Wrapper
+OCR Model for License Plate Recognition
 
-Wraps the Parseq model for license plate recognition.
-Parseq: "Scene Text Recognition with Permuted Autoregressive Sequence Items"
+Supports two backends:
+- Pretrained: External model from HuggingFace (use_pretrained=True)
+- SimpleCRNN: Custom CRNN with TPS-STN, ResNet, BiLSTM (default)
 
 This module provides:
-1. ParseqOCR class for inference and fine-tuning
-2. ParseqTokenizer for encoding/decoding text
+1. OCRModel class for inference and fine-tuning
+2. CharacterTokenizer for encoding/decoding text
 3. Integration with LCOFL loss function
 """
 
@@ -32,27 +33,27 @@ PARSEQ_SOURCE = None
 class PlateFormatValidator:
     """
     Validates and corrects license plate predictions based on format constraints.
-    
+
     Brazilian plate formats:
     - Old format: LLL-NNNN (3 letters + 4 digits)
     - Mercosur format: LLL-NLNN (3 letters + digit + letter + 2 digits)
-    
+
     These constraints can boost accuracy by +5-10% with no model changes.
     """
-    
+
     # Pattern: L=Letter, N=Number
     BRAZILIAN_OLD = r'^[A-Z]{3}[0-9]{4}$'      # LLLNNNN
     MERCOSUR = r'^[A-Z]{3}[0-9][A-Z][0-9]{2}$'  # LLLNLNN
-    
+
     # Character confusion pairs (commonly confused)
     LETTER_TO_DIGIT = {'O': '0', 'I': '1', 'Z': '2', 'S': '5', 'B': '8', 'G': '6'}
     DIGIT_TO_LETTER = {'0': 'O', '1': 'I', '2': 'Z', '5': 'S', '8': 'B', '6': 'G'}
-    
+
     @classmethod
     def validate(cls, text: str) -> Tuple[bool, str]:
         """
         Check if text matches any valid plate format.
-        
+
         Returns:
             (is_valid, format_name)
         """
@@ -61,32 +62,32 @@ class PlateFormatValidator:
         if re.match(cls.MERCOSUR, text):
             return True, 'mercosur'
         return False, 'unknown'
-    
+
     @classmethod
     def correct(cls, text: str, target_format: str = 'auto') -> str:
         """
         Attempt to correct the prediction to match plate format.
-        
+
         Args:
             text: Raw OCR prediction (7 characters)
             target_format: 'brazilian', 'mercosur', or 'auto' (try both)
-            
+
         Returns:
             Corrected text if possible, otherwise original
         """
         if len(text) != 7:
             return text
-        
+
         text = text.upper()
-        
+
         # Already valid
         is_valid, fmt = cls.validate(text)
         if is_valid:
             return text
-        
+
         # Try to correct based on format
         candidates = []
-        
+
         if target_format in ('brazilian', 'auto'):
             # Brazilian: LLL NNNN (positions 0-2 letters, 3-6 digits)
             corrected = list(text)
@@ -99,7 +100,7 @@ class PlateFormatValidator:
             result = ''.join(corrected)
             if re.match(cls.BRAZILIAN_OLD, result):
                 candidates.append((result, 'brazilian'))
-        
+
         if target_format in ('mercosur', 'auto'):
             # Mercosur: LLL N L NN (positions 0-2 letters, 3 digit, 4 letter, 5-6 digits)
             corrected = list(text)
@@ -112,20 +113,20 @@ class PlateFormatValidator:
             result = ''.join(corrected)
             if re.match(cls.MERCOSUR, result):
                 candidates.append((result, 'mercosur'))
-        
+
         # Return best candidate (prefer original format if valid, otherwise first match)
         if candidates:
             return candidates[0][0]
         return text
-    
+
     @classmethod
     def score_candidates(cls, candidates: List[Tuple[str, float]]) -> List[Tuple[str, float]]:
         """
         Re-score beam search candidates with format preference bonus.
-        
+
         Args:
             candidates: List of (text, log_prob) tuples
-            
+
         Returns:
             Re-scored candidates with valid formats boosted
         """
@@ -135,7 +136,7 @@ class PlateFormatValidator:
             # Give 2.0 log-prob bonus to valid formats (significant but not overwhelming)
             bonus = 2.0 if is_valid else 0.0
             scored.append((text, log_prob + bonus, fmt))
-        
+
         # Sort by adjusted score
         scored.sort(key=lambda x: x[1], reverse=True)
         return [(t, s) for t, s, _ in scored]
@@ -280,15 +281,19 @@ class ParseqTokenizer:
         return texts
 
 
-class ParseqOCR(nn.Module):
+class OCRModel(nn.Module):
     """
-    Parseq OCR Model Wrapper.
+    OCR Model Wrapper for License Plate Recognition.
+
+    Supports two backends:
+    - Parseq: Pretrained model from HuggingFace (use_parseq=True)
+    - SimpleCRNN: Custom CRNN with TPS-STN, ResNet, BiLSTM (use_parseq=False)
 
     Provides:
-    - Loading pretrained Parseq model
+    - Loading pretrained models
     - Fine-tuning on license plate data
     - Inference with logit outputs for LCOFL
-    - Text decoding
+    - Text decoding with CTC or Parseq tokenizer
     """
 
     def __init__(
@@ -301,10 +306,10 @@ class ParseqOCR(nn.Module):
         use_parseq: bool = True,  # New flag to choose model
     ):
         """
-        Initialize Parseq OCR.
+        Initialize OCR Model.
 
         Args:
-            pretrained_path: Path or HuggingFace ID for pretrained model
+            pretrained_path: Path or HuggingFace ID for pretrained model (for Parseq)
             vocab: Character vocabulary
             max_length: Maximum sequence length
             frozen: If True, freeze weights during SR training
@@ -326,10 +331,10 @@ class ParseqOCR(nn.Module):
                 self.use_parseq = True
                 self.blank_idx = 0  # Parseq uses 0 as blank/padding
                 print("Successfully loaded Parseq model from HuggingFace")
-                
+
                 # Create tokenizer with Parseq vocab
                 self.tokenizer = ParseqTokenizer(vocab, max_length, use_parseq_vocab=True)
-                
+
             except Exception as e:
                 print(f"Failed to load Parseq: {e}")
                 print("Falling back to SimpleCRNN...")
@@ -525,7 +530,7 @@ class ParseqOCR(nn.Module):
         with torch.no_grad():
             # Check if using real Parseq model
             is_simple_crnn = isinstance(self.model, SimpleCRNN)
-            
+
             if not is_simple_crnn and self.use_parseq:
                 # Use Parseq's native prediction
                 # Normalize input for Parseq
@@ -534,20 +539,20 @@ class ParseqOCR(nn.Module):
                     x = torch.clamp(x, 0, 1)
                 else:
                     x = images
-                
+
                 # Resize to Parseq expected input size (32, 128)
                 parseq_h, parseq_w = 32, 128
                 if x.shape[2] != parseq_h or x.shape[3] != parseq_w:
                     x = F.interpolate(x, size=(parseq_h, parseq_w), mode='bilinear', align_corners=False)
-                
+
                 # Normalize with ImageNet stats
                 mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(x.device)
                 std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(x.device)
                 x = (x - mean) / std
-                
+
                 # Parseq returns predictions directly
                 pred = self.model(x)
-                
+
                 # pred is a dict with 'tokens' and 'text', or just logits
                 if isinstance(pred, dict):
                     # Use Parseq's tokenizer to decode
@@ -572,9 +577,9 @@ class ParseqOCR(nn.Module):
                                 if char in self.vocab:
                                     text += char
                         texts.append(text)
-                
+
                 return texts
-            
+
             logits = self.forward(images, return_logits=True)
 
         # SimpleCRNN with CTC decoding
@@ -597,7 +602,7 @@ class ParseqOCR(nn.Module):
                         if char in self.tokenizer.vocab:
                             text += char
                 texts.append(text)
-            
+
             # Apply plate format correction for +5-10% accuracy boost
             texts = [PlateFormatValidator.correct(t) for t in texts]
             return texts
@@ -786,7 +791,7 @@ class ParseqOCR(nn.Module):
         # gamma=0: standard CTC (default, safer for initial training)
         # gamma=1.5-2.0: focal weighting for fine-tuning hard examples
         focal_gamma = getattr(self, 'focal_gamma', 0.0)
-        
+
         if focal_gamma > 0:
             with torch.no_grad():
                 loss_normalized = torch.clamp(ctc_loss / (ctc_loss.max() + 1e-8), 0, 1)
@@ -849,7 +854,7 @@ class ParseqOCR(nn.Module):
             # Parseq's tokenizer expects a list of strings
             # Encode targets using Parseq's native tokenizer
             target_tensor = torch.zeros(B, T, dtype=torch.long, device=device)
-            
+
             for i, text in enumerate(targets):
                 # Pad/truncate to T positions
                 text_padded = text[:T] if len(text) > T else text
@@ -869,7 +874,7 @@ class ParseqOCR(nn.Module):
         else:
             # Fallback: encode using our tokenizer (make sure indices are valid)
             target_tensor = torch.zeros(B, T, dtype=torch.long, device=device)
-            
+
             for i, text in enumerate(targets):
                 for j, char in enumerate(text):
                     if j >= T:
@@ -951,9 +956,9 @@ class SequenceAttention(nn.Module):
         self.hidden_size = hidden_size
         self.num_heads = num_heads
         self.head_dim = hidden_size // num_heads
-        
+
         assert hidden_size % num_heads == 0, "hidden_size must be divisible by num_heads"
-        
+
         self.q_proj = nn.Linear(hidden_size, hidden_size)
         self.k_proj = nn.Linear(hidden_size, hidden_size)
         self.v_proj = nn.Linear(hidden_size, hidden_size)
@@ -964,26 +969,26 @@ class SequenceAttention(nn.Module):
     def forward(self, x):
         # x: (B, T, H)
         B, T, H = x.shape
-        
+
         # Residual connection
         residual = x
-        
+
         # Project to Q, K, V
         q = self.q_proj(x).view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
         k = self.k_proj(x).view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(x).view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
-        
+
         # Scaled dot-product attention
         scale = self.head_dim ** -0.5
         attn = torch.matmul(q, k.transpose(-2, -1)) * scale
         attn = F.softmax(attn, dim=-1)
         attn = self.dropout(attn)
-        
+
         # Apply attention to values
         out = torch.matmul(attn, v)
         out = out.transpose(1, 2).contiguous().view(B, T, H)
         out = self.out_proj(out)
-        
+
         # Residual + LayerNorm
         return self.layer_norm(out + residual)
 
@@ -1291,10 +1296,10 @@ class SimpleCRNN(nn.Module):
 
 
 if __name__ == "__main__":
-    # Test Parseq OCR
-    print("Testing ParseqOCR...")
+    # Test OCR Model
+    print("Testing OCRModel...")
 
-    ocr = ParseqOCR(
+    ocr = OCRModel(
         vocab="0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ",
         max_length=7,
         frozen=False,
@@ -1316,4 +1321,4 @@ if __name__ == "__main__":
     decoded = tokenizer.decode(encoded)
     print(f"Decoded: {decoded}")
 
-    print("ParseqOCR test passed!")
+    print("OCRModel test passed!")
