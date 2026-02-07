@@ -1595,20 +1595,58 @@ class ProgressiveTrainer:
             save_path = self.save_dir / "best.pth"
             torch.save(checkpoint, save_path)
 
+    def _unwrap_model(self, model):
+        """Unwrap DDP or DataParallel wrapper to get the underlying model."""
+        if isinstance(model, (nn.parallel.DistributedDataParallel, nn.DataParallel)):
+            return model.module
+        return model
+
     def load_checkpoint(self, checkpoint_path: str):
         """Load a checkpoint."""
+        if self.is_main:
+            self._log(f"Loading checkpoint from {checkpoint_path}...")
+
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
 
-        self.generator.load_state_dict(checkpoint["generator_state_dict"])
+        # Handle DDP wrapper mismatch - checkpoint might have "module." prefix
+        generator_state = checkpoint["generator_state_dict"]
+        generator_unwrapped = self._unwrap_model(self.generator)
+
+        # Check if state dict has "module." prefix (from DDP save)
+        has_module_prefix = any(k.startswith("module.") for k in generator_state.keys())
+        is_ddp_wrapped = isinstance(self.generator, nn.parallel.DistributedDataParallel)
+
+        if has_module_prefix and not is_ddp_wrapped:
+            # Remove "module." prefix for non-DDP model
+            generator_state = {k.replace("module.", ""): v for k, v in generator_state.items()}
+        elif not has_module_prefix and is_ddp_wrapped:
+            # Add "module." prefix for DDP model
+            generator_state = {"module." + k: v for k, v in generator_state.items()}
+
+        generator_unwrapped.load_state_dict(generator_state)
 
         if "ocr_state_dict" in checkpoint:
-            self.ocr.load_state_dict(checkpoint["ocr_state_dict"])
+            ocr_state = checkpoint["ocr_state_dict"]
+            ocr_unwrapped = self._unwrap_model(self.ocr)
+
+            # Check if state dict has "module." prefix
+            has_module_prefix = any(k.startswith("module.") for k in ocr_state.keys())
+            is_ddp_wrapped = isinstance(self.ocr, nn.parallel.DistributedDataParallel)
+
+            if has_module_prefix and not is_ddp_wrapped:
+                ocr_state = {k.replace("module.", ""): v for k, v in ocr_state.items()}
+            elif not has_module_prefix and is_ddp_wrapped:
+                ocr_state = {"module." + k: v for k, v in ocr_state.items()}
+
+            ocr_unwrapped.load_state_dict(ocr_state)
 
         self.global_epoch = checkpoint.get("global_epoch", 0)
         self.best_word_acc = checkpoint.get("best_word_acc", 0.0)
 
-        # Synchronize all processes after loading checkpoint
-        self._safe_barrier(timeout_seconds=300, description="load_checkpoint")
+        if self.is_main:
+            self._log(f"Checkpoint loaded: epoch={self.global_epoch}, best_acc={self.best_word_acc:.4f}")
+
+        # Note: No barrier here - the caller (train_progressive.py) handles synchronization
 
     def train_full_progressive(self) -> Dict[str, Any]:
         """Train all stages sequentially."""
