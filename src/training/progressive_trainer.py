@@ -1610,35 +1610,46 @@ class ProgressiveTrainer:
 
         # Handle DDP wrapper mismatch - checkpoint might have "module." prefix
         generator_state = checkpoint["generator_state_dict"]
-        generator_unwrapped = self._unwrap_model(self.generator)
 
         # Check if state dict has "module." prefix (from DDP save)
         has_module_prefix = any(k.startswith("module.") for k in generator_state.keys())
         is_ddp_wrapped = isinstance(self.generator, nn.parallel.DistributedDataParallel)
 
+        # For DDP: load directly into wrapped model (expects "module." prefix)
+        # For non-DDP: load into model directly (no prefix expected)
         if has_module_prefix and not is_ddp_wrapped:
             # Remove "module." prefix for non-DDP model
             generator_state = {k.replace("module.", ""): v for k, v in generator_state.items()}
+            self.generator.load_state_dict(generator_state)
         elif not has_module_prefix and is_ddp_wrapped:
             # Add "module." prefix for DDP model
             generator_state = {"module." + k: v for k, v in generator_state.items()}
-
-        generator_unwrapped.load_state_dict(generator_state)
+            self.generator.load_state_dict(generator_state)
+        elif has_module_prefix and is_ddp_wrapped:
+            # Both have prefix - load directly into wrapped model
+            self.generator.load_state_dict(generator_state)
+        else:
+            # Neither has prefix - load directly
+            self.generator.load_state_dict(generator_state)
 
         if "ocr_state_dict" in checkpoint:
             ocr_state = checkpoint["ocr_state_dict"]
-            ocr_unwrapped = self._unwrap_model(self.ocr)
 
             # Check if state dict has "module." prefix
             has_module_prefix = any(k.startswith("module.") for k in ocr_state.keys())
             is_ddp_wrapped = isinstance(self.ocr, nn.parallel.DistributedDataParallel)
 
+            # Same logic for OCR
             if has_module_prefix and not is_ddp_wrapped:
                 ocr_state = {k.replace("module.", ""): v for k, v in ocr_state.items()}
+                self.ocr.load_state_dict(ocr_state)
             elif not has_module_prefix and is_ddp_wrapped:
                 ocr_state = {"module." + k: v for k, v in ocr_state.items()}
-
-            ocr_unwrapped.load_state_dict(ocr_state)
+                self.ocr.load_state_dict(ocr_state)
+            elif has_module_prefix and is_ddp_wrapped:
+                self.ocr.load_state_dict(ocr_state)
+            else:
+                self.ocr.load_state_dict(ocr_state)
 
         self.global_epoch = checkpoint.get("global_epoch", 0)
         self.best_word_acc = checkpoint.get("best_word_acc", 0.0)
