@@ -58,6 +58,10 @@ def parse_args():
                         help="Do NOT resize test images to lr_size (use native resolution)")
     parser.add_argument("--lr-size", type=int, nargs=2, default=None, metavar=("H", "W"),
                         help="Override LR size (default: from config or no resize)")
+    parser.add_argument("--diagnose", action="store_true",
+                        help="Run diagnostic mode: compare strategies, print samples, check pipeline")
+    parser.add_argument("--diagnose-val", type=str, default=None,
+                        help="Path to training data root to validate inference vs training accuracy")
     return parser.parse_args()
 
 
@@ -543,8 +547,273 @@ def aggregate_track_predictions(predictions):
 
 
 @torch.no_grad()
+def run_diagnose(args):
+    """
+    Diagnostic mode: compare strategies, print samples, find pipeline bugs.
+
+    Tests:
+    1. Image size statistics across all test images
+    2. Compare: resize(34x62) vs native resolution vs OCR-only
+    3. Print first 10 track predictions for manual inspection
+    4. If --diagnose-val given: reproduce training validation accuracy
+    """
+    config = load_config(args.config)
+    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+
+    generator, ocr = load_models(args, config, device)
+    data_config = config.get("data", {})
+    config_lr_size = tuple(data_config.get("lr_size", [34, 62]))
+
+    tracks = discover_tracks(args.data_root)
+    if not tracks:
+        print("No tracks found!")
+        return
+
+    # ═══════════════════════════════════════════════════════════════════
+    # TEST 1: Image size statistics
+    # ═══════════════════════════════════════════════════════════════════
+    print(f"\n{'='*60}")
+    print("TEST 1: Image Size Statistics")
+    print(f"{'='*60}")
+    sizes = []
+    for _, image_paths in tracks[:100]:  # Sample first 100 tracks
+        for p in image_paths:
+            img = Image.open(p)
+            sizes.append((img.height, img.width))
+
+    heights = [s[0] for s in sizes]
+    widths = [s[1] for s in sizes]
+    ratios = [h / w for h, w in sizes]
+    unique_sizes = set(sizes)
+
+    print(f"  Sampled {len(sizes)} images from {min(100, len(tracks))} tracks")
+    print(f"  Height range: {min(heights)} - {max(heights)} (mean={sum(heights)/len(heights):.1f})")
+    print(f"  Width range:  {min(widths)} - {max(widths)} (mean={sum(widths)/len(widths):.1f})")
+    print(f"  Aspect ratio: {min(ratios):.3f} - {max(ratios):.3f} (mean={sum(ratios)/len(ratios):.3f})")
+    print(f"  Unique sizes: {len(unique_sizes)}")
+    if len(unique_sizes) <= 20:
+        from collections import Counter
+        size_counts = Counter(sizes).most_common(20)
+        for (h, w), count in size_counts:
+            print(f"    {h}×{w} (ratio {h/w:.3f}): {count} images")
+    print(f"  Config lr_size: {config_lr_size[0]}×{config_lr_size[1]} (ratio {config_lr_size[0]/config_lr_size[1]:.3f})")
+
+    # ═══════════════════════════════════════════════════════════════════
+    # TEST 2: Compare strategies on first 20 tracks
+    # ═══════════════════════════════════════════════════════════════════
+    print(f"\n{'='*60}")
+    print("TEST 2: Strategy Comparison (first 20 tracks)")
+    print(f"{'='*60}")
+
+    test_tracks = tracks[:20]
+
+    strategies = {}
+
+    # Strategy A: Resize to config lr_size (current default)
+    print("\n  Running Strategy A: resize to config lr_size...")
+    strat_a = {}
+    for track_id, image_paths in test_tracks:
+        preds = []
+        tensors = [load_and_preprocess(p, lr_size=config_lr_size) for p in image_paths]
+        batch = torch.stack(tensors).to(device)
+        if generator is not None:
+            sr = generator(batch)
+        else:
+            sr = batch
+        logits = ocr(sr, return_logits=True)
+        preds = predict_with_confidence(ocr, logits, beam_width=args.beam_width)
+        text, conf = aggregate_track_predictions(preds)
+        strat_a[track_id] = (text, conf)
+    strategies["A: resize(34×62)+SR"] = strat_a
+
+    # Strategy B: No resize (native resolution) + SR
+    print("  Running Strategy B: native resolution + SR...")
+    strat_b = {}
+    for track_id, image_paths in test_tracks:
+        tensors = [load_and_preprocess(p, lr_size=None) for p in image_paths]
+        # Pad to same size within track
+        max_h = max(t.shape[1] for t in tensors)
+        max_w = max(t.shape[2] for t in tensors)
+        # Make divisible by 2 for PixelShuffle
+        max_h = max_h + (max_h % 2)
+        max_w = max_w + (max_w % 2)
+        padded = [F.pad(t, (0, max_w - t.shape[2], 0, max_h - t.shape[1]), mode='reflect') for t in tensors]
+        batch = torch.stack(padded).to(device)
+        if generator is not None:
+            sr = generator(batch)
+        else:
+            sr = batch
+        logits = ocr(sr, return_logits=True)
+        preds = predict_with_confidence(ocr, logits, beam_width=args.beam_width)
+        text, conf = aggregate_track_predictions(preds)
+        strat_b[track_id] = (text, conf)
+    strategies["B: native+SR"] = strat_b
+
+    # Strategy C: OCR only (no SR), resize to OCR input size
+    print("  Running Strategy C: OCR only (no SR), resize to OCR-friendly size...")
+    strat_c = {}
+    for track_id, image_paths in test_tracks:
+        # OCR internally resizes to 68×124; feed larger images
+        tensors = [load_and_preprocess(p, lr_size=(68, 124)) for p in image_paths]
+        batch = torch.stack(tensors).to(device)
+        logits = ocr(batch, return_logits=True)
+        preds = predict_with_confidence(ocr, logits, beam_width=args.beam_width)
+        text, conf = aggregate_track_predictions(preds)
+        strat_c[track_id] = (text, conf)
+    strategies["C: OCR-only(68×124)"] = strat_c
+
+    # Strategy D: OCR only, native resolution
+    print("  Running Strategy D: OCR only, native resolution...")
+    strat_d = {}
+    for track_id, image_paths in test_tracks:
+        tensors = [load_and_preprocess(p, lr_size=None) for p in image_paths]
+        max_h = max(t.shape[1] for t in tensors)
+        max_w = max(t.shape[2] for t in tensors)
+        padded = [F.pad(t, (0, max_w - t.shape[2], 0, max_h - t.shape[1]), mode='reflect') for t in tensors]
+        batch = torch.stack(padded).to(device)
+        logits = ocr(batch, return_logits=True)
+        preds = predict_with_confidence(ocr, logits, beam_width=args.beam_width)
+        text, conf = aggregate_track_predictions(preds)
+        strat_d[track_id] = (text, conf)
+    strategies["D: OCR-only(native)"] = strat_d
+
+    # Strategy E: No format correction (raw beam search)
+    print("  Running Strategy E: SR + NO format correction...")
+    strat_e = {}
+    for track_id, image_paths in test_tracks:
+        tensors = [load_and_preprocess(p, lr_size=config_lr_size) for p in image_paths]
+        batch = torch.stack(tensors).to(device)
+        if generator is not None:
+            sr = generator(batch)
+        else:
+            sr = batch
+        logits = ocr(sr, return_logits=True)
+        # Greedy decode WITHOUT format correction
+        decoded_lists = ocr.model.ctc_decode_greedy(logits)
+        preds = []
+        for b in range(logits.shape[0]):
+            text = indices_to_text(decoded_lists[b], ocr)
+            preds.append((text, 1.0))
+        text, conf = aggregate_track_predictions(preds)
+        strat_e[track_id] = (text, conf)
+    strategies["E: SR+greedy(no fmt fix)"] = strat_e
+
+    # Print comparison table
+    print(f"\n  {'Track':<15}", end="")
+    for name in strategies:
+        print(f" | {name:<25}", end="")
+    print()
+    print("  " + "-" * (15 + 28 * len(strategies)))
+
+    for track_id, _ in test_tracks:
+        print(f"  {track_id:<15}", end="")
+        for name, strat in strategies.items():
+            text, conf = strat[track_id]
+            print(f" | {text:<18} ({conf:.2f})", end="")
+        print()
+
+    # Agreement analysis
+    print(f"\n  Strategy agreement:")
+    strat_names = list(strategies.keys())
+    for i, name_i in enumerate(strat_names):
+        for j, name_j in enumerate(strat_names):
+            if i >= j:
+                continue
+            agree = sum(
+                1 for tid, _ in test_tracks
+                if strategies[name_i][tid][0] == strategies[name_j][tid][0]
+            )
+            print(f"    {name_i} vs {name_j}: {agree}/{len(test_tracks)} agree")
+
+    # ═══════════════════════════════════════════════════════════════════
+    # TEST 3: Reproduce training validation (if --diagnose-val given)
+    # ═══════════════════════════════════════════════════════════════════
+    if args.diagnose_val:
+        print(f"\n{'='*60}")
+        print("TEST 3: Reproduce Training Validation Accuracy")
+        print(f"{'='*60}")
+
+        from src.data.lp_dataset import LicensePlateDataset
+        from torch.utils.data import DataLoader
+
+        val_dataset = LicensePlateDataset(
+            root_dir=args.diagnose_val,
+            image_size=tuple(config_lr_size),
+            augment=False,
+        )
+
+        if len(val_dataset) == 0:
+            print("  No validation data found!")
+        else:
+            val_loader = DataLoader(val_dataset, batch_size=8, shuffle=False, num_workers=0)
+
+            word_correct = 0
+            char_correct = 0
+            total_chars = 0
+            total_samples = 0
+            mismatches = []
+
+            for batch in tqdm(val_loader, desc="  Validating"):
+                lr_images = batch["lr"].to(device)
+                gt_texts = batch["plate_text"]
+
+                if generator is not None:
+                    sr_images = generator(lr_images)
+                else:
+                    sr_images = lr_images
+
+                logits = ocr(sr_images, return_logits=True)
+                preds = predict_with_confidence(ocr, logits, beam_width=args.beam_width)
+
+                for (pred_text, conf), gt in zip(preds, gt_texts):
+                    total_samples += 1
+                    if pred_text == gt:
+                        word_correct += 1
+                    else:
+                        if len(mismatches) < 20:
+                            mismatches.append((gt, pred_text, conf))
+
+                    for p, g in zip(pred_text, gt):
+                        if p == g:
+                            char_correct += 1
+                        total_chars += 1
+
+            word_acc = word_correct / total_samples if total_samples > 0 else 0
+            char_acc = char_correct / total_chars if total_chars > 0 else 0
+
+            # Load checkpoint to get stored accuracy
+            ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+            ckpt_word_acc = ckpt.get("best_word_acc", 0.0)
+
+            print(f"\n  Inference on training data:")
+            print(f"    Samples: {total_samples}")
+            print(f"    Word accuracy: {word_acc:.4f} (checkpoint says {ckpt_word_acc:.4f})")
+            print(f"    Char accuracy: {char_acc:.4f}")
+            print(f"    Match: {'YES ✓' if abs(word_acc - ckpt_word_acc) < 0.05 else 'NO ✗ — PIPELINE BUG!'}")
+
+            if mismatches:
+                print(f"\n  Sample mismatches (first 20):")
+                print(f"    {'Ground Truth':<12} {'Prediction':<12} {'Conf':>6}  Diff")
+                for gt, pred, conf in mismatches:
+                    diff = "".join(
+                        "^" if (i < len(pred) and i < len(gt) and pred[i] != gt[i]) else " "
+                        for i in range(max(len(pred), len(gt)))
+                    )
+                    print(f"    {gt:<12} {pred:<12} {conf:>6.3f}  {diff}")
+
+    print(f"\n{'='*60}")
+    print("DIAGNOSIS COMPLETE")
+    print(f"{'='*60}")
+
+
+@torch.no_grad()
 def run_inference(args):
     """Main inference pipeline."""
+    # ── Run diagnostics if requested ─────────────────────────────────
+    if args.diagnose:
+        return run_diagnose(args)
+
     # ── Setup ────────────────────────────────────────────────────────
     config = load_config(args.config)
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
