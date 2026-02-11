@@ -429,23 +429,14 @@ def train_ddp(rank, world_size, args, config):
     if is_main:
         trainer.set_text_logger(text_logger)
 
-    # Resume from checkpoint if specified (only rank 0 loads, then broadcast)
-    if args.resume and is_main:
-        print(f"\nResuming from {args.resume}")
+    # Resume from checkpoint if specified (ALL ranks must load for consistent state)
+    if args.resume:
+        if is_main:
+            print(f"\nResuming from {args.resume}")
         trainer.load_checkpoint(args.resume)
 
     # Synchronize all ranks before training
     dist.barrier()
-
-    # Broadcast trainer state from rank 0 to all ranks
-    # This ensures best_word_acc and global_epoch are consistent across all processes
-    if args.resume:
-        state = [0.0, 0]  # [best_word_acc, global_epoch]
-        if is_main:
-            state = [trainer.best_word_acc, trainer.global_epoch]
-        dist.broadcast_object_list(state, src=0)
-        trainer.best_word_acc = state[0]
-        trainer.global_epoch = state[1]
 
     # Run training
     if args.stage.lower() == "all":
