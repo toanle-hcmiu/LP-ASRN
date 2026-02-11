@@ -82,11 +82,13 @@ def send_ntfy(message: str, is_error: bool = False):
         return False
     try:
         import urllib.request
-        title = "❌ LP-ASRN CRASHED" if is_error else "✅ LP-ASRN Training"
+        title = "LP-ASRN CRASHED" if is_error else "LP-ASRN Training"
         priority = "urgent" if is_error else "default"
+        # Strip emojis/unicode for ASCII-safe encoding
+        clean_msg = message.encode("ascii", errors="ignore").decode("ascii")
         req = urllib.request.Request(
             f"https://ntfy.sh/{NTFY_TOPIC}",
-            data=message.encode("utf-8"),
+            data=clean_msg.encode("utf-8"),
             headers={
                 "Title": title,
                 "Priority": priority,
@@ -145,11 +147,11 @@ def notify(message: str, is_error: bool = False):
     full_msg = f"{prefix} {message}"
     print(f"[Monitor] {full_msg}")
 
-    # Clean message for plain-text channels (remove markdown)
+    # Clean message for plain-text channels (remove markdown and emojis)
     plain_msg = message.replace("**", "").replace("```", "").replace("`", "")
 
     sent = False
-    sent = send_ntfy(plain_msg, is_error=is_error) or sent
+    sent = send_ntfy(plain_msg, is_error=is_error) or sent  # ntfy strips emojis internally
     sent = send_discord(full_msg, color=0xFF0000 if is_error else 0x00FF00) or sent
     sent = send_telegram(full_msg) or sent
     sent = send_email(plain_msg, is_error=is_error) or sent
