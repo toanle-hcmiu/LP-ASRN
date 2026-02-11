@@ -1492,6 +1492,12 @@ class ProgressiveTrainer:
             # Learning rate scheduling
             self.scheduler.step()
 
+            # Periodic checkpoint save (every 25 epochs) to avoid losing progress
+            checkpoint_interval = self.config.get("training", {}).get("checkpoint_interval", 25)
+            if (epoch + 1) % checkpoint_interval == 0 and self.is_main:
+                self.save_checkpoint(epoch, stage, is_best=False)
+                self._log(f"Periodic checkpoint saved at epoch {epoch + 1}")
+
             # Periodic memory cleanup to prevent OOM in long stages (Stage 2: 300 epochs, Stage 3: 150 epochs)
             if epoch % 10 == 0:
                 torch.cuda.empty_cache()
@@ -1517,13 +1523,14 @@ class ProgressiveTrainer:
 
         return self.best_word_acc
 
-    def save_checkpoint(self, epoch: int, stage: TrainingStage, emergency: bool = False):
+    def save_checkpoint(self, epoch: int, stage: TrainingStage, emergency: bool = False, is_best: bool = True):
         """Save a checkpoint (main process only for DDP).
 
         Args:
             epoch: Current epoch number
             stage: Current training stage
             emergency: If True, save as emergency checkpoint with timestamp
+            is_best: If True, also save as best.pth. Set False for periodic saves.
         """
         if self.distributed and not self.is_main:
             return
@@ -1551,13 +1558,18 @@ class ProgressiveTrainer:
             save_path = self.save_dir / "emergency_latest.pth"
             torch.save(checkpoint, save_path)
         else:
-            # Regular checkpoint
+            # Regular checkpoint — always save epoch-specific file
             save_path = self.save_dir / f"stage_{stage.value}_epoch_{epoch}.pth"
             torch.save(checkpoint, save_path)
 
-            # Save best
-            save_path = self.save_dir / "best.pth"
-            torch.save(checkpoint, save_path)
+            # Also save as latest.pth for easy resume
+            latest_path = self.save_dir / "latest.pth"
+            torch.save(checkpoint, latest_path)
+
+            # Only overwrite best.pth when this is actually the best model
+            if is_best:
+                best_path = self.save_dir / "best.pth"
+                torch.save(checkpoint, best_path)
 
     def _unwrap_model(self, model):
         """Unwrap DDP or DataParallel wrapper to get the underlying model."""
