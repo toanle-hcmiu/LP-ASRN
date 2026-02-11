@@ -55,6 +55,14 @@ data:
   # Set to true when running stage0 (OCR pretraining) for better robustness
   ocr_pretrain_augmentation: true
 
+  # Aspect ratio augmentation: randomly varies crop aspect ratio during training
+  # to match test-time image distribution. Test images have H/W ratios of 0.29-0.40
+  # while training crops resized to lr_size have ratio 0.55. This augmentation
+  # pads images before resize to simulate the test distribution, teaching the
+  # generator+OCR to handle varied aspect ratios.
+  aspect_ratio_augment: true
+  test_aspect_range: [0.29, 0.40]  # Min/max H/W ratios observed in test-public
+
 training:
   # Number of training epochs
   epochs: 100

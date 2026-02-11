@@ -5,6 +5,7 @@ Supports both Brazilian and Mercosur layouts with paired LR/HR images.
 
 import os
 import json
+import random
 from pathlib import Path
 from typing import Optional, Tuple, List, Dict, Any, Callable
 
@@ -57,6 +58,8 @@ class LicensePlateDataset(Dataset):
         augment: bool = True,
         normalize: bool = True,
         ocr_pretrain_mode: bool = False,
+        aspect_ratio_augment: bool = False,
+        test_aspect_range: Tuple[float, float] = (0.29, 0.40),
     ):
         """
         Initialize the dataset.
@@ -70,6 +73,13 @@ class LicensePlateDataset(Dataset):
             augment: Whether to apply data augmentation
             normalize: Whether to normalize images to [-1, 1]
             ocr_pretrain_mode: If True, use OCR-specific augmentation for pretraining
+            aspect_ratio_augment: If True, randomly vary aspect ratio during training
+                to match test-time distribution (test images have different ratios
+                than training crops). This pads images before resize to simulate
+                different crop sizes.
+            test_aspect_range: (min_ratio, max_ratio) of test image aspect ratios (H/W).
+                Used to sample random target ratios during augmentation.
+                Default (0.29, 0.40) matches observed test-public distribution.
         """
         self.root_dir = Path(root_dir)
         self.scenarios = scenarios or ["Scenario-A", "Scenario-B"]
@@ -79,6 +89,8 @@ class LicensePlateDataset(Dataset):
         self.augment = augment
         self.normalize = normalize
         self.ocr_pretrain_mode = ocr_pretrain_mode
+        self.aspect_ratio_augment = aspect_ratio_augment
+        self.test_aspect_range = test_aspect_range
 
         # Load all samples
         self.samples = self._load_samples()
@@ -313,6 +325,75 @@ class LicensePlateDataset(Dataset):
         except (KeyError, IndexError):
             return image
 
+    def _apply_aspect_ratio_augment(self, image: Image.Image) -> Image.Image:
+        """
+        Randomly change the aspect ratio of a cropped plate image to simulate
+        the test-time distribution.
+
+        Test images have aspect ratios (H/W) of 0.29-0.40, while training crops
+        resized to 34×62 have ratio 0.55. This augmentation pads the image to a
+        random target ratio BEFORE the final resize, so the generator learns to
+        handle varied aspect ratios.
+
+        Applied with 50% probability to keep some training at the native ratio.
+
+        Args:
+            image: Cropped PIL image (before resize)
+
+        Returns:
+            Padded PIL image with randomized aspect ratio
+        """
+        if not self.aspect_ratio_augment or not self.augment:
+            return image
+
+        # Apply with 50% probability — keep some training at native ratio
+        if random.random() > 0.5:
+            return image
+
+        orig_w, orig_h = image.size
+        orig_ratio = orig_h / orig_w
+
+        # Sample a random target aspect ratio
+        # Blend between test range and training range for smooth distribution
+        min_ratio, max_ratio = self.test_aspect_range
+        if self.image_size is not None:
+            train_ratio = self.image_size[0] / self.image_size[1]
+        else:
+            train_ratio = orig_ratio
+
+        # 70% chance: sample from test range, 30% chance: between test and train
+        if random.random() < 0.7:
+            target_ratio = random.uniform(min_ratio, max_ratio)
+        else:
+            target_ratio = random.uniform(min(min_ratio, train_ratio),
+                                          max(max_ratio, train_ratio))
+
+        if abs(target_ratio - orig_ratio) < 0.02:
+            return image  # Already close enough
+
+        img_arr = np.array(image)
+
+        if target_ratio < orig_ratio:
+            # Target is wider — pad width (add columns on sides)
+            new_w = int(orig_h / target_ratio)
+            pad_total = new_w - orig_w
+            pad_left = pad_total // 2
+            pad_right = pad_total - pad_left
+            img_arr = np.pad(img_arr,
+                             ((0, 0), (pad_left, pad_right), (0, 0)),
+                             mode='edge')
+        else:
+            # Target is taller — pad height (add rows top/bottom)
+            new_h = int(orig_w * target_ratio)
+            pad_total = new_h - orig_h
+            pad_top = pad_total // 2
+            pad_bottom = pad_total - pad_top
+            img_arr = np.pad(img_arr,
+                             ((pad_top, pad_bottom), (0, 0), (0, 0)),
+                             mode='edge')
+
+        return Image.fromarray(img_arr)
+
     def _resize_image(
         self,
         image: Image.Image,
@@ -409,6 +490,21 @@ class LicensePlateDataset(Dataset):
         lr_image = self._crop_with_corners(lr_image, sample["lr_corners"])
         hr_image = self._crop_with_corners(hr_image, sample["hr_corners"])
 
+        # Aspect ratio augmentation: randomly pad to simulate test-time aspect ratios
+        # Applied BEFORE resize so the generator learns to handle varied ratios
+        # Must use same padding for both LR and HR to keep them aligned
+        if self.aspect_ratio_augment and self.augment:
+            # Save random state to apply identical padding to both LR and HR
+            rng_state = random.getstate()
+            np_rng_state = np.random.get_state()
+
+            lr_image = self._apply_aspect_ratio_augment(lr_image)
+
+            # Restore and re-apply for HR (same random decisions)
+            random.setstate(rng_state)
+            np.random.set_state(np_rng_state)
+            hr_image = self._apply_aspect_ratio_augment(hr_image)
+
         # Resize to target size
         lr_image = self._resize_image(lr_image, self.image_size)
         if self.image_size is not None:
@@ -465,6 +561,8 @@ def create_dataloaders(
     rank: int = 0,
     world_size: int = 1,
     ocr_pretrain_mode: bool = False,
+    aspect_ratio_augment: bool = False,
+    test_aspect_range: Tuple[float, float] = (0.29, 0.40),
 ) -> Tuple[DataLoader, DataLoader, Optional["DistributedSampler"]]:
     """
     Create train and validation dataloaders.
@@ -482,6 +580,8 @@ def create_dataloaders(
         rank: Rank of current process (for DDP)
         world_size: Total number of processes (for DDP)
         ocr_pretrain_mode: If True, use OCR-specific augmentation for pretraining
+        aspect_ratio_augment: If True, randomly vary aspect ratio to match test distribution
+        test_aspect_range: (min_ratio, max_ratio) of test image H/W ratios
 
     Returns:
         Tuple of (train_dataloader, val_dataloader, train_sampler)
@@ -495,6 +595,8 @@ def create_dataloaders(
         image_size=image_size,
         augment=False,  # We'll augment in the collate function or separately
         ocr_pretrain_mode=ocr_pretrain_mode,
+        aspect_ratio_augment=aspect_ratio_augment,
+        test_aspect_range=test_aspect_range,
     )
 
     # Split into train and validation

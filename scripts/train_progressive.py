@@ -324,6 +324,8 @@ def train_ddp(rank, world_size, args, config):
         rank=rank,
         world_size=world_size,
         ocr_pretrain_mode=config["data"].get("ocr_pretrain_augmentation", False),
+        aspect_ratio_augment=config["data"].get("aspect_ratio_augment", False),
+        test_aspect_range=tuple(config["data"].get("test_aspect_range", [0.29, 0.40])),
     )
 
     if is_main:
@@ -576,6 +578,8 @@ def main():
             image_size=tuple(config["data"].get("lr_size", [17, 31])),
             distributed=False,
             ocr_pretrain_mode=config["data"].get("ocr_pretrain_augmentation", False),
+            aspect_ratio_augment=config["data"].get("aspect_ratio_augment", False),
+            test_aspect_range=tuple(config["data"].get("test_aspect_range", [0.29, 0.40])),
         )
 
         print(f"Train samples: {len(train_loader.dataset)}")
