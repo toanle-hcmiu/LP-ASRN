@@ -4,12 +4,12 @@
 
 model:
   # Number of RRDB-EA blocks in the deep feature extractor
-  # Increased from 16 to 24 for more expressive power
-  num_rrdb_blocks: 24
+  # Balanced: 12 blocks for good capacity without being excessive (original: 24, papers: 16)
+  num_rrdb_blocks: 12
 
-  # Number of feature channels (INCREASED from 64 to 128 for better SR quality)
-  # This significantly increases model capacity to match OCR params
-  num_filters: 128
+  # Number of feature channels
+  # Reduced from 128 to 64 for lightweight model (4x parameter reduction)
+  num_filters: 64
 
   # Upscaling factor (2 for 2x, 4 for 4x)
   # Paper 2 uses 2x which achieved 49.8% recognition rate
@@ -23,7 +23,8 @@ model:
   dcnv4_groups: 4             # Number of groups for DCNv4
 
   # Phase 3: Multi-Scale Character Attention
-  use_character_attention: true  # Enable multi-scale character attention module
+  # DISABLED for lightweight model - saves computation and params
+  use_character_attention: false  # Disabled for speed (not needed for fixed-format plates)
   msca_scales: [1.0, 0.5, 0.25]  # Scales for multi-scale processing
   msca_num_prototypes: 36          # Number of character prototypes
 
@@ -42,7 +43,7 @@ data:
   # Increased from 17x31 to 34x62 (2x) for better OCR - each character now ~10-12 pixels instead of ~5-6
   lr_size: [34, 62]
 
-  # Batch size for training (64 per GPU, effective 128 with 2x A100)
+  # Batch size for training (64 fits comfortably with lightweight model)
   batch_size: 64
 
   # Number of data loading workers (reduced for DDP stability)
@@ -114,8 +115,9 @@ loss:
   lambda_ssim: 0.2
 
   # Phase 1: Embedding Consistency Loss (LCOFL-EC)
-  lambda_embed: 0.0           # Initial embedding loss weight (will be warmed up)
-  embed_target_weight: 0.3    # Target weight after warm-up
+  # DISABLED for lightweight model - saves ResNet-18 backbone (~11M params)
+  lambda_embed: 0.0           # Disabled for lightweight model
+  embed_target_weight: 0.0    # Disabled for lightweight model
   embed_warmup_epochs: 50     # Epochs for warm-up
   embedding_dim: 128          # Embedding dimension
   embed_margin: 2.0           # Contrastive loss margin
@@ -162,6 +164,11 @@ ocr:
   # 0.0 = disabled, 0.3 = recommended, 0.5 = strong
   rnn_dropout: 0.3  # Balanced dropout for OCR pretraining
 
+  # OCR model size configuration (lightweight settings)
+  backbone_channels: 256      # Backbone final channels (256=lightweight, 384=full)
+  lstm_hidden_size: 256       # LSTM hidden size (256=lightweight, 384=full)
+  lstm_num_layers: 1          # LSTM layers (1=lightweight, 2=full)
+
 # Progressive Training Configuration
 progressive_training:
   enabled: true
@@ -181,7 +188,7 @@ progressive_training:
   # Purpose: Stabilize network before introducing complex losses
   stage1:
     name: "warmup"
-    epochs: 50    # Increased: More warm-up for stability
+    epochs: 30    # Reduced - lightweight model converges faster
     lr: 0.0001
     loss_components: ["l1"]
     freeze_ocr: true
@@ -191,7 +198,7 @@ progressive_training:
   # Purpose: Optimize for character recognition with frozen OCR
   stage2:
     name: "lcofl"
-    epochs: 300   # Increased: model was still improving at epoch 60+
+    epochs: 200   # Reduced - smaller model needs less training
     lr: 0.0002   # Increased for faster convergence
     loss_components: ["l1", "lcofl"]
     freeze_ocr: true
@@ -201,7 +208,7 @@ progressive_training:
   # Purpose: Refine with unfrozen OCR for co-adaptation
   stage3:
     name: "finetune"
-    epochs: 150   # Increased: joint training needs more time
+    epochs: 100   # Reduced for lightweight model
     lr: 0.00001   # Lower LR for joint training
     loss_components: ["l1", "lcofl"]
     freeze_ocr: false
@@ -213,7 +220,7 @@ progressive_training:
     name: "hard_mining"
     epochs: 50    # Additional epochs focusing on hard examples
     lr: 0.000005  # Lower LR for fine-tuning on hard examples
-    loss_components: ["l1", "lcofl", "embedding"]
+    loss_components: ["l1", "lcofl"]  # No embedding loss for lightweight
     freeze_ocr: true
     update_confusion: true
     hard_mining:

@@ -359,6 +359,9 @@ def train_ddp(rank, world_size, args, config):
         max_length=ocr_config.get("max_length", 7),
         rnn_dropout=ocr_config.get("rnn_dropout", 0.3),
         use_parseq=ocr_config.get("use_pretrained", False),  # Use external pretrained model
+        backbone_channels=ocr_config.get("backbone_channels", 256),
+        lstm_hidden_size=ocr_config.get("lstm_hidden_size", 256),
+        lstm_num_layers=ocr_config.get("lstm_num_layers", 1),
     )
 
     # Load fine-tuned OCR if available (all ranks need this)
@@ -598,6 +601,9 @@ def main():
             max_length=ocr_config.get("max_length", 7),
             rnn_dropout=ocr_config.get("rnn_dropout", 0.3),
             use_parseq=ocr_config.get("use_pretrained", False),  # Use external pretrained model
+            backbone_channels=ocr_config.get("backbone_channels", 256),
+            lstm_hidden_size=ocr_config.get("lstm_hidden_size", 256),
+            lstm_num_layers=ocr_config.get("lstm_num_layers", 1),
         )
 
         # Load fine-tuned OCR if available

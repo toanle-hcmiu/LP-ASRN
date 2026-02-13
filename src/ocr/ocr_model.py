@@ -304,6 +304,9 @@ class OCRModel(nn.Module):
         frozen: bool = True,
         rnn_dropout: float = 0.3,
         use_parseq: bool = True,  # New flag to choose model
+        backbone_channels: int = 256,  # OCR backbone channels (256=lightweight, 384=full)
+        lstm_hidden_size: int = 256,  # LSTM hidden size (256=lightweight, 384=full)
+        lstm_num_layers: int = 1,  # LSTM layers (1=lightweight, 2=full)
     ):
         """
         Initialize OCR Model.
@@ -315,6 +318,9 @@ class OCRModel(nn.Module):
             frozen: If True, freeze weights during SR training
             rnn_dropout: Dropout rate for RNN layer in SimpleCRNN
             use_parseq: If True, use real Parseq model; if False, use SimpleCRNN
+            backbone_channels: Final backbone feature channels (256=lightweight, 384=full)
+            lstm_hidden_size: LSTM hidden size (256=lightweight, 384=full)
+            lstm_num_layers: Number of LSTM layers (1=lightweight, 2=full)
         """
         super().__init__()
 
@@ -338,26 +344,29 @@ class OCRModel(nn.Module):
             except Exception as e:
                 print(f"Failed to load Parseq: {e}")
                 print("Falling back to SimpleCRNN...")
-                self._init_simple_crnn(vocab, max_length, rnn_dropout)
+                self._init_simple_crnn(vocab, max_length, rnn_dropout, backbone_channels, lstm_hidden_size, lstm_num_layers)
         else:
-            self._init_simple_crnn(vocab, max_length, rnn_dropout)
+            self._init_simple_crnn(vocab, max_length, rnn_dropout, backbone_channels, lstm_hidden_size, lstm_num_layers)
 
         # Freeze weights if specified
         if frozen:
             for param in self.parameters():
                 param.requires_grad = False
 
-    def _init_simple_crnn(self, vocab: str, max_length: int, rnn_dropout: float):
+    def _init_simple_crnn(self, vocab: str, max_length: int, rnn_dropout: float, backbone_channels: int = 256, lstm_hidden_size: int = 256, lstm_num_layers: int = 1):
         """Initialize SimpleCRNN as fallback."""
         self.model = SimpleCRNN(
             vocab_size=len(vocab),
             max_length=max_length,
             use_ctc=True,
             rnn_dropout=rnn_dropout,
+            backbone_channels=backbone_channels,
+            lstm_hidden_size=lstm_hidden_size,
+            lstm_num_layers=lstm_num_layers,
         )
         self.use_parseq = False
         self.blank_idx = len(vocab)
-        print("Using SimpleCRNN model with CTC decoding for license plate recognition")
+        print(f"Using SimpleCRNN model (backbone={backbone_channels}, LSTM={lstm_hidden_size}x{lstm_num_layers}) with CTC decoding")
         self.tokenizer = ParseqTokenizer(vocab, max_length, use_parseq_vocab=False)
 
     def _replace_parseq_head(self, vocab: str):
@@ -1060,6 +1069,9 @@ class SimpleCRNN(nn.Module):
         max_length: int = 7,
         use_ctc: bool = True,
         rnn_dropout: float = 0.3,
+        backbone_channels: int = 256,  # Final backbone channels (default 256 for lightweight)
+        lstm_hidden_size: int = 256,  # LSTM hidden size (default 256 for lightweight)
+        lstm_num_layers: int = 1,  # LSTM layers (default 1 for lightweight)
     ):
         """
         Initialize SimpleCRNN.
@@ -1069,6 +1081,9 @@ class SimpleCRNN(nn.Module):
             max_length: Maximum sequence length
             use_ctc: If True, use CTC decoding (adds blank token to vocab)
             rnn_dropout: Dropout rate after RNN layer (0.0 = disabled, 0.3 = recommended)
+            backbone_channels: Final backbone feature channels (256=lightweight, 384=full)
+            lstm_hidden_size: LSTM hidden size (256=lightweight, 384=full)
+            lstm_num_layers: Number of LSTM layers (1=lightweight, 2=full)
         """
         super().__init__()
 
@@ -1091,45 +1106,65 @@ class SimpleCRNN(nn.Module):
             num_fiducial=20,
         )
 
-        # 2. CNN backbone with SE attention (balanced capacity for ~20M params)
-        self.backbone = nn.Sequential(
-            # Block 1: 3 -> 64
-            ConvBNReLU(3, 64, 3),
-            SEBlock(64),
-            nn.MaxPool2d(2, 2),
-            # Block 2: 64 -> 128
-            ResidualBlock(64, 128),
-            SEBlock(128),
-            nn.MaxPool2d(2, 2),
-            # Block 3: 128 -> 256
-            ResidualBlock(128, 256),
-            ResidualBlock(256, 256),
-            SEBlock(256),
-            nn.MaxPool2d((2, 1), (2, 1)),  # Preserve width
-            # Block 4: 256 -> 384 (reduced from 512/768)
-            ResidualBlock(256, 384),
-            ResidualBlock(384, 384),
-            SEBlock(384),
-            nn.MaxPool2d((2, 1), (2, 1)),  # Preserve width
-        )
+        # 2. CNN backbone with SE attention (configurable capacity)
+        if backbone_channels == 256:
+            # Lightweight: 3 -> 64 -> 128 -> 256
+            self.backbone = nn.Sequential(
+                # Block 1: 3 -> 64
+                ConvBNReLU(3, 64, 3),
+                SEBlock(64),
+                nn.MaxPool2d(2, 2),
+                # Block 2: 64 -> 128
+                ResidualBlock(64, 128),
+                SEBlock(128),
+                nn.MaxPool2d(2, 2),
+                # Block 3: 128 -> 256
+                ResidualBlock(128, 256),
+                ResidualBlock(256, 256),
+                SEBlock(256),
+                nn.MaxPool2d((2, 1), (2, 1)),  # Preserve width
+            )
+        elif backbone_channels == 384:
+            # Full: 3 -> 64 -> 128 -> 256 -> 384
+            self.backbone = nn.Sequential(
+                # Block 1: 3 -> 64
+                ConvBNReLU(3, 64, 3),
+                SEBlock(64),
+                nn.MaxPool2d(2, 2),
+                # Block 2: 64 -> 128
+                ResidualBlock(64, 128),
+                SEBlock(128),
+                nn.MaxPool2d(2, 2),
+                # Block 3: 128 -> 256
+                ResidualBlock(128, 256),
+                ResidualBlock(256, 256),
+                SEBlock(256),
+                nn.MaxPool2d((2, 1), (2, 1)),  # Preserve width
+                # Block 4: 256 -> 384
+                ResidualBlock(256, 384),
+                ResidualBlock(384, 384),
+                SEBlock(384),
+                nn.MaxPool2d((2, 1), (2, 1)),  # Preserve width
+            )
+        else:
+            raise ValueError(f"backbone_channels must be 256 or 384, got {backbone_channels}")
 
         # Layer normalization before LSTM (stabilizes training)
-        self.layer_norm = nn.LayerNorm(384)
+        self.layer_norm = nn.LayerNorm(backbone_channels)
 
-        # 3. Sequence modeling with BiLSTM (balanced capacity)
-        # 2 layers with 384 hidden size
+        # 3. Sequence modeling with BiLSTM (configurable capacity)
         self.rnn = nn.LSTM(
-            input_size=384,
-            hidden_size=384,
-            num_layers=2,
+            input_size=backbone_channels,
+            hidden_size=lstm_hidden_size,
+            num_layers=lstm_num_layers,
             batch_first=True,
             bidirectional=True,
-            dropout=0.3,
+            dropout=0.3 if lstm_num_layers > 1 else 0.0,
         )
 
         # 4. Output projection (removed MHSA - redundant for short plate sequences)
-        # Input size is hidden_size * 2 for bidirectional LSTM (384 * 2 = 768)
-        self.fc = nn.Linear(768, self.output_size)
+        # Input size is hidden_size * 2 for bidirectional LSTM
+        self.fc = nn.Linear(lstm_hidden_size * 2, self.output_size)
 
     def forward(self, x: torch.Tensor, return_logits: bool = True) -> torch.Tensor:
         """
