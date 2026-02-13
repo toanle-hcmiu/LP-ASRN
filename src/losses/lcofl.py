@@ -127,22 +127,24 @@ class ClassificationLoss(nn.Module):
 
         Args:
             pred_logits: OCR predictions of shape (B, K, C) where K is max length,
-                        C is vocab size. Should be log probabilities.
+                        C is vocab size (may include CTC blank token).
             gt_texts: Ground truth texts
 
         Returns:
             Loss tensor and info dict
         """
         B, K, C = pred_logits.shape
+        num_vocab = len(self.char_to_idx)  # 36
 
-        # Check if vocab size matches (e.g., external pretrained model outputs 94 chars, but our vocab is 36)
-        if C != len(self.char_to_idx):
-            # Vocab size mismatch - skip classification loss and rely on CTC loss only
-            # Fixed: The previous implementation used predicted indices instead of ground truth,
-            # creating a self-reinforcing loss that rewarded confidence in wrong predictions.
-            # Proper cross-entropy with vocab mapping would require complex character mapping.
-            # For now, we skip this loss component and rely on CTC loss for training.
-            zero_loss = torch.tensor(0.0, device=pred_logits.device, requires_grad=False)
+        # Handle CTC models where C = vocab + 1 (blank token at index 36)
+        # Slice off the blank token column so we have (B, K, 36) matching our vocab
+        if C == num_vocab + 1:
+            # CTC model: last column is blank token — remove it
+            pred_logits = pred_logits[:, :, :num_vocab]
+            C = num_vocab
+        elif C > num_vocab + 1:
+            # Large vocab mismatch (e.g., Parseq with 94 chars) — can't map reliably
+            zero_loss = torch.tensor(0.0, device=pred_logits.device, requires_grad=True)
             return zero_loss, {
                 "classification_loss": zero_loss,
                 "vocab_mismatch": True,
@@ -150,28 +152,23 @@ class ClassificationLoss(nn.Module):
             }
 
         # Encode ground truth texts
-        targets = []
-        for text in gt_texts:
-            encoded = torch.zeros(K, dtype=torch.long)
+        # Use -100 as ignore index (PyTorch cross_entropy convention)
+        targets = torch.full((B, K), -100, dtype=torch.long)
+        for b, text in enumerate(gt_texts):
             for i, char in enumerate(text):
                 if i >= K:
                     break
                 if char in self.char_to_idx:
-                    encoded[i] = self.char_to_idx[char]
-                else:
-                    # Use padding index for unknown characters
-                    encoded[i] = C - 1  # Last index as padding
-            targets.append(encoded)
+                    targets[b, i] = self.char_to_idx[char]
 
-        targets = torch.stack(targets).to(pred_logits.device)  # (B, K)
+        targets = targets.to(pred_logits.device)  # (B, K)
 
         # Reshape for cross-entropy
         pred_logits_flat = pred_logits.reshape(-1, C)  # (B*K, C)
         targets_flat = targets.reshape(-1)  # (B*K,)
 
-        # Compute weighted cross-entropy
-        # Filter out padding (index C-1 when char not in vocab)
-        mask = targets_flat < C - 1
+        # Compute weighted cross-entropy (ignore_index=-100 skips padding positions)
+        mask = targets_flat != -100
         if mask.sum() > 0:
             loss = F.cross_entropy(
                 pred_logits_flat[mask],
@@ -180,85 +177,117 @@ class ClassificationLoss(nn.Module):
                 reduction="mean",
             )
         else:
-            loss = torch.tensor(0.0, device=pred_logits.device)
+            loss = torch.tensor(0.0, device=pred_logits.device, requires_grad=True)
 
         return loss, {"classification_loss": loss}
 
 
 class LayoutPenalty(nn.Module):
     """
-    LP Layout Penalty component of LCOFL.
+    LP Layout Penalty component of LCOFL (differentiable version).
 
     Penalizes when digits are reconstructed as letters or vice versa,
     violating the expected license plate layout pattern.
 
-    Formula: L_P = Σ [D(pred_i) * A(GT_i) + A(pred_i) * D(GT_i)]
-    where D(c) = β if digit, A(c) = β if letter
+    Uses OCR logits directly to compute a differentiable penalty:
+    - At digit positions in GT: penalize probability mass on letter classes
+    - At letter positions in GT: penalize probability mass on digit classes
+
+    This allows gradients to flow back through the OCR to the generator.
     """
 
-    def __init__(self, beta: float = 1.0):
+    # Indices of digit characters (0-9) and letter characters (A-Z) in vocab
+    DIGITS = "0123456789"
+    LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+    def __init__(
+        self,
+        beta: float = 1.0,
+        vocab: str = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+    ):
         """
         Initialize Layout Penalty.
 
         Args:
-            beta: Penalty value for each layout violation
+            beta: Penalty weight
+            vocab: Character vocabulary (must match OCR vocab order)
         """
         super().__init__()
         self.beta = beta
+        self.vocab = vocab
 
-    def is_digit(self, char: str) -> bool:
-        """Check if character is a digit."""
-        return char.isdigit()
+        # Pre-compute digit and letter index masks
+        digit_indices = [i for i, c in enumerate(vocab) if c in self.DIGITS]
+        letter_indices = [i for i, c in enumerate(vocab) if c in self.LETTERS]
 
-    def is_letter(self, char: str) -> bool:
-        """Check if character is a letter."""
-        return char.isalpha()
+        # Store as buffers (move to device with model)
+        self.register_buffer("digit_mask", torch.zeros(len(vocab)))
+        self.register_buffer("letter_mask", torch.zeros(len(vocab)))
+        self.digit_mask[digit_indices] = 1.0
+        self.letter_mask[letter_indices] = 1.0
 
     def forward(
-        self, pred_texts: List[str], gt_texts: List[str], device: torch.device = torch.device("cpu")
+        self,
+        pred_logits: torch.Tensor,
+        gt_texts: List[str],
+        device: torch.device = torch.device("cpu"),
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """
-        Compute layout penalty.
+        Compute differentiable layout penalty using OCR logits.
 
         Args:
-            pred_texts: List of predicted texts
-            gt_texts: List of ground truth texts
-            device: Device to create the penalty tensor on
+            pred_logits: OCR logits of shape (B, K, C) — raw or softmaxed
+            gt_texts: Ground truth texts
+            device: Device for tensors
 
         Returns:
-            Penalty tensor and info dict
+            Penalty tensor (differentiable) and info dict
         """
-        total_penalty = 0.0
+        B, K, C = pred_logits.shape
+
+        # Handle CTC blank token (C = vocab + 1): slice it off
+        vocab_size = len(self.vocab)
+        if C > vocab_size:
+            pred_logits = pred_logits[:, :, :vocab_size]
+            C = vocab_size
+
+        # Softmax to get probabilities
+        probs = F.softmax(pred_logits, dim=-1)  # (B, K, C)
+
+        # Move masks to correct device
+        digit_mask = self.digit_mask.to(device)   # (C,)
+        letter_mask = self.letter_mask.to(device)  # (C,)
+
+        total_penalty = torch.tensor(0.0, device=device)
         total_violations = 0
         total_chars = 0
 
-        for pred_text, gt_text in zip(pred_texts, gt_texts):
-            min_len = min(len(pred_text), len(gt_text))
-            for i in range(min_len):
-                pred_char = pred_text[i]
-                gt_char = gt_text[i]
-
+        for b in range(B):
+            gt = gt_texts[b]
+            for k in range(min(K, len(gt))):
+                gt_char = gt[k]
                 total_chars += 1
 
-                # Check if pred is digit but GT is letter
-                if self.is_digit(pred_char) and self.is_letter(gt_char):
-                    total_penalty += self.beta
-                    total_violations += 1
+                # Probability the model assigns to WRONG character type
+                if gt_char in self.DIGITS:
+                    # GT is digit → penalize probability on letter classes
+                    wrong_prob = (probs[b, k] * letter_mask).sum()
+                    total_penalty = total_penalty + wrong_prob
+                    if wrong_prob.item() > 0.5:
+                        total_violations += 1
+                elif gt_char in self.LETTERS:
+                    # GT is letter → penalize probability on digit classes
+                    wrong_prob = (probs[b, k] * digit_mask).sum()
+                    total_penalty = total_penalty + wrong_prob
+                    if wrong_prob.item() > 0.5:
+                        total_violations += 1
 
-                # Check if pred is letter but GT is digit
-                elif self.is_letter(pred_char) and self.is_digit(gt_char):
-                    total_penalty += self.beta
-                    total_violations += 1
+        # Average over batch
+        if B > 0:
+            total_penalty = self.beta * total_penalty / B
 
-        # Average over batch - create tensor on specified device
-        penalty = torch.tensor(
-            total_penalty / len(pred_texts) if pred_texts else 0.0,
-            dtype=torch.float32,
-            device=device,
-        )
-
-        return penalty, {
-            "layout_penalty": penalty,
+        return total_penalty, {
+            "layout_penalty": total_penalty.detach(),
             "layout_violations": total_violations,
             "total_chars": total_chars,
         }
@@ -313,7 +342,7 @@ class LCOFL(nn.Module):
         self.embedding_dim = embedding_dim
 
         self.classification_loss = ClassificationLoss(vocab, alpha, beta)
-        self.layout_penalty = LayoutPenalty(beta)
+        self.layout_penalty = LayoutPenalty(beta, vocab=vocab)
 
         # Initialize embedding loss components if enabled
         if lambda_embed > 0 or embedding_dim > 0:
@@ -419,9 +448,9 @@ class LCOFL(nn.Module):
         losses.append(cls_loss)
         info.update(cls_info)
 
-        # Layout Penalty (requires decoded predictions)
-        if pred_texts is not None:
-            layout_loss, layout_info = self.layout_penalty(pred_texts, gt_texts, device=sr_images.device)
+        # Layout Penalty (differentiable — uses logits, not decoded texts)
+        if self.lambda_layout > 0:
+            layout_loss, layout_info = self.layout_penalty(pred_logits, gt_texts, device=sr_images.device)
             weighted_layout = self.lambda_layout * layout_loss
             losses.append(weighted_layout)
             info.update(layout_info)
@@ -509,9 +538,9 @@ if __name__ == "__main__":
     loss, info = cls_loss(pred_logits, gt_texts)
     print(f"Classification Loss: {loss.item():.4f}")
 
-    # Test Layout Penalty
+    # Test Layout Penalty (now uses logits, not decoded texts)
     layout_penalty = LayoutPenalty()
-    penalty, info = layout_penalty(pred_texts, gt_texts)
+    penalty, info = layout_penalty(pred_logits, gt_texts)
     print(f"Layout Penalty: {penalty.item():.4f}")
 
     # Test LCOFL

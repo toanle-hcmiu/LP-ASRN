@@ -333,24 +333,25 @@ class EnhancedAttentionModule(nn.Module):
         """
         identity = x
 
-        # Channel Attention
+        # Channel Attention: (B, C, 1, 1) — "what" channels matter
         ca_out = self.channel_attention(x)
 
-        # Positional Unit with deformable conv
+        # Positional Unit: (B, C, H, W) — "where" spatially to focus
         pos_out = self.pos_conv(x)
 
-        # Geometrical Perception
+        # Geometrical Perception: (B, C, 1, 1) — structural priors
         gp_out = self.geometrical_attention(x)
 
-        # Combine all three attention mechanisms
-        # Element-wise sum and multiplication
-        combined = ca_out * pos_out
-        combined = combined + gp_out  # Broadcast GP from (B, C, 1, 1)
+        # Combine: apply channel+geometric gating to spatial features
+        # ca_out * gp_out → (B, C, 1, 1): combined channel+structure weight
+        # Then scale the spatial features by this weight
+        channel_gate = ca_out * gp_out  # (B, C, 1, 1)
+        combined = pos_out * channel_gate  # (B, C, H, W) — properly gated spatial features
 
         # Final processing
         attention_mask = self.sigmoid(self.final_conv(combined))
 
-        # Apply attention to input
+        # Apply attention to input (residual)
         output = identity * attention_mask + identity
 
         return output

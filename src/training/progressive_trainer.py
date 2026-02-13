@@ -424,13 +424,29 @@ class ProgressiveTrainer:
             loss = l1
 
             if "lcofl" in stage_config.loss_components:
-                # Get OCR predictions
+                # Get OCR logits (single forward pass — predict() is not needed)
                 with torch.no_grad():
                     pred_logits = self.ocr(sr_images, return_logits=True)
-                    ocr_unwrapped = self._unwrap_model(self.ocr)
-                    pred_texts = ocr_unwrapped.predict(sr_images)
 
-                # Compute LCOFL
+                # Decode texts from logits for confusion tracking (no extra forward pass)
+                ocr_unwrapped = self._unwrap_model(self.ocr)
+                with torch.no_grad():
+                    if hasattr(ocr_unwrapped.model, 'use_ctc') and ocr_unwrapped.model.use_ctc:
+                        decoded_lists = ocr_unwrapped.model.ctc_decode_greedy(pred_logits)
+                        pred_texts = []
+                        for indices in decoded_lists:
+                            text = ""
+                            for idx in indices:
+                                if 0 <= idx < ocr_unwrapped.blank_idx:
+                                    char = ocr_unwrapped.tokenizer.idx_to_char.get(idx, "")
+                                    if char in ocr_unwrapped.tokenizer.vocab:
+                                        text += char
+                            pred_texts.append(text)
+                    else:
+                        pred_indices = pred_logits.argmax(dim=-1)
+                        pred_texts = ocr_unwrapped.tokenizer.decode_batch(pred_indices)
+
+                # Compute LCOFL (layout penalty now uses logits directly)
                 lcofl, lcofl_info = self.lcofl_loss(
                     sr_images, hr_images, pred_logits, gt_texts, pred_texts
                 )

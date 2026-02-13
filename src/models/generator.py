@@ -489,8 +489,14 @@ class Generator(nn.Module):
         skip = self.skip_upscale(input_lr)
         output = output + self.skip_weight * skip
 
-        # Clamp to valid range
-        output = torch.clamp(output, -1.0, 1.0)
+        # Soft clamp to valid range using tanh (preserves gradients at boundaries)
+        # tanh naturally maps to [-1, 1] without killing gradients like hard clamp
+        # Only apply when values exceed range to avoid distorting well-behaved outputs
+        output = torch.where(
+            output.abs() > 1.0,
+            torch.tanh(output),
+            output,
+        )
 
         return output
 
