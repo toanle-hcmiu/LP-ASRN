@@ -1398,12 +1398,32 @@ class ProgressiveTrainer:
         if hasattr(self, '_checkpoint_state') and 'stage' in self._checkpoint_state:
             checkpoint_stage = self._checkpoint_state.get('stage', '')
             if checkpoint_stage == stage.value:
-                # Same stage - continue from saved epoch (checkpoint stores stage-specific epoch)
-                stage_start_epoch = self.global_epoch
+                # Same stage - continue from saved epoch
+                checkpoint_epoch = self._checkpoint_state.get('epoch', 0)
+                stage_start_epoch = checkpoint_epoch + 1  # Resume from NEXT epoch
+
+                # If checkpoint epoch >= config.epochs, the stage was already done.
+                # When user passes e.g. --lcofl-epochs 100 to extend, interpret
+                # config.epochs as ADDITIONAL epochs beyond the checkpoint.
+                if stage_start_epoch >= config.epochs:
+                    if self.is_main:
+                        self._log(f"Checkpoint at epoch {checkpoint_epoch} >= configured {config.epochs} epochs. "
+                                  f"Interpreting as {config.epochs} ADDITIONAL epochs.")
+                    config = StageConfig(
+                        name=config.name,
+                        epochs=stage_start_epoch + config.epochs,
+                        lr=config.lr,
+                        loss_components=config.loss_components,
+                        freeze_ocr=config.freeze_ocr,
+                        update_confusion=config.update_confusion,
+                    )
             else:
                 # Different stage - start from 0
                 stage_start_epoch = 0
                 self.global_epoch = 0  # Reset for new stage
+
+        if self.is_main:
+            self._log(f"Starting from epoch {stage_start_epoch}, running to epoch {config.epochs}")
 
         for epoch in range(stage_start_epoch, config.epochs):
             # epoch is stage-specific (0 to config.epochs-1)
@@ -1519,7 +1539,7 @@ class ProgressiveTrainer:
                 metric_name="word_acc"
             )
 
-        self.global_epoch = start_epoch + config.epochs
+        self.global_epoch = config.epochs
 
         return self.best_word_acc
 
