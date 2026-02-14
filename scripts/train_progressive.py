@@ -535,8 +535,11 @@ def main():
         )
     else:
         # Single GPU training (original code path)
-        # Determine device
-        device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+        # Use the specified GPU ID from --gpus argument
+        gpu_id = gpu_ids[0]
+        device = torch.device(f"cuda:{gpu_id}" if torch.cuda.is_available() else "cpu")
+        if torch.cuda.is_available():
+            torch.cuda.set_device(int(gpu_id))
         print(f"Using device: {device}")
 
         # Enable CuDNN autotuner for A100 optimization

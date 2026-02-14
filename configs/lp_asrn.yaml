@@ -95,6 +95,10 @@ training:
   # Stops after 30 epochs without improvement (increased for 98% target)
   early_stop_patience: 30
 
+  # Validation settings
+  val_interval: 2         # Validate every N epochs
+  val_beam_width: 3       # Beam width for OCR during validation (3 = good balance of speed/accuracy)
+
   # Monitor metric for early stopping
   # "recognition_rate" monitors OCR accuracy (Paper 2 innovation)
   # "loss" monitors total loss
