@@ -528,7 +528,11 @@ class ProgressiveTrainer:
                 "gt_texts": [],
             }
 
-        self.generator.eval()
+        # IMPORTANT: Use unwrapped models for validation to avoid DDP deadlock.
+        # In DDP, only rank 0 runs validation. If we use self.generator (DDP-wrapped),
+        # it triggers NCCL allreduce that rank 1 never participates in → deadlock.
+        gen_unwrapped = self._unwrap_model(self.generator)
+        gen_unwrapped.eval()
         self.ocr.eval()  # Critical: ensure batch norm uses eval statistics
 
         total_psnr = 0.0
@@ -548,8 +552,8 @@ class ProgressiveTrainer:
                 hr_images = batch["hr"].to(self.device)
                 gt_texts = batch["plate_text"]
 
-                # Forward pass
-                sr_images = self.generator(lr_images)
+                # Forward pass (unwrapped to avoid DDP collective ops)
+                sr_images = gen_unwrapped(lr_images)
 
                 # OCR predictions (ONCE per batch - use configurable beam width)
                 ocr_unwrapped = self._unwrap_model(self.ocr)
@@ -597,7 +601,7 @@ class ProgressiveTrainer:
         char_acc = char_correct / total_chars if total_chars > 0 else 0
 
         # Restore training mode
-        self.generator.train()
+        gen_unwrapped.train()
         self.ocr.train()
 
         return {
