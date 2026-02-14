@@ -621,6 +621,10 @@ def main():
         text_logger.log_model_summary("OCR", ocr)
         text_logger.log_training_config(config)
 
+        # Move models to device
+        generator = generator.to(device)
+        ocr = ocr.to(device)
+
         # Create trainer
         trainer = ProgressiveTrainer(
             generator=generator,
