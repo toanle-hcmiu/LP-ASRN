@@ -452,9 +452,10 @@ class Generator(nn.Module):
             mode='bilinear',
             align_corners=False,
         )
-        # Learnable skip weight (initialized to 0.1 for minimal initial impact)
-        # This allows the model to learn how much to rely on the skip connection
-        self.skip_weight = nn.Parameter(torch.tensor(0.1))
+        # Learnable skip weight (initialized to 0.5 for a strong baseline)
+        # At 0.5, the model starts close to bilinear upscale and learns residuals.
+        # This provides a better starting point than 0.1 which barely uses the skip.
+        self.skip_weight = nn.Parameter(torch.tensor(0.5))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """

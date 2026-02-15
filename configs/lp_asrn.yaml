@@ -118,6 +118,10 @@ loss:
   # Weight for SSIM loss (from Paper 2)
   lambda_ssim: 0.2
 
+  # Weight for VGG perceptual loss (sharper textures)
+  # Active during LCOFL and finetune stages
+  lambda_perceptual: 0.1
+
   # Phase 1: Embedding Consistency Loss (LCOFL-EC)
   # DISABLED for lightweight model - saves ResNet-18 backbone (~11M params)
   lambda_embed: 0.0           # Disabled for lightweight model

@@ -481,6 +481,19 @@ class LCOFL(nn.Module):
         return total_loss, info
 
 
+def _gaussian_window(window_size: int, sigma: float, channels: int = 1, device: torch.device = None) -> torch.Tensor:
+    """Create a Gaussian window for SSIM computation (Wang et al. 2004)."""
+    coords = torch.arange(window_size, dtype=torch.float32, device=device) - window_size // 2
+    g = torch.exp(-(coords ** 2) / (2 * sigma ** 2))
+    g = g / g.sum()
+    # Create 2D kernel
+    window = g.unsqueeze(1) * g.unsqueeze(0)
+    window = window.unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
+    # Expand to all channels
+    window = window.expand(channels, 1, window_size, window_size).contiguous()
+    return window
+
+
 def ssim(
     x: torch.Tensor,
     y: torch.Tensor,
@@ -490,6 +503,9 @@ def ssim(
 ) -> torch.Tensor:
     """
     Compute Structural Similarity Index (SSIM) between two tensors.
+
+    Uses a proper Gaussian window (Wang et al. 2004) instead of simple
+    average pooling for more accurate local statistics estimation.
 
     Args:
         x: First tensor (B, C, H, W)
@@ -504,16 +520,20 @@ def ssim(
     x = (x + 1.0) / 2.0
     y = (y + 1.0) / 2.0
 
-    mu_x = F.avg_pool2d(x, window_size, stride=1, padding=window_size // 2)
-    mu_y = F.avg_pool2d(y, window_size, stride=1, padding=window_size // 2)
+    channels = x.shape[1]
+    window = _gaussian_window(window_size, sigma=1.5, channels=channels, device=x.device)
+    padding = window_size // 2
 
-    mu_x_sq = mu_x**2
-    mu_y_sq = mu_y**2
+    mu_x = F.conv2d(x, window, padding=padding, groups=channels)
+    mu_y = F.conv2d(y, window, padding=padding, groups=channels)
+
+    mu_x_sq = mu_x ** 2
+    mu_y_sq = mu_y ** 2
     mu_xy = mu_x * mu_y
 
-    sigma_x_sq = F.avg_pool2d(x**2, window_size, stride=1, padding=window_size // 2) - mu_x_sq
-    sigma_y_sq = F.avg_pool2d(y**2, window_size, stride=1, padding=window_size // 2) - mu_y_sq
-    sigma_xy = F.avg_pool2d(x * y, window_size, stride=1, padding=window_size // 2) - mu_xy
+    sigma_x_sq = F.conv2d(x ** 2, window, padding=padding, groups=channels) - mu_x_sq
+    sigma_y_sq = F.conv2d(y ** 2, window, padding=padding, groups=channels) - mu_y_sq
+    sigma_xy = F.conv2d(x * y, window, padding=padding, groups=channels) - mu_xy
 
     ssim_map = ((2 * mu_xy + C1) * (2 * sigma_xy + C2)) / (
         (mu_x_sq + mu_y_sq + C1) * (sigma_x_sq + sigma_y_sq + C2)

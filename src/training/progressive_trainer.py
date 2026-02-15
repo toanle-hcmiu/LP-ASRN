@@ -27,7 +27,7 @@ from tqdm import tqdm
 from src.models.generator import Generator
 from src.ocr.ocr_model import OCRModel
 from src.losses.lcofl import LCOFL
-from src.losses.basic import L1Loss
+from src.losses.basic import L1Loss, PerceptualLoss
 from src.ocr.confusion_tracker import ConfusionTracker, MetricsTracker
 from src.utils.logger import TensorBoardLogger
 from src.utils.visualizer import create_comparison_grid
@@ -125,6 +125,13 @@ class ProgressiveTrainer:
             alpha=config.get("loss", {}).get("alpha", 0.1),
             beta=config.get("loss", {}).get("beta", 1.0),
         )
+
+        # VGG perceptual loss (frozen VGG19 features)
+        self.lambda_perceptual = config.get("loss", {}).get("lambda_perceptual", 0.0)
+        if self.lambda_perceptual > 0:
+            self.perceptual_loss = PerceptualLoss().to(device)
+        else:
+            self.perceptual_loss = None
 
         # Stage configurations
         self.stage_configs = {
@@ -424,11 +431,13 @@ class ProgressiveTrainer:
             loss = l1
 
             if "lcofl" in stage_config.loss_components:
-                # Get OCR logits (single forward pass — predict() is not needed)
-                with torch.no_grad():
-                    pred_logits = self.ocr(sr_images, return_logits=True)
+                # Get OCR logits WITH gradient flow enabled.
+                # OCR params are frozen (requires_grad=False) so they won't update,
+                # but gradients must flow THROUGH the OCR back to the generator.
+                # Without this, LCOFL loss has no effect on generator training.
+                pred_logits = self.ocr(sr_images, return_logits=True)
 
-                # Decode texts from logits for confusion tracking (no extra forward pass)
+                # Decode texts from logits for confusion tracking (non-differentiable)
                 ocr_unwrapped = self._unwrap_model(self.ocr)
                 with torch.no_grad():
                     if hasattr(ocr_unwrapped.model, 'use_ctc') and ocr_unwrapped.model.use_ctc:
@@ -454,6 +463,11 @@ class ProgressiveTrainer:
                 lambda_lcofl = self.config.get("loss", {}).get("lambda_lcofl", 1.0)
                 loss = loss + lambda_lcofl * lcofl
                 total_lcofl += lcofl.item()
+
+                # VGG perceptual loss (sharper textures)
+                if self.perceptual_loss is not None and self.lambda_perceptual > 0:
+                    percep_loss = self.perceptual_loss(sr_images, hr_images)
+                    loss = loss + self.lambda_perceptual * percep_loss
 
                 pred_texts_all.extend(pred_texts)
                 gt_texts_all.extend(gt_texts)

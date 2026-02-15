@@ -137,47 +137,96 @@ class SSIMLoss(nn.Module):
 
 class PerceptualLoss(nn.Module):
     """
-    Perceptual Loss using feature extraction from a pretrained network.
+    Perceptual Loss using VGG19 feature extraction.
 
-    Compares features extracted from intermediate layers of a
-    pretrained network (e.g., VGG) instead of just pixel values.
+    Compares features from intermediate layers of a pretrained VGG19 network
+    instead of just pixel values. This produces sharper, more natural textures
+    by penalizing differences in high-level features.
+
+    Standard approach from: Johnson et al. "Perceptual Losses for Real-Time
+    Style Transfer and Super-Resolution" (ECCV 2016).
     """
+
+    # Default VGG19 feature extraction layers (after each ReLU)
+    DEFAULT_LAYERS = {
+        'relu1_2': 4,   # After conv1_2 + relu
+        'relu2_2': 9,   # After conv2_2 + relu
+        'relu3_3': 18,  # After conv3_3 + relu (was relu3_4 at 18 in VGG19)
+        'relu4_3': 27,  # After conv4_3 + relu
+    }
+
+    # Weights for each layer (deeper layers contribute less to avoid hallucinations)
+    DEFAULT_WEIGHTS = {
+        'relu1_2': 1.0,
+        'relu2_2': 1.0,
+        'relu3_3': 1.0,
+        'relu4_3': 1.0,
+    }
 
     def __init__(
         self,
-        feature_network: Optional[nn.Module] = None,
         layers: Optional[list] = None,
+        layer_weights: Optional[dict] = None,
+        feature_network: Optional[nn.Module] = None,
     ):
         """
-        Initialize Perceptual Loss.
+        Initialize VGG19 Perceptual Loss.
 
         Args:
-            feature_network: Pretrained network for feature extraction
-            layers: List of layer names to extract features from
+            layers: List of layer names to extract features from.
+                    Default: ['relu1_2', 'relu2_2', 'relu3_3', 'relu4_3']
+            layer_weights: Dict of layer_name -> weight. Default: all 1.0
+            feature_network: Override with custom feature network (ignores VGG19)
         """
         super().__init__()
 
-        if feature_network is None:
-            # Use a simple VGG-like network by default
-            # For OCR, we might use the OCR model's features
-            self.features = nn.Sequential(
-                nn.Conv2d(3, 64, 3, padding=1),
-                nn.ReLU(inplace=True),
-                nn.MaxPool2d(2),
-                nn.Conv2d(64, 128, 3, padding=1),
-                nn.ReLU(inplace=True),
-                nn.MaxPool2d(2),
-                nn.Conv2d(128, 256, 3, padding=1),
-                nn.ReLU(inplace=True),
-            )
-        else:
+        self.layer_names = layers or list(self.DEFAULT_LAYERS.keys())
+        self.layer_weights = layer_weights or self.DEFAULT_WEIGHTS
+
+        if feature_network is not None:
+            # Use custom feature network
             self.features = feature_network
+            self._use_custom = True
+        else:
+            # Use VGG19 pretrained on ImageNet
+            self._use_custom = False
+            try:
+                from torchvision.models import vgg19, VGG19_Weights
+                vgg = vgg19(weights=VGG19_Weights.IMAGENET1K_V1)
+            except (ImportError, TypeError):
+                # Fallback for older torchvision
+                from torchvision.models import vgg19
+                vgg = vgg19(pretrained=True)
 
-        self.layers = layers or ["relu1_2", "relu2_2", "relu3_2"]
+            # Get the max layer index we need
+            max_idx = max(self.DEFAULT_LAYERS[l] for l in self.layer_names) + 1
+            self.features = vgg.features[:max_idx]
 
-        # Freeze features
+            # Store which indices to extract features at
+            self.extract_indices = {
+                self.DEFAULT_LAYERS[name]: name for name in self.layer_names
+            }
+
+        # Freeze all VGG parameters
         for param in self.features.parameters():
             param.requires_grad = False
+
+        # ImageNet normalization
+        self.register_buffer(
+            'mean', torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+        )
+        self.register_buffer(
+            'std', torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+        )
+
+    def _extract_features(self, x: torch.Tensor) -> dict:
+        """Extract features from VGG19 at specified layers."""
+        features = {}
+        for i, layer in enumerate(self.features):
+            x = layer(x)
+            if i in self.extract_indices:
+                features[self.extract_indices[i]] = x
+        return features
 
     def forward(
         self, pred: torch.Tensor, target: torch.Tensor
@@ -197,18 +246,26 @@ class PerceptualLoss(nn.Module):
         target = (target + 1.0) / 2.0
 
         # Normalize with ImageNet stats
-        mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(pred.device)
-        std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(pred.device)
+        pred = (pred - self.mean.to(pred.device)) / self.std.to(pred.device)
+        target = (target - self.mean.to(target.device)) / self.std.to(target.device)
 
-        pred = (pred - mean) / std
-        target = (target - mean) / std
+        if self._use_custom:
+            # Simple path for custom feature network
+            pred_features = self.features(pred)
+            target_features = self.features(target)
+            return F.mse_loss(pred_features, target_features)
 
-        # Extract features
-        pred_features = self.features(pred)
-        target_features = self.features(target)
+        # Extract multi-layer features
+        pred_features = self._extract_features(pred)
+        target_features = self._extract_features(target)
 
-        # Compute L2 distance between features
-        loss = F.mse_loss(pred_features, target_features)
+        # Weighted sum of L2 losses at each layer
+        loss = torch.tensor(0.0, device=pred.device)
+        for name in self.layer_names:
+            weight = self.layer_weights.get(name, 1.0)
+            loss = loss + weight * F.mse_loss(
+                pred_features[name], target_features[name]
+            )
 
         return loss
 
