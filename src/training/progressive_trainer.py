@@ -1719,9 +1719,14 @@ class ProgressiveTrainer:
     def _load_optimizer_state(self):
         """Load optimizer state from checkpoint (must be called after optimizer is created)."""
         if hasattr(self, '_checkpoint_state') and 'optimizer_state_dict' in self._checkpoint_state:
-            self.optimizer.load_state_dict(self._checkpoint_state['optimizer_state_dict'])
-            if self.is_main:
-                self._log("Optimizer state loaded from checkpoint")
+            try:
+                self.optimizer.load_state_dict(self._checkpoint_state['optimizer_state_dict'])
+                if self.is_main:
+                    self._log("Optimizer state loaded from checkpoint")
+            except (ValueError, RuntimeError) as e:
+                if self.is_main:
+                    self._log(f"WARNING: Could not load optimizer state: {e}")
+                    self._log("Starting with fresh optimizer state (normal when switching stages or after architecture changes)")
 
     def train_full_progressive(self) -> Dict[str, Any]:
         """Train all stages sequentially."""
