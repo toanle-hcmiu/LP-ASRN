@@ -583,16 +583,15 @@ class ProgressiveTrainer:
                         "pred_texts": pred_texts,
                     }
 
-                # Compute PSNR/SSIM (vectorized - much faster!)
-                # MSE per image in batch
+                # Compute PSNR (vectorized)
                 mse_per_img = torch.mean((sr_images - hr_images) ** 2, dim=(1, 2, 3))
                 psnr_per_img = 20 * torch.log10(2.0 / torch.sqrt(mse_per_img + 1e-10))
                 total_psnr += psnr_per_img.sum().item()
 
-                # SSIM (simplified) - batch computation
-                mae_per_img = torch.mean(torch.abs(sr_images - hr_images), dim=(1, 2, 3))
-                ssim_per_img = 1.0 - (mae_per_img / 2.0)
-                total_ssim += ssim_per_img.sum().item()
+                # Real SSIM using proper Gaussian-window implementation
+                from src.losses.lcofl import ssim as compute_ssim
+                ssim_val = compute_ssim(sr_images, hr_images)
+                total_ssim += ssim_val.item() * sr_images.shape[0]
 
                 # Store predictions for metrics
                 pred_texts_all.extend(pred_texts)
@@ -603,8 +602,11 @@ class ProgressiveTrainer:
                     if pred == gt:
                         word_correct += 1
 
-                    # Character accuracy
-                    for p_char, g_char in zip(pred, gt):
+                    # Character accuracy — count length mismatches as errors
+                    max_len = max(len(pred), len(gt))
+                    for i in range(max_len):
+                        p_char = pred[i] if i < len(pred) else ''
+                        g_char = gt[i] if i < len(gt) else ''
                         if p_char == g_char:
                             char_correct += 1
                         total_chars += 1
@@ -785,7 +787,9 @@ class ProgressiveTrainer:
             print(f"{'='*60}")
             print(f"Epochs: {stage_config.epochs}")
             print(f"Learning Rate: {stage_config.lr}")
-            print(f"Using CTC Loss: Yes")
+            is_ctc = hasattr(ocr_unwrapped.model, 'use_ctc') and ocr_unwrapped.model.use_ctc
+            loss_type = "CTC" if is_ctc else "Cross-Entropy (PARSeq)"
+            print(f"Using Loss: {loss_type}")
             print(f"{'='*60}\n")
 
         # Track step counter for OCR pretraining

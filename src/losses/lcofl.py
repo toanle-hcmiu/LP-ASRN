@@ -125,6 +125,12 @@ class ClassificationLoss(nn.Module):
         """
         Compute classification loss.
 
+        Supports two modes:
+        - CTC mode (C = vocab + 1): Uses proper CTC loss for gradient consistency
+          with CTC-trained OCR models like SimpleCRNN.
+        - Position-aligned mode (C = vocab): Uses weighted cross-entropy for
+          attention-based OCR models like PARSeq where logits are position-aligned.
+
         Args:
             pred_logits: OCR predictions of shape (B, K, C) where K is max length,
                         C is vocab size (may include CTC blank token).
@@ -136,14 +142,14 @@ class ClassificationLoss(nn.Module):
         B, K, C = pred_logits.shape
         num_vocab = len(self.char_to_idx)  # 36
 
-        # Handle CTC models where C = vocab + 1 (blank token at index 36)
-        # Slice off the blank token column so we have (B, K, 36) matching our vocab
         if C == num_vocab + 1:
-            # CTC model: last column is blank token — remove it
-            pred_logits = pred_logits[:, :, :num_vocab]
-            C = num_vocab
-        elif C > num_vocab + 1:
-            # Large vocab mismatch (e.g., Parseq with 94 chars) — can't map reliably
+            # CTC model: use proper CTC loss for gradient consistency
+            return self._ctc_classification_loss(pred_logits, gt_texts, B, K, C)
+        elif C == num_vocab:
+            # Position-aligned model (e.g., PARSeq): use weighted cross-entropy
+            return self._ce_classification_loss(pred_logits, gt_texts, B, K, C)
+        else:
+            # Large vocab mismatch — can't map reliably
             zero_loss = torch.tensor(0.0, device=pred_logits.device, requires_grad=True)
             return zero_loss, {
                 "classification_loss": zero_loss,
@@ -151,8 +157,69 @@ class ClassificationLoss(nn.Module):
                 "skipped": True
             }
 
+    def _ctc_classification_loss(
+        self,
+        pred_logits: torch.Tensor,
+        gt_texts: List[str],
+        B: int, K: int, C: int,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """
+        CTC-based classification loss. Uses the same CTC loss function
+        as OCR pretraining for consistent gradients.
+        """
+        blank_idx = C - 1  # Blank token is at last index
+
+        # Encode targets as flat index list (CTC format)
+        target_indices_list = []
+        target_lengths = []
+        for text in gt_texts:
+            indices = [self.char_to_idx[c] for c in text if c in self.char_to_idx]
+            target_indices_list.extend(indices)
+            target_lengths.append(len(indices))
+
+        if len(target_indices_list) == 0:
+            zero_loss = torch.tensor(0.0, device=pred_logits.device, requires_grad=True)
+            return zero_loss, {"classification_loss": zero_loss}
+
+        target_indices = torch.tensor(target_indices_list, dtype=torch.long,
+                                       device=pred_logits.device)
+        target_lengths = torch.tensor(target_lengths, dtype=torch.long,
+                                       device=pred_logits.device)
+        input_lengths = torch.full((B,), K, dtype=torch.long,
+                                    device=pred_logits.device)
+
+        # Log softmax + transpose for CTC: (T, B, C)
+        log_probs = F.log_softmax(pred_logits, dim=-1).transpose(0, 1)
+
+        # Apply per-class weights via weighted log probs
+        # This preserves the confusion-based weighting from the original design
+        weights = self.weights.to(pred_logits.device)
+        # Extend weights to include blank token (weight=1.0)
+        weights_full = torch.cat([weights, torch.ones(1, device=weights.device)])
+        weighted_log_probs = log_probs * weights_full.unsqueeze(0).unsqueeze(0)
+
+        loss = F.ctc_loss(
+            weighted_log_probs,
+            target_indices,
+            input_lengths,
+            target_lengths,
+            blank=blank_idx,
+            zero_infinity=True,
+            reduction='mean',
+        )
+
+        return loss, {"classification_loss": loss, "loss_mode": "ctc"}
+
+    def _ce_classification_loss(
+        self,
+        pred_logits: torch.Tensor,
+        gt_texts: List[str],
+        B: int, K: int, C: int,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """
+        Position-aligned cross-entropy loss for attention-based OCR models.
+        """
         # Encode ground truth texts
-        # Use -100 as ignore index (PyTorch cross_entropy convention)
         targets = torch.full((B, K), -100, dtype=torch.long)
         for b, text in enumerate(gt_texts):
             for i, char in enumerate(text):
@@ -161,13 +228,13 @@ class ClassificationLoss(nn.Module):
                 if char in self.char_to_idx:
                     targets[b, i] = self.char_to_idx[char]
 
-        targets = targets.to(pred_logits.device)  # (B, K)
+        targets = targets.to(pred_logits.device)
 
         # Reshape for cross-entropy
-        pred_logits_flat = pred_logits.reshape(-1, C)  # (B*K, C)
-        targets_flat = targets.reshape(-1)  # (B*K,)
+        pred_logits_flat = pred_logits.reshape(-1, C)
+        targets_flat = targets.reshape(-1)
 
-        # Compute weighted cross-entropy (ignore_index=-100 skips padding positions)
+        # Compute weighted cross-entropy
         mask = targets_flat != -100
         if mask.sum() > 0:
             loss = F.cross_entropy(
@@ -179,7 +246,7 @@ class ClassificationLoss(nn.Module):
         else:
             loss = torch.tensor(0.0, device=pred_logits.device, requires_grad=True)
 
-        return loss, {"classification_loss": loss}
+        return loss, {"classification_loss": loss, "loss_mode": "ce"}
 
 
 class LayoutPenalty(nn.Module):

@@ -24,9 +24,9 @@ import torch.nn.functional as F
 from typing import List, Dict, Optional, Tuple
 import re
 
-# Parseq availability check - DISABLED to avoid torch.hub loading at import time
-# SimpleCRNN is the actual OCR model being used
-PARSEQ_AVAILABLE = False
+# PARSeq availability is checked at runtime when use_parseq=True
+# This avoids torch.hub loading at import time
+PARSEQ_AVAILABLE = None  # Will be set on first attempt to load
 PARSEQ_SOURCE = None
 
 
@@ -335,14 +335,26 @@ class OCRModel(nn.Module):
                 print(f"Loading Parseq model from: {pretrained_path}")
                 self.model = torch.hub.load('baudm/parseq', 'parseq', pretrained=True, trust_repo=True)
                 self.use_parseq = True
-                self.blank_idx = 0  # Parseq uses 0 as blank/padding
                 print("Successfully loaded Parseq model from HuggingFace")
 
-                # Create tokenizer with Parseq vocab
-                self.tokenizer = ParseqTokenizer(vocab, max_length, use_parseq_vocab=True)
+                # Store PARSeq's native tokenizer for decoding
+                self._parseq_tokenizer = self.model.tokenizer
+
+                # Replace head to match our vocabulary
+                self._replace_parseq_head(vocab)
+
+                # PARSeq outputs (B, max_label_length+1, num_classes)
+                # After head replacement: (B, 26, 36) — position-aligned, no CTC
+                self.blank_idx = None  # PARSeq doesn't use CTC blank
+
+                # Create tokenizer with simple vocab (not Parseq's 95-char vocab)
+                # since we replaced the head to output 36 classes
+                self.tokenizer = ParseqTokenizer(vocab, max_length, use_parseq_vocab=False)
 
             except Exception as e:
                 print(f"Failed to load Parseq: {e}")
+                import traceback
+                traceback.print_exc()
                 print("Falling back to SimpleCRNN...")
                 self._init_simple_crnn(vocab, max_length, rnn_dropout, backbone_channels, lstm_hidden_size, lstm_num_layers)
         else:
@@ -509,12 +521,9 @@ class OCRModel(nn.Module):
             # SimpleCRNN handles normalization internally
             return self.model(x, return_logits=return_logits)
         else:
-            # Parseq model
+            # PARSeq model — output is already (B, T, C) format
+            logits = self.model(x)  # (B, ~26, num_classes)
             if return_logits:
-                logits = self.model(x)
-                # Parseq returns (B, C, T), need to transpose to (B, T, C)
-                if logits.dim() == 3:
-                    logits = logits.permute(0, 2, 1)
                 # Truncate or pad to max_length
                 if logits.shape[1] > self.max_length:
                     logits = logits[:, :self.max_length, :]
@@ -523,7 +532,7 @@ class OCRModel(nn.Module):
                     logits = F.pad(logits, (0, 0, 0, pad_len))
                 return logits
             else:
-                return self.model(x)
+                return logits
 
     def predict(self, images: torch.Tensor, beam_width: int = 1) -> List[str]:
         """
@@ -540,65 +549,14 @@ class OCRModel(nn.Module):
             # Check if using real Parseq model
             is_simple_crnn = isinstance(self.model, SimpleCRNN)
 
-            if not is_simple_crnn and self.use_parseq:
-                # Use Parseq's native prediction
-                # Normalize input for Parseq
-                if images.min() < 0:
-                    x = (images + 1.0) / 2.0
-                    x = torch.clamp(x, 0, 1)
-                else:
-                    x = images
-
-                # Resize to Parseq expected input size (32, 128)
-                parseq_h, parseq_w = 32, 128
-                if x.shape[2] != parseq_h or x.shape[3] != parseq_w:
-                    x = F.interpolate(x, size=(parseq_h, parseq_w), mode='bilinear', align_corners=False)
-
-                # Normalize with ImageNet stats
-                mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(x.device)
-                std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(x.device)
-                x = (x - mean) / std
-
-                # Parseq returns predictions directly
-                pred = self.model(x)
-
-                # pred is a dict with 'tokens' and 'text', or just logits
-                if isinstance(pred, dict):
-                    # Use Parseq's tokenizer to decode
-                    texts = pred.get('text', [])
-                    if not texts:
-                        # Fallback: decode from logits
-                        logits = pred.get('logits', None)
-                        if logits is not None:
-                            pred_indices = logits.argmax(dim=-1)
-                            texts = [self.model.tokenizer.decode(idx) for idx in pred_indices]
-                else:
-                    # It's just logits, decode them
-                    pred_indices = pred.argmax(dim=-1)
-                    # Filter to our vocabulary
-                    texts = []
-                    for batch_idx in range(pred_indices.shape[0]):
-                        text = ""
-                        for idx in pred_indices[batch_idx]:
-                            idx_val = idx.item()
-                            if idx_val < len(self.tokenizer.PARSEQ_VOCAB):
-                                char = self.tokenizer.PARSEQ_VOCAB[idx_val]
-                                if char in self.vocab:
-                                    text += char
-                        texts.append(text)
-
-                return texts
-
+            # Get logits through unified forward pass
             logits = self.forward(images, return_logits=True)
 
-        # SimpleCRNN with CTC decoding
         if is_simple_crnn and hasattr(self.model, 'use_ctc') and self.model.use_ctc:
-            # Use CTC decoding (greedy if beam_width=1, beam search if >1)
+            # SimpleCRNN with CTC decoding
             if beam_width == 1:
-                # Fast greedy decoding (~10x faster than beam search)
                 decoded_indices_list = self.model.ctc_decode_greedy(logits)
             else:
-                # Slower but more accurate beam search
                 decoded_indices_list = self.model.ctc_decode_beam_search(logits, beam_width=beam_width)
 
             # Convert indices to characters
@@ -612,14 +570,12 @@ class OCRModel(nn.Module):
                             text += char
                 texts.append(text)
 
-            # Apply plate format correction for +5-10% accuracy boost
             texts = [PlateFormatValidator.correct(t) for t in texts]
             return texts
         else:
-            # Decode predictions using simple argmax
+            # PARSeq or non-CTC model: position-aligned argmax decoding
             pred_indices = logits.argmax(dim=-1)  # (B, max_length)
             texts = self.tokenizer.decode_batch(pred_indices)
-            # Apply plate format correction
             texts = [PlateFormatValidator.correct(t) for t in texts]
             return texts
 
@@ -843,10 +799,13 @@ class OCRModel(nn.Module):
         label_smoothing: float = 0.1,
     ) -> torch.Tensor:
         """
-        Compute cross-entropy loss for Parseq training.
+        Compute cross-entropy loss for PARSeq training.
+
+        Since we replaced PARSeq's output head to match our 36-char vocab,
+        we always use our simple tokenizer for target encoding.
 
         Args:
-            logits: (B, T, C) predictions from model
+            logits: (B, T, C) predictions from model (C=36 after head replacement)
             targets: List of target text strings
             device: Device to compute loss on
             label_smoothing: Label smoothing factor
@@ -858,53 +817,28 @@ class OCRModel(nn.Module):
 
         B, T, C = logits.shape
 
-        # Use Parseq's native tokenizer if available
-        if hasattr(self.model, 'tokenizer') and self.model.tokenizer is not None:
-            # Parseq's tokenizer expects a list of strings
-            # Encode targets using Parseq's native tokenizer
-            target_tensor = torch.zeros(B, T, dtype=torch.long, device=device)
+        # Encode targets using our simple tokenizer (matches replaced head)
+        # Use -1 as padding (NOT 0, because index 0 = digit '0' which is a valid char)
+        target_tensor = torch.full((B, T), -1, dtype=torch.long, device=device)
 
-            for i, text in enumerate(targets):
-                # Pad/truncate to T positions
-                text_padded = text[:T] if len(text) > T else text
-                # Encode using Parseq's tokenizer
-                try:
-                    encoded = self.model.tokenizer.encode([text_padded], device=device)
-                    # encoded is (1, seq_len), we need to extract and pad
-                    enc_len = min(encoded.shape[1], T)
-                    target_tensor[i, :enc_len] = encoded[0, :enc_len]
-                except:
-                    # Fallback: manual encoding using PARSEQ_VOCAB
-                    for j, char in enumerate(text_padded):
-                        if j >= T:
-                            break
-                        if char in self.tokenizer.char_to_idx:
-                            target_tensor[i, j] = self.tokenizer.char_to_idx[char]
-        else:
-            # Fallback: encode using our tokenizer (make sure indices are valid)
-            target_tensor = torch.zeros(B, T, dtype=torch.long, device=device)
-
-            for i, text in enumerate(targets):
-                for j, char in enumerate(text):
-                    if j >= T:
-                        break
-                    if char in self.tokenizer.char_to_idx:
-                        idx = self.tokenizer.char_to_idx[char]
-                        # Clamp to valid range
-                        target_tensor[i, j] = min(idx, C - 1)
+        for i, text in enumerate(targets):
+            for j, char in enumerate(text):
+                if j >= T:
+                    break
+                if char in self.tokenizer.char_to_idx:
+                    idx = self.tokenizer.char_to_idx[char]
+                    target_tensor[i, j] = min(idx, C - 1)
 
         # Flatten for cross-entropy: (B*T, C) and (B*T,)
         logits_flat = logits.reshape(-1, C)
         targets_flat = target_tensor.reshape(-1)
 
-        # Clamp targets to valid range (safety check)
-        targets_flat = torch.clamp(targets_flat, 0, C - 1)
-
         # Use cross-entropy with label smoothing
+        # ignore_index=-1 skips padding positions (positions beyond text length)
         loss = F.cross_entropy(
             logits_flat,
             targets_flat,
-            ignore_index=0,  # Ignore padding
+            ignore_index=-1,
             label_smoothing=label_smoothing,
         )
 

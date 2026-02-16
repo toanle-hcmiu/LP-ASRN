@@ -584,6 +584,98 @@ def aggregate_track_predictions(predictions):
     return final_text, final_confidence
 
 
+def tta_augment_batch(images: torch.Tensor) -> list:
+    """
+    Create TTA augmented versions of a batch of images.
+
+    Augmentations that preserve text readability:
+    - Original (identity)
+    - Brightness +/- 10%
+    - Contrast +/- 15%
+    - Slight scale (0.95x and 1.05x with padding)
+
+    Args:
+        images: (B, 3, H, W) tensor in [-1, 1] range
+
+    Returns:
+        List of (augmented_batch, weight) tuples. Each augmented_batch
+        has the same shape as input. Weight indicates confidence in
+        this augmentation (1.0 = original, <1.0 = augmented).
+    """
+    augmented = [(images, 1.0)]  # Original always included with highest weight
+
+    # Convert to [0, 1] for augmentations
+    imgs_01 = (images + 1.0) / 2.0
+
+    # Brightness variations
+    for delta in [-0.08, 0.08]:
+        bright = torch.clamp(imgs_01 + delta, 0, 1)
+        augmented.append((bright * 2.0 - 1.0, 0.8))
+
+    # Contrast variations
+    mean = imgs_01.mean(dim=(2, 3), keepdim=True)
+    for factor in [0.85, 1.15]:
+        contrast = torch.clamp(mean + (imgs_01 - mean) * factor, 0, 1)
+        augmented.append((contrast * 2.0 - 1.0, 0.8))
+
+    # Slight scale variations (zoom in/out by 5%)
+    B, C, H, W = images.shape
+    for scale in [0.95, 1.05]:
+        new_h, new_w = int(H * scale), int(W * scale)
+        if new_h >= 4 and new_w >= 4:  # Safety check
+            scaled = F.interpolate(images, size=(new_h, new_w), mode='bilinear', align_corners=False)
+            # Pad/crop back to original size
+            if scale < 1.0:
+                pad_h = H - new_h
+                pad_w = W - new_w
+                scaled = F.pad(scaled, (pad_w // 2, pad_w - pad_w // 2,
+                                        pad_h // 2, pad_h - pad_h // 2), mode='reflect')
+            else:
+                crop_h = new_h - H
+                crop_w = new_w - W
+                scaled = scaled[:, :, crop_h // 2:crop_h // 2 + H, crop_w // 2:crop_w // 2 + W]
+            augmented.append((scaled, 0.7))
+
+    return augmented
+
+
+def tta_predict(generator, ocr, images, beam_width=5):
+    """
+    Run TTA: augment images, get logits from each, average logits, then decode.
+
+    Logit-level fusion is much more powerful than text-level majority voting
+    because it combines information before the argmax bottleneck.
+
+    Args:
+        generator: SR generator (or None for OCR-only)
+        ocr: OCR model
+        images: (B, 3, H, W) input tensor
+        beam_width: Beam width for final decoding
+
+    Returns:
+        List of (text, confidence) tuples
+    """
+    augmented_batches = tta_augment_batch(images)
+    all_logits = []
+    all_weights = []
+
+    for aug_images, weight in augmented_batches:
+        if generator is not None:
+            sr = generator(aug_images)
+        else:
+            sr = aug_images
+        logits = ocr(sr, return_logits=True)
+        all_logits.append(logits)
+        all_weights.append(weight)
+
+    # Weighted average of logits (soft fusion before argmax)
+    total_weight = sum(all_weights)
+    fused_logits = sum(l * w for l, w in zip(all_logits, all_weights)) / total_weight
+
+    # Decode the fused logits
+    return predict_with_confidence(ocr, fused_logits, beam_width=beam_width)
+
+
 @torch.no_grad()
 def run_diagnose(args):
     """
@@ -918,6 +1010,7 @@ def run_inference(args):
     print(f"\nRunning inference on {len(tracks)} tracks...")
     print(f"  SR: {'enabled' if generator is not None else 'disabled (OCR-only)'}")
     print(f"  Beam width: {args.beam_width}")
+    print(f"  TTA: {'enabled (7 augmentations, logit-level fusion)' if args.tta else 'disabled'}")
     print(f"  LR size: {lr_size}")
 
     for track_id, image_paths in tqdm(tracks, desc="Processing tracks"):
@@ -951,15 +1044,19 @@ def run_inference(args):
 
             batch = torch.stack(batch_tensors).to(device)  # (B, 3, H, W)
 
-            # Super-resolution
-            if generator is not None:
-                sr_batch = generator(batch)
+            if args.tta:
+                # TTA: logit-level fusion across augmented versions
+                preds_with_conf = tta_predict(
+                    generator, ocr, batch, beam_width=args.beam_width
+                )
             else:
-                sr_batch = batch  # OCR on LR directly
-
-            # OCR with logits for confidence + format-aware beam search
-            logits = ocr(sr_batch, return_logits=True)
-            preds_with_conf = predict_with_confidence(ocr, logits, beam_width=args.beam_width)
+                # Standard: single forward pass
+                if generator is not None:
+                    sr_batch = generator(batch)
+                else:
+                    sr_batch = batch
+                logits = ocr(sr_batch, return_logits=True)
+                preds_with_conf = predict_with_confidence(ocr, logits, beam_width=args.beam_width)
 
             track_predictions.extend(preds_with_conf)
 

@@ -141,10 +141,11 @@ ocr:
   # OCR model type
   model_type: "simplecrnn"
 
-  # Use external pretrained model from HuggingFace (true) or SimpleCRNN (false)
-  # NOTE: External model requires teacher forcing for training which is not implemented.
-  # Use SimpleCRNN (false) for training.
-  use_pretrained: false
+  # Use PARSeq from HuggingFace (true) or SimpleCRNN (false)
+  # PARSeq: attention-based, pretrained on millions of text images, position-aligned
+  # SimpleCRNN: CTC-based, trained from scratch, lightweight
+  # To switch to PARSeq: set to true, retrain from stage 0
+  use_pretrained: true
 
   # Pre-trained model path (HuggingFace model ID or local path)
   pretrained_path: "baudm/parseq-base"
@@ -159,6 +160,8 @@ ocr:
   freeze_ocr: true
 
   # Maximum sequence length for OCR
+  # PARSeq: 7 is correct (position-aligned, 1:1 char mapping)
+  # SimpleCRNN: use 20 for CTC (needs extra timesteps for blank insertion)
   max_length: 7
 
   # Character vocabulary
