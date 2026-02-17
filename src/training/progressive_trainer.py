@@ -409,6 +409,12 @@ class ProgressiveTrainer:
     def train_epoch(self, stage_config: StageConfig) -> Dict[str, float]:
         """Train for one epoch."""
         self.generator.train()
+        # CRITICAL: Set OCR to eval mode when frozen, train mode when training
+        # PARSeq and other models have BatchNorm/Dropout that behave differently
+        if stage_config.freeze_ocr:
+            self.ocr.eval()
+        else:
+            self.ocr.train()
 
         total_loss = 0.0
         total_l1 = 0.0
