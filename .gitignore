@@ -86,4 +86,5 @@ torchhub/
 tmp/
 temp/
 *.tmp
+tmpclaude*
 

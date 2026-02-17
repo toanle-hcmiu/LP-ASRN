@@ -19,6 +19,10 @@ import torch.nn.functional as F
 from typing import Dict, Optional, Tuple, List
 from collections import defaultdict
 
+# PARSeq's native vocabulary for vocab mapping
+# Order: digits, lowercase, uppercase, punctuation (95 characters)
+PARSEQ_VOCAB = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ!\"#$%&'()*+,-.:;<=>?@[\\]^_`{|}~"
+
 
 class ClassificationLoss(nn.Module):
     """
@@ -74,6 +78,35 @@ class ClassificationLoss(nn.Module):
         weight_increments = confusion_matrix.sum(dim=1) - correct
         self.weights = 1.0 + self.alpha * weight_increments
 
+    def _map_parseq_logits_to_vocab(self, pred_logits: torch.Tensor) -> torch.Tensor:
+        """
+        Map PARSeq's larger vocab logits to our 36-char LP vocab.
+
+        PARSeq vocab (95 chars): 0-9, a-z, A-Z, punctuation
+        Our LP vocab (36 chars): 0-9, A-Z
+
+        Args:
+            pred_logits: (B, K, 95) PARSeq output logits
+
+        Returns:
+            (B, K, 36) Mapped logits containing only our vocab characters
+        """
+        # Our vocab: digits + uppercase letters (must match self.vocab order)
+        our_vocab = self.vocab  # "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+        # Find indices in PARSeq vocab that correspond to our characters
+        our_indices_in_parseq = [PARSEQ_VOCAB.index(c) for c in our_vocab]
+
+        # Create index tensor for efficient gathering
+        index_tensor = torch.tensor(our_indices_in_parseq,
+                                    dtype=torch.long,
+                                    device=pred_logits.device)
+
+        # Extract only those logits using index_select
+        # pred_logits: (B, K, 95) -> (B, K, 36)
+        mapped_logits = pred_logits[:, :, index_tensor]
+        return mapped_logits
+
     def get_character_pairs(
         self, pred_text: str, gt_text: str
     ) -> List[Tuple[str, str]]:
@@ -125,11 +158,12 @@ class ClassificationLoss(nn.Module):
         """
         Compute classification loss.
 
-        Supports two modes:
+        Supports three modes:
         - CTC mode (C = vocab + 1): Uses proper CTC loss for gradient consistency
           with CTC-trained OCR models like SimpleCRNN.
         - Position-aligned mode (C = vocab): Uses weighted cross-entropy for
-          attention-based OCR models like PARSeq where logits are position-aligned.
+          attention-based OCR models where logits are position-aligned.
+        - PARSeq mode (C > vocab + 1): Maps PARSeq's larger vocab to our vocab.
 
         Args:
             pred_logits: OCR predictions of shape (B, K, C) where K is max length,
@@ -142,19 +176,27 @@ class ClassificationLoss(nn.Module):
         B, K, C = pred_logits.shape
         num_vocab = len(self.char_to_idx)  # 36
 
+        # Handle PARSeq's larger vocab (95 dims) - map to our 36 chars
+        if C > num_vocab + 1:
+            # Assume PARSeq with larger vocab - map to our 36 chars
+            pred_logits = self._map_parseq_logits_to_vocab(pred_logits)
+            C = num_vocab  # Update C after mapping
+
         if C == num_vocab + 1:
             # CTC model: use proper CTC loss for gradient consistency
             return self._ctc_classification_loss(pred_logits, gt_texts, B, K, C)
         elif C == num_vocab:
-            # Position-aligned model (e.g., PARSeq): use weighted cross-entropy
+            # Position-aligned model (e.g., after PARSeq mapping): use weighted cross-entropy
             return self._ce_classification_loss(pred_logits, gt_texts, B, K, C)
         else:
-            # Large vocab mismatch — can't map reliably
+            # Should not happen after mapping - return zero loss with debug info
             zero_loss = torch.tensor(0.0, device=pred_logits.device, requires_grad=True)
             return zero_loss, {
                 "classification_loss": zero_loss,
                 "vocab_mismatch": True,
-                "skipped": True
+                "skipped": True,
+                "logit_dim": C,
+                "expected_dim": num_vocab,
             }
 
     def _ctc_classification_loss(
