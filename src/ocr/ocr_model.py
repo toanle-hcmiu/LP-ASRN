@@ -332,27 +332,48 @@ class OCRModel(nn.Module):
         if use_parseq:
             # Load real Parseq model from HuggingFace
             try:
-                print(f"Loading Parseq model from: {pretrained_path}")
-                self.model = torch.hub.load('baudm/parseq', 'parseq', pretrained=True, trust_repo=True)
+                print(f"Loading PARSeq model from HuggingFace...")
+                # torch.hub returns system.PARSeq (PyTorch Lightning wrapper)
+                # which contains .model (raw PARSeq) and .tokenizer
+                self.parseq_system = torch.hub.load(
+                    'baudm/parseq', 'parseq', pretrained=True, trust_repo=True
+                )
                 self.use_parseq = True
-                print("Successfully loaded Parseq model from HuggingFace")
+                print("Successfully loaded PARSeq model")
 
-                # Store PARSeq's native tokenizer for decoding
-                self._parseq_tokenizer = self.model.tokenizer
+                # Store references to PARSeq's internal components
+                # self.parseq_system.model = raw PARSeq (encoder + decoder + head)
+                # self.parseq_system.tokenizer = Tokenizer with BOS/EOS/PAD
+                self.model = self.parseq_system  # for nn.Module parameter tracking
+                self._parseq_raw = self.parseq_system.model  # raw model for encode/decode/head
+                self._parseq_tokenizer = self.parseq_system.tokenizer
+                self.bos_id = self.parseq_system.bos_id
+                self.eos_id = self.parseq_system.eos_id
+                self.pad_id = self.parseq_system.pad_id
 
-                # Replace head to match our vocabulary
-                self._replace_parseq_head(vocab)
-
-                # PARSeq outputs (B, max_label_length+1, num_classes)
-                # After head replacement: (B, 26, 36) — position-aligned, no CTC
+                # PARSeq uses its native 94-char vocab — NO head replacement needed
+                # Our 36-char vocab (0-9, A-Z) is a subset of PARSeq's charset
+                # At decode time, output is filtered to uppercase + digits
                 self.blank_idx = None  # PARSeq doesn't use CTC blank
 
-                # Create tokenizer with simple vocab (not Parseq's 95-char vocab)
-                # since we replaced the head to output 36 classes
+                # PLM permutation config (from PARSeq's default settings)
+                self._perm_num = 6  # number of permutations per batch
+                self._perm_forward = True  # always include forward permutation
+                self._perm_mirrored = True  # include mirrored permutations
+                self._rng = __import__('numpy').random.default_rng()
+
+                # Simple tokenizer for SimpleCRNN compatibility (decode_batch, etc.)
                 self.tokenizer = ParseqTokenizer(vocab, max_length, use_parseq_vocab=False)
 
+                # Print model info
+                n_params = sum(p.numel() for p in self.parseq_system.parameters())
+                print(f"  PARSeq parameters: {n_params:,}")
+                print(f"  Native vocab size: {len(self._parseq_tokenizer)} tokens")
+                print(f"  Max label length: {self._parseq_raw.max_label_length}")
+                print(f"  Training: teacher forcing + PLM ({self._perm_num} permutations)")
+
             except Exception as e:
-                print(f"Failed to load Parseq: {e}")
+                print(f"Failed to load PARSeq: {e}")
                 import traceback
                 traceback.print_exc()
                 print("Falling back to SimpleCRNN...")
@@ -378,103 +399,197 @@ class OCRModel(nn.Module):
         )
         self.use_parseq = False
         self.blank_idx = len(vocab)
+        self.parseq_system = None  # no PARSeq
         print(f"Using SimpleCRNN model (backbone={backbone_channels}, LSTM={lstm_hidden_size}x{lstm_num_layers}) with CTC decoding")
         self.tokenizer = ParseqTokenizer(vocab, max_length, use_parseq_vocab=False)
 
-    def _replace_parseq_head(self, vocab: str):
+    def _preprocess_for_parseq(self, images: torch.Tensor) -> torch.Tensor:
         """
-        Replace Parseq's output layer to match our vocabulary.
-        Uses programmatic search to find the correct output layer.
+        Preprocess images for PARSeq: resize to 32x128, normalize with ImageNet stats.
 
         Args:
-            vocab: Target vocabulary string (e.g., "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+            images: (B, 3, H, W) in [0, 1] range
+
+        Returns:
+            Preprocessed images ready for PARSeq encoder
         """
-        # Parseq's default vocabulary (94 characters)
-        parseq_vocab = (
-            "0123456789"
-            "abcdefghijklmnopqrstuvwxyz"
-            "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-            "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~"
-        )
+        parseq_h, parseq_w = 32, 128
+        if images.shape[2] != parseq_h or images.shape[3] != parseq_w:
+            images = F.interpolate(images, size=(parseq_h, parseq_w), mode='bilinear', align_corners=False)
 
-        # Create mapping: our_char_idx -> parseq_char_idx
-        vocab_mapping = []
-        for char in vocab:
-            if char in parseq_vocab:
-                vocab_mapping.append(parseq_vocab.index(char))
+        # Normalize with ImageNet stats (PARSeq expects this)
+        mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(images.device)
+        std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(images.device)
+        return (images - mean) / std
+
+    def _gen_tgt_perms(self, tgt: torch.Tensor) -> torch.Tensor:
+        """
+        Generate permutation orderings for PARSeq's Permutation Language Modeling.
+
+        Directly adapted from PARSeq's official implementation.
+
+        Args:
+            tgt: (B, T) encoded target tokens from PARSeq's tokenizer
+
+        Returns:
+            Permutation tensor of shape (num_perms, T-2) where T includes BOS and EOS
+        """
+        device = tgt.device
+        max_num_chars = tgt.shape[1] - 2  # Exclude BOS and EOS
+
+        if max_num_chars == 1:
+            return torch.arange(3, device=device).unsqueeze(0)
+
+        perms = [torch.arange(max_num_chars, device=device)] if self._perm_forward else []
+
+        max_perms = math.factorial(max_num_chars)
+        max_gen_perms = self._perm_num // 2 if self._perm_mirrored else self._perm_num
+        if self._perm_mirrored:
+            max_perms //= 2
+        num_gen_perms = min(max_gen_perms, max_perms)
+
+        if max_num_chars < 5:
+            from itertools import permutations as iter_perms
+            if max_num_chars == 4 and self._perm_mirrored:
+                selector = [0, 3, 4, 6, 9, 10, 12, 16, 17, 18, 19, 21]
             else:
-                # Character not in Parseq's vocab - use last index as fallback
-                vocab_mapping.append(len(parseq_vocab) - 1)
-
-        # Programmatic search for the output layer
-        original_head = None
-        head_path = None
-
-        # Search for Linear layer with ~94 output features (Parseq's vocab size)
-        for name, module in self.model.named_modules():
-            if isinstance(module, nn.Linear):
-                # Check if this is the output layer (vocab size ~94)
-                if module.out_features in [92, 93, 94, 95, 96, 97]:  # Parseq vocab sizes
-                    original_head = module
-                    head_path = name
-                    print(f"Found Parseq output layer: {name}")
-                    print(f"  Input: {module.in_features}, Output: {module.out_features}")
-                    break
-
-        # Fallback: try common paths if size-based search didn't work
-        if original_head is None:
-            print("Warning: Could not find output layer by size. Trying direct paths...")
-            fallback_paths = [
-                'decoder.head', 'decoder.output_projection', 'decoder.lm_head',
-                'decoder.linear', 'head', 'lm_head', 'output_projection'
-            ]
-            for path in fallback_paths:
-                obj = self.model
-                try:
-                    for attr in path.split('.'):
-                        obj = getattr(obj, attr)
-                    if isinstance(obj, nn.Linear):
-                        original_head = obj
-                        head_path = path
-                        print(f"Found output layer at path: {path}")
-                        print(f"  Input: {obj.in_features}, Output: {obj.out_features}")
-                        break
-                except AttributeError:
-                    continue
-
-        if original_head is None:
-            print("Error: Could not find Parseq output layer. Model structure:")
-            print(self.model)
-            return
-
-        # Create new head
-        in_features = original_head.in_features
-        out_features = len(vocab)  # 36
-        new_head = nn.Linear(in_features, out_features)
-        new_head = new_head.to(original_head.weight.device)
-
-        print(f"Replacing Parseq head: {original_head.out_features} -> {out_features} classes")
-        print(f"Preserving pretrained weights for {len(vocab_mapping)} characters")
-
-        # Initialize with corresponding weights from pretrained layer
-        with torch.no_grad():
-            for new_idx, old_idx in enumerate(vocab_mapping):
-                if old_idx < original_head.out_features:
-                    new_head.weight[new_idx] = original_head.weight[old_idx].clone()
-                    new_head.bias[new_idx] = original_head.bias[old_idx].clone()
-
-        # Replace the layer using the path
-        if '.' in head_path:
-            # Navigate to parent and replace
-            parts = head_path.split('.')
-            parent = self.model
-            for part in parts[:-1]:
-                parent = getattr(parent, part)
-            setattr(parent, parts[-1], new_head)
+                selector = list(range(max_perms))
+            perm_pool = torch.as_tensor(
+                list(iter_perms(range(max_num_chars), max_num_chars)),
+                device=device,
+            )[selector]
+            if self._perm_forward:
+                perm_pool = perm_pool[1:]
+            perms = torch.stack(perms) if perms else torch.empty(0, max_num_chars, dtype=torch.long, device=device)
+            if len(perm_pool):
+                i = self._rng.choice(len(perm_pool), size=num_gen_perms - len(perms), replace=False)
+                perms = torch.cat([perms, perm_pool[i]])
         else:
-            setattr(self.model, head_path, new_head)
+            perms.extend(
+                [torch.randperm(max_num_chars, device=device) for _ in range(num_gen_perms - len(perms))]
+            )
+            perms = torch.stack(perms)
 
-        print("Parseq head replaced successfully")
+        if self._perm_mirrored:
+            comp = perms.flip(-1)
+            perms = torch.stack([perms, comp]).transpose(0, 1).reshape(-1, max_num_chars)
+
+        # Add BOS (position 0) and EOS (position max_num_chars + 1)
+        bos_idx = perms.new_zeros((len(perms), 1))
+        eos_idx = perms.new_full((len(perms), 1), max_num_chars + 1)
+        perms = torch.cat([bos_idx, perms + 1, eos_idx], dim=1)
+
+        # Reverse direction handling
+        if len(perms) > 1:
+            perms[1, 1:] = max_num_chars + 1 - torch.arange(max_num_chars + 1, device=device)
+
+        return perms
+
+    def _generate_attn_masks(self, perm: torch.Tensor):
+        """
+        Generate attention masks from a permutation ordering.
+
+        Args:
+            perm: (T,) permutation tensor
+
+        Returns:
+            (content_mask, query_mask) boolean tensors
+        """
+        device = perm.device
+        sz = perm.shape[0]
+        mask = torch.zeros((sz, sz), dtype=torch.bool, device=device)
+        for i in range(sz):
+            query_idx = perm[i]
+            masked_keys = perm[i + 1:]
+            mask[query_idx, masked_keys] = True
+        content_mask = mask[:-1, :-1].clone()
+        mask[torch.eye(sz, dtype=torch.bool, device=device)] = True
+        query_mask = mask[1:, :-1]
+        return content_mask, query_mask
+
+    def forward_train(
+        self,
+        images: torch.Tensor,
+        targets: List[str],
+        label_smoothing: float = 0.1,
+    ) -> torch.Tensor:
+        """
+        PARSeq training forward pass with teacher forcing and PLM.
+
+        This is the correct way to train PARSeq — NOT via the inference forward().
+
+        The training protocol:
+        1. Encode images with ViT encoder
+        2. Encode target labels with BOS/EOS/PAD tokens
+        3. For each permutation ordering:
+           - Generate attention masks
+           - Decode with teacher forcing (ground-truth as input)
+           - Compute CE loss
+        4. Average losses across permutations
+
+        Args:
+            images: (B, 3, H, W) input images in [-1, 1] range
+            targets: List of target text strings (e.g., ["ABC1234", "XYZ5678"])
+            label_smoothing: Label smoothing factor
+
+        Returns:
+            Loss tensor with gradients
+        """
+        assert self.use_parseq, "forward_train is only for PARSeq, not SimpleCRNN"
+
+        # Preprocess images
+        if images.min() < 0:
+            x = (images + 1.0) / 2.0
+            x = torch.clamp(x, 0, 1)
+        else:
+            x = images
+        x = self._preprocess_for_parseq(x)
+
+        # Encode images
+        memory = self._parseq_raw.encode(x)
+
+        # Encode targets using PARSeq's native tokenizer: [BOS, c1, c2, ..., cn, EOS, PAD...]
+        tgt = self._parseq_tokenizer.encode(targets, x.device)
+
+        # Split into input and output
+        tgt_in = tgt[:, :-1]   # [BOS, c1, c2, ..., cn]
+        tgt_out = tgt[:, 1:]   # [c1, c2, ..., cn, EOS]
+
+        # Padding mask
+        tgt_padding_mask = (tgt_in == self.pad_id) | (tgt_in == self.eos_id)
+
+        # Generate permutations for PLM training
+        tgt_perms = self._gen_tgt_perms(tgt)
+
+        loss = 0
+        loss_numel = 0
+        n = (tgt_out != self.pad_id).sum().item()
+
+        for i, perm in enumerate(tgt_perms):
+            tgt_mask, query_mask = self._generate_attn_masks(perm)
+
+            # Teacher-forced decode
+            out = self._parseq_raw.decode(
+                tgt_in, memory, tgt_mask, tgt_padding_mask, tgt_query_mask=query_mask
+            )
+            logits = self._parseq_raw.head(out).flatten(end_dim=1)
+
+            loss += n * F.cross_entropy(
+                logits, tgt_out.flatten(),
+                ignore_index=self.pad_id,
+                label_smoothing=label_smoothing,
+            )
+            loss_numel += n
+
+            # After canonical + reverse orderings, remove EOS for remaining perms
+            if i == 1:
+                tgt_out = torch.where(tgt_out == self.eos_id, self.pad_id, tgt_out)
+                n = (tgt_out != self.pad_id).sum().item()
+
+        loss /= loss_numel
+
+        return loss
+
 
     def forward(
         self,
@@ -482,7 +597,10 @@ class OCRModel(nn.Module):
         return_logits: bool = True,
     ) -> torch.Tensor:
         """
-        Forward pass.
+        Forward pass (inference mode).
+
+        For PARSeq: uses autoregressive decoding with native tokenizer.
+        For SimpleCRNN: uses CTC-based forward pass.
 
         Args:
             images: Input images of shape (B, 3, H, W) in range [-1, 1]
@@ -493,36 +611,19 @@ class OCRModel(nn.Module):
             Otherwise: Predicted texts
         """
         # Normalize to [0, 1] range
-        # Dataset may provide images in either [-1, 1] or [0, 1] range
-        # Auto-detect and normalize only if needed
-        if images.min() < 0:  # Input is in [-1, 1] range
+        if images.min() < 0:
             x = (images + 1.0) / 2.0
             x = torch.clamp(x, 0, 1)
         else:
-            x = images  # Already in [0, 1] range
+            x = images
 
-        # Check if using SimpleCRNN fallback
-        is_simple_crnn = isinstance(self.model, SimpleCRNN)
-
-        if not is_simple_crnn:
-            # Resize to Parseq expected input size (32, 128)
-            # Parseq uses VisionTransformer which requires fixed input size
-            parseq_h, parseq_w = 32, 128
-            if x.shape[2] != parseq_h or x.shape[3] != parseq_w:
-                x = F.interpolate(x, size=(parseq_h, parseq_w), mode='bilinear', align_corners=False)
-
-            # Normalize with ImageNet stats (Parseq expects this)
-            mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(x.device)
-            std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(x.device)
-            x = (x - mean) / std
-
-        # Get model outputs
-        if is_simple_crnn:
+        if not self.use_parseq:
             # SimpleCRNN handles normalization internally
             return self.model(x, return_logits=return_logits)
         else:
-            # PARSeq model — output is already (B, T, C) format
-            logits = self.model(x)  # (B, ~26, num_classes)
+            # PARSeq inference: preprocess + native forward (AR decode)
+            x = self._preprocess_for_parseq(x)
+            logits = self.parseq_system(x, self.max_length)  # (B, max_length+1, num_classes)
             if return_logits:
                 # Truncate or pad to max_length
                 if logits.shape[1] > self.max_length:
@@ -546,25 +647,20 @@ class OCRModel(nn.Module):
             List of predicted text strings
         """
         with torch.no_grad():
-            # Check if using real Parseq model
-            is_simple_crnn = isinstance(self.model, SimpleCRNN)
-
-            # Get logits through unified forward pass
             logits = self.forward(images, return_logits=True)
 
-        if is_simple_crnn and hasattr(self.model, 'use_ctc') and self.model.use_ctc:
+        if not self.use_parseq:
             # SimpleCRNN with CTC decoding
             if beam_width == 1:
                 decoded_indices_list = self.model.ctc_decode_greedy(logits)
             else:
                 decoded_indices_list = self.model.ctc_decode_beam_search(logits, beam_width=beam_width)
 
-            # Convert indices to characters
             texts = []
             for indices in decoded_indices_list:
                 text = ""
                 for idx in indices:
-                    if 0 <= idx < self.blank_idx:  # Valid character index
+                    if 0 <= idx < self.blank_idx:
                         char = self.tokenizer.idx_to_char.get(idx, "")
                         if char in self.tokenizer.vocab:
                             text += char
@@ -573,9 +669,15 @@ class OCRModel(nn.Module):
             texts = [PlateFormatValidator.correct(t) for t in texts]
             return texts
         else:
-            # PARSeq or non-CTC model: position-aligned argmax decoding
-            pred_indices = logits.argmax(dim=-1)  # (B, max_length)
-            texts = self.tokenizer.decode_batch(pred_indices)
+            # PARSeq: decode using native tokenizer then filter to our vocab
+            probs = logits.softmax(-1)
+            preds, _ = self._parseq_tokenizer.decode(probs)
+            # Filter to uppercase + digits (our LP vocabulary)
+            allowed = set(self.vocab)
+            texts = []
+            for pred in preds:
+                text = ''.join(c.upper() if c.upper() in allowed else '' for c in pred)
+                texts.append(text[:self.max_length])
             texts = [PlateFormatValidator.correct(t) for t in texts]
             return texts
 
@@ -774,8 +876,10 @@ class OCRModel(nn.Module):
         label_smoothing: float = 0.1,
     ) -> torch.Tensor:
         """
-        Compute appropriate loss based on model type.
-        Uses CTC for SimpleCRNN, cross-entropy for Parseq.
+        Compute loss for training.
+
+        For SimpleCRNN: computes CTC loss from logits.
+        For PARSeq: raises error — use forward_train() instead.
 
         Args:
             logits: (B, T, C) predictions from model
@@ -787,62 +891,13 @@ class OCRModel(nn.Module):
             Loss tensor
         """
         if self.use_parseq:
-            return self.compute_ce_loss(logits, targets, device, label_smoothing)
-        else:
-            return self.compute_ctc_loss(logits, targets, device, label_smoothing)
+            raise RuntimeError(
+                "PARSeq training must use forward_train(images, targets) instead of "
+                "forward() + compute_loss(). forward_train() implements teacher forcing "
+                "with PLM, which is required for proper gradient flow."
+            )
+        return self.compute_ctc_loss(logits, targets, device, label_smoothing)
 
-    def compute_ce_loss(
-        self,
-        logits: torch.Tensor,
-        targets: List[str],
-        device: str = "cuda",
-        label_smoothing: float = 0.1,
-    ) -> torch.Tensor:
-        """
-        Compute cross-entropy loss for PARSeq training.
-
-        Since we replaced PARSeq's output head to match our 36-char vocab,
-        we always use our simple tokenizer for target encoding.
-
-        Args:
-            logits: (B, T, C) predictions from model (C=36 after head replacement)
-            targets: List of target text strings
-            device: Device to compute loss on
-            label_smoothing: Label smoothing factor
-
-        Returns:
-            Cross-entropy loss tensor
-        """
-        import torch.nn.functional as F
-
-        B, T, C = logits.shape
-
-        # Encode targets using our simple tokenizer (matches replaced head)
-        # Use -1 as padding (NOT 0, because index 0 = digit '0' which is a valid char)
-        target_tensor = torch.full((B, T), -1, dtype=torch.long, device=device)
-
-        for i, text in enumerate(targets):
-            for j, char in enumerate(text):
-                if j >= T:
-                    break
-                if char in self.tokenizer.char_to_idx:
-                    idx = self.tokenizer.char_to_idx[char]
-                    target_tensor[i, j] = min(idx, C - 1)
-
-        # Flatten for cross-entropy: (B*T, C) and (B*T,)
-        logits_flat = logits.reshape(-1, C)
-        targets_flat = target_tensor.reshape(-1)
-
-        # Use cross-entropy with label smoothing
-        # ignore_index=-1 skips padding positions (positions beyond text length)
-        loss = F.cross_entropy(
-            logits_flat,
-            targets_flat,
-            ignore_index=-1,
-            label_smoothing=label_smoothing,
-        )
-
-        return loss
 
 
 class ConvBNReLU(nn.Module):

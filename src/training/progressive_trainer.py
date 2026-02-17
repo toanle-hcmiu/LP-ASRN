@@ -440,7 +440,8 @@ class ProgressiveTrainer:
                 # Decode texts from logits for confusion tracking (non-differentiable)
                 ocr_unwrapped = self._unwrap_model(self.ocr)
                 with torch.no_grad():
-                    if hasattr(ocr_unwrapped.model, 'use_ctc') and ocr_unwrapped.model.use_ctc:
+                    if not ocr_unwrapped.use_parseq:
+                        # SimpleCRNN: CTC decode from logits
                         decoded_lists = ocr_unwrapped.model.ctc_decode_greedy(pred_logits)
                         pred_texts = []
                         for indices in decoded_lists:
@@ -452,8 +453,14 @@ class ProgressiveTrainer:
                                         text += char
                             pred_texts.append(text)
                     else:
-                        pred_indices = pred_logits.argmax(dim=-1)
-                        pred_texts = ocr_unwrapped.tokenizer.decode_batch(pred_indices)
+                        # PARSeq: use native tokenizer decode
+                        probs = pred_logits.softmax(-1)
+                        preds, _ = ocr_unwrapped._parseq_tokenizer.decode(probs)
+                        allowed = set(ocr_unwrapped.vocab)
+                        pred_texts = []
+                        for pred in preds:
+                            text = ''.join(c.upper() if c.upper() in allowed else '' for c in pred)
+                            pred_texts.append(text[:ocr_unwrapped.max_length])
 
                 # Compute LCOFL (layout penalty now uses logits directly)
                 lcofl, lcofl_info = self.lcofl_loss(
@@ -752,13 +759,25 @@ class ProgressiveTrainer:
 
         self.ocr.train()
 
-        # Create optimizer for OCR only (AdamW with weight decay for better generalization)
-        # Fixed: Use configured LR directly (removed 0.1 multiplier that was too conservative)
-        self.optimizer = optim.AdamW(
-            self.ocr.parameters(),
-            lr=stage_config.lr,  # Use configured LR directly (0.001)
-            weight_decay=0.05,  # Increased from 0.01 for better regularization
-        )
+        # Create optimizer for OCR only
+        ocr_unwrapped = self._unwrap_model(self.ocr)
+        if ocr_unwrapped.use_parseq:
+            # PARSeq: pretrained ViT needs much lower LR to preserve knowledge
+            parseq_lr = stage_config.lr * 0.01  # e.g. 0.001 → 1e-5
+            self.optimizer = optim.AdamW(
+                self.ocr.parameters(),
+                lr=parseq_lr,
+                weight_decay=0.01,  # lighter weight decay for pretrained
+            )
+            if self.is_main:
+                print(f"  PARSeq fine-tuning LR: {parseq_lr:.1e} (100x lower than config)")
+        else:
+            # SimpleCRNN: train from scratch with higher LR
+            self.optimizer = optim.AdamW(
+                self.ocr.parameters(),
+                lr=stage_config.lr,
+                weight_decay=0.05,
+            )
 
         # Add warmup scheduler for first 5 epochs to prevent early instability
         warmup_epochs = 5
@@ -816,14 +835,23 @@ class ProgressiveTrainer:
                 if self.ocr.training:
                     hr_images = self._apply_ocr_augmentation(hr_images)
 
-                # Forward pass
-                logits = self.ocr(hr_images, return_logits=True)
-
-                # Compute loss (uses CTC for SimpleCRNN)
+                # Compute loss — different paths for PARSeq vs SimpleCRNN
                 ocr_unwrapped = self._unwrap_model(self.ocr)
                 label_smoothing = self.config.get("ocr", {}).get("label_smoothing", 0.1)
-                loss = ocr_unwrapped.compute_loss(logits, gt_texts, device=self.device,
-                                                   label_smoothing=label_smoothing)
+
+                if ocr_unwrapped.use_parseq:
+                    # PARSeq: use forward_train (teacher forcing + PLM)
+                    # This handles forward pass + loss in one call
+                    loss = ocr_unwrapped.forward_train(
+                        hr_images, gt_texts, label_smoothing=label_smoothing
+                    )
+                else:
+                    # SimpleCRNN: standard forward + CTC loss
+                    logits = self.ocr(hr_images, return_logits=True)
+                    loss = ocr_unwrapped.compute_loss(
+                        logits, gt_texts, device=self.device,
+                        label_smoothing=label_smoothing
+                    )
 
                 # Backward pass
                 self.optimizer.zero_grad()
