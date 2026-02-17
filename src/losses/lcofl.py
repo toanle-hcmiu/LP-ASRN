@@ -20,8 +20,13 @@ from typing import Dict, Optional, Tuple, List
 from collections import defaultdict
 
 # PARSeq's native vocabulary for vocab mapping
-# Order: digits, lowercase, uppercase, punctuation (95 characters)
-PARSEQ_VOCAB = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ!\"#$%&'()*+,-.:;<=>?@[\\]^_`{|}~"
+# IMPORTANT: PARSeq has 97 tokens total:
+#   - Index 0: [E] (EOS token)
+#   - Indices 1-94: 94 characters (digits, lowercase, uppercase, punctuation)
+#   - Index 95: [B] (BOS token)
+#   - Index 96: [P] (PAD token)
+# We include the special tokens so indices match PARSeq's actual output
+PARSEQ_VOCAB = "[E]0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~[B][P]"
 
 
 class ClassificationLoss(nn.Module):
