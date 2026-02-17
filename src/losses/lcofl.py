@@ -20,13 +20,10 @@ from typing import Dict, Optional, Tuple, List
 from collections import defaultdict
 
 # PARSeq's native vocabulary for vocab mapping
-# IMPORTANT: PARSeq has 97 tokens total:
-#   - Index 0: [E] (EOS token)
-#   - Indices 1-94: 94 characters (digits, lowercase, uppercase, punctuation)
-#   - Index 95: [B] (BOS token)
-#   - Index 96: [P] (PAD token)
-# We include the special tokens so indices match PARSeq's actual output
-PARSEQ_VOCAB = "[E]0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~[B][P]"
+# PARSeq has 97 tokens with special multi-character tokens at indices 0, 95, 96
+# Our 36-char LP vocab (0-9, A-Z) maps to indices 1-10 and 37-62
+# This is pre-computed for efficiency
+_PARSEQ_VOCAB_INDICES = list(range(1, 11)) + list(range(37, 63))  # [1,2,...,10, 37,38,...,62]
 
 
 class ClassificationLoss(nn.Module):
@@ -65,6 +62,12 @@ class ClassificationLoss(nn.Module):
         # Initialize weights (all 1 initially)
         self.register_buffer("weights", torch.ones(self.num_classes))
 
+        # Pre-computed PARSeq to our vocab index mapping
+        # Our vocab "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ" maps to PARSeq indices:
+        #   '0'-'9' -> indices 1-10
+        #   'A'-'Z' -> indices 37-62
+        self.register_buffer("parseq_vocab_mapping", torch.tensor(_PARSEQ_VOCAB_INDICES, dtype=torch.long))
+
         # For tracking confusion
         self.confusion_matrix: Optional[torch.Tensor] = None
 
@@ -87,29 +90,17 @@ class ClassificationLoss(nn.Module):
         """
         Map PARSeq's larger vocab logits to our 36-char LP vocab.
 
-        PARSeq vocab (95 chars): 0-9, a-z, A-Z, punctuation
-        Our LP vocab (36 chars): 0-9, A-Z
+        Uses pre-computed index mapping for efficient gradient flow.
 
         Args:
-            pred_logits: (B, K, 95) PARSeq output logits
+            pred_logits: (B, K, 97) PARSeq output logits
 
         Returns:
             (B, K, 36) Mapped logits containing only our vocab characters
         """
-        # Our vocab: digits + uppercase letters (must match self.vocab order)
-        our_vocab = self.vocab  # "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-
-        # Find indices in PARSeq vocab that correspond to our characters
-        our_indices_in_parseq = [PARSEQ_VOCAB.index(c) for c in our_vocab]
-
-        # Create index tensor for efficient gathering
-        index_tensor = torch.tensor(our_indices_in_parseq,
-                                    dtype=torch.long,
-                                    device=pred_logits.device)
-
-        # Extract only those logits using index_select
-        # pred_logits: (B, K, 95) -> (B, K, 36)
-        mapped_logits = pred_logits[:, :, index_tensor]
+        # Use pre-computed mapping (registered as buffer for proper device placement)
+        # pred_logits: (B, K, 97) -> (B, K, 36)
+        mapped_logits = pred_logits[:, :, self.parseq_vocab_mapping]
         return mapped_logits
 
     def get_character_pairs(
@@ -284,12 +275,14 @@ class ClassificationLoss(nn.Module):
         # Compute weighted cross-entropy
         mask = targets_flat != -100
         if mask.sum() > 0:
-            loss = F.cross_entropy(
-                pred_logits_flat[mask],
-                targets_flat[mask],
-                weight=self.weights.to(pred_logits.device),
-                reduction="mean",
-            )
+            # Log space for numerical stability
+            log_probs = F.log_softmax(pred_logits_flat[mask], dim=-1)
+            # Compute negative log likelihood with weights
+            nll_loss = -log_probs[range(len(targets_flat[mask])), targets_flat[mask]]
+            # Apply class weights
+            weights = self.weights.to(pred_logits.device)
+            weighted_loss = nll_loss * weights[targets_flat[mask]]
+            loss = weighted_loss.mean()
         else:
             loss = torch.tensor(0.0, device=pred_logits.device, requires_grad=True)
 
