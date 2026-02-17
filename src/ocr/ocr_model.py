@@ -549,7 +549,12 @@ class OCRModel(nn.Module):
         memory = self._parseq_raw.encode(x)
 
         # Encode targets using PARSeq's native tokenizer: [BOS, c1, c2, ..., cn, EOS, PAD...]
-        tgt = self._parseq_tokenizer.encode(targets, x.device)
+        # Clean targets: remove spaces and chars not in PARSeq's charset
+        clean_targets = []
+        for t in targets:
+            clean = ''.join(c for c in t if c in self._parseq_tokenizer._stoi)
+            clean_targets.append(clean)
+        tgt = self._parseq_tokenizer.encode(clean_targets, x.device)
 
         # Split into input and output
         tgt_in = tgt[:, :-1]   # [BOS, c1, c2, ..., cn]
