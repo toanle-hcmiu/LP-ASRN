@@ -838,7 +838,7 @@ def run_diagnose(args):
         strat_d[track_id] = (text, conf)
     strategies["D: OCR-only(native)"] = strat_d
 
-    # Strategy E: No format correction (raw beam search)
+    # Strategy E: No format correction (raw predictions)
     print("  Running Strategy E: SR + NO format correction...")
     strat_e = {}
     for track_id, image_paths in test_tracks:
@@ -849,15 +849,29 @@ def run_diagnose(args):
         else:
             sr = batch
         logits = ocr(sr, return_logits=True)
-        # Greedy decode WITHOUT format correction
-        decoded_lists = ocr.model.ctc_decode_greedy(logits)
-        preds = []
-        for b in range(logits.shape[0]):
-            text = indices_to_text(decoded_lists[b], ocr)
-            preds.append((text, 1.0))
+
+        # Decode WITHOUT format correction (raw predictions)
+        if ocr.use_parseq:
+            # PARSeq: use native tokenizer without format correction
+            probs = logits.softmax(-1)
+            preds_list, _ = ocr._parseq_tokenizer.decode(probs)
+            allowed = set(ocr.vocab)
+            preds = []
+            for pred in preds_list:
+                text = ''.join(c.upper() if c.upper() in allowed else '' for c in pred)
+                # NO PlateFormatValidator.correct() here
+                preds.append((text[:ocr.max_length], 1.0))
+        else:
+            # SimpleCRNN: greedy decode without format correction
+            decoded_lists = ocr.model.ctc_decode_greedy(logits)
+            preds = []
+            for b in range(logits.shape[0]):
+                text = indices_to_text(decoded_lists[b], ocr)
+                preds.append((text, 1.0))
+
         text, conf = aggregate_track_predictions(preds)
         strat_e[track_id] = (text, conf)
-    strategies["E: SR+greedy(no fmt fix)"] = strat_e
+    strategies["E: SR+raw(no fmt fix)"] = strat_e
 
     # Strategy F: Aspect-ratio-preserving resize + SR
     print("  Running Strategy F: aspect-preserving resize + SR...")
