@@ -1,13 +1,14 @@
 """
 OCR Model for License Plate Recognition
 
-Supports two backends:
-- Pretrained: External model from HuggingFace (use_pretrained=True)
-- SimpleCRNN: Custom CRNN with TPS-STN, ResNet, BiLSTM (default)
+Uses PARSeq (Pre-training Autoregressive Objectively) from HuggingFace:
+- Attention-based architecture with autoregressive decoding
+- Pretrained on millions of text images
+- State-of-the-art accuracy on license plate recognition
 
 This module provides:
 1. OCRModel class for inference and fine-tuning
-2. CharacterTokenizer for encoding/decoding text
+2. ParseqTokenizer for encoding/decoding text
 3. Integration with LCOFL loss function
 """
 
@@ -17,17 +18,6 @@ import torch.nn.functional as F
 from typing import List, Dict, Optional, Tuple
 import re
 import math
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from typing import List, Dict, Optional, Tuple
-import re
-
-# PARSeq availability is checked at runtime when use_parseq=True
-# This avoids torch.hub loading at import time
-PARSEQ_AVAILABLE = None  # Will be set on first attempt to load
-PARSEQ_SOURCE = None
 
 
 class PlateFormatValidator:
@@ -184,7 +174,7 @@ class ParseqTokenizer:
             self.idx_to_char = {i: c for i, c in enumerate(self.PARSEQ_VOCAB)}
             self.vocab_size = len(self.PARSEQ_VOCAB)  # 95
         else:
-            # Use simple sequential indexing (for SimpleCRNN fallback)
+            # Use simple sequential indexing
             self.char_to_idx = {c: i for i, c in enumerate(vocab)}
             self.idx_to_char = {i: c for i, c in enumerate(vocab)}
             self.vocab_size = len(vocab)
@@ -283,17 +273,17 @@ class ParseqTokenizer:
 
 class OCRModel(nn.Module):
     """
-    OCR Model Wrapper for License Plate Recognition.
+    OCR Model Wrapper for License Plate Recognition using PARSeq.
 
-    Supports two backends:
-    - Parseq: Pretrained model from HuggingFace (use_parseq=True)
-    - SimpleCRNN: Custom CRNN with TPS-STN, ResNet, BiLSTM (use_parseq=False)
+    PARSeq (Pre-training Autoregressive Objectively with Self-supervision)
+    is a state-of-the-art text recognition model pretrained on millions
+    of text images.
 
     Provides:
-    - Loading pretrained models
+    - Loading pretrained PARSeq model from HuggingFace
     - Fine-tuning on license plate data
     - Inference with logit outputs for LCOFL
-    - Text decoding with CTC or Parseq tokenizer
+    - Text decoding with autoregressive inference
     """
 
     def __init__(
@@ -302,106 +292,66 @@ class OCRModel(nn.Module):
         vocab: str = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ",
         max_length: int = 7,
         frozen: bool = True,
-        rnn_dropout: float = 0.3,
-        use_parseq: bool = True,  # New flag to choose model
-        backbone_channels: int = 256,  # OCR backbone channels (256=lightweight, 384=full)
-        lstm_hidden_size: int = 256,  # LSTM hidden size (256=lightweight, 384=full)
-        lstm_num_layers: int = 1,  # LSTM layers (1=lightweight, 2=full)
     ):
         """
         Initialize OCR Model.
 
         Args:
-            pretrained_path: Path or HuggingFace ID for pretrained model (for Parseq)
+            pretrained_path: Path or HuggingFace ID for pretrained model
             vocab: Character vocabulary
             max_length: Maximum sequence length
             frozen: If True, freeze weights during SR training
-            rnn_dropout: Dropout rate for RNN layer in SimpleCRNN
-            use_parseq: If True, use real Parseq model; if False, use SimpleCRNN
-            backbone_channels: Final backbone feature channels (256=lightweight, 384=full)
-            lstm_hidden_size: LSTM hidden size (256=lightweight, 384=full)
-            lstm_num_layers: Number of LSTM layers (1=lightweight, 2=full)
         """
         super().__init__()
 
         self.vocab = vocab
         self.max_length = max_length
         self.frozen = frozen
-        self.use_parseq = use_parseq
 
-        if use_parseq:
-            # Load real Parseq model from HuggingFace
-            try:
-                print(f"Loading PARSeq model from HuggingFace...")
-                # torch.hub returns system.PARSeq (PyTorch Lightning wrapper)
-                # which contains .model (raw PARSeq) and .tokenizer
-                self.parseq_system = torch.hub.load(
-                    'baudm/parseq', 'parseq', pretrained=True, trust_repo=True
-                )
-                self.use_parseq = True
-                print("Successfully loaded PARSeq model")
+        # Load PARSeq model from HuggingFace
+        print(f"Loading PARSeq model from HuggingFace ({pretrained_path})...")
+        self.parseq_system = torch.hub.load(
+            pretrained_path.split('/')[0], 'parseq',
+            pretrained=True,
+            source='github',
+            trust_repo=True
+        )
+        print("Successfully loaded PARSeq model")
 
-                # Store references to PARSeq's internal components
-                # self.parseq_system.model = raw PARSeq (encoder + decoder + head)
-                # self.parseq_system.tokenizer = Tokenizer with BOS/EOS/PAD
-                self.model = self.parseq_system  # for nn.Module parameter tracking
-                self._parseq_raw = self.parseq_system.model  # raw model for encode/decode/head
-                self._parseq_tokenizer = self.parseq_system.tokenizer
-                self.bos_id = self.parseq_system.bos_id
-                self.eos_id = self.parseq_system.eos_id
-                self.pad_id = self.parseq_system.pad_id
+        # Store references to PARSeq's internal components
+        # self.parseq_system.model = raw PARSeq (encoder + decoder + head)
+        # self.parseq_system.tokenizer = Tokenizer with BOS/EOS/PAD
+        self.model = self.parseq_system  # for nn.Module parameter tracking
+        self._parseq_raw = self.parseq_system.model  # raw model for encode/decode/head
+        self._parseq_tokenizer = self.parseq_system.tokenizer
+        self.bos_id = self.parseq_system.bos_id
+        self.eos_id = self.parseq_system.eos_id
+        self.pad_id = self.parseq_system.pad_id
 
-                # PARSeq uses its native 94-char vocab — NO head replacement needed
-                # Our 36-char vocab (0-9, A-Z) is a subset of PARSeq's charset
-                # At decode time, output is filtered to uppercase + digits
-                self.blank_idx = None  # PARSeq doesn't use CTC blank
+        # PARSeq uses its native 94-char vocab — NO head replacement needed
+        # Our 36-char vocab (0-9, A-Z) is a subset of PARSeq's charset
+        self.blank_idx = None  # PARSeq doesn't use CTC blank
 
-                # PLM permutation config (from PARSeq's default settings)
-                self._perm_num = 6  # number of permutations per batch
-                self._perm_forward = True  # always include forward permutation
-                self._perm_mirrored = True  # include mirrored permutations
-                self._rng = __import__('numpy').random.default_rng()
+        # PLM permutation config (from PARSeq's default settings)
+        self._perm_num = 6  # number of permutations per batch
+        self._perm_forward = True  # always include forward permutation
+        self._perm_mirrored = True  # include mirrored permutations
+        self._rng = __import__('numpy').random.default_rng()
 
-                # Simple tokenizer for SimpleCRNN compatibility (decode_batch, etc.)
-                self.tokenizer = ParseqTokenizer(vocab, max_length, use_parseq_vocab=False)
+        # Simple tokenizer for compatibility (decode_batch, etc.)
+        self.tokenizer = ParseqTokenizer(vocab, max_length, use_parseq_vocab=False)
 
-                # Print model info
-                n_params = sum(p.numel() for p in self.parseq_system.parameters())
-                print(f"  PARSeq parameters: {n_params:,}")
-                print(f"  Native vocab size: {len(self._parseq_tokenizer)} tokens")
-                print(f"  Max label length: {self._parseq_raw.max_label_length}")
-                print(f"  Training: teacher forcing + PLM ({self._perm_num} permutations)")
-
-            except Exception as e:
-                print(f"Failed to load PARSeq: {e}")
-                import traceback
-                traceback.print_exc()
-                print("Falling back to SimpleCRNN...")
-                self._init_simple_crnn(vocab, max_length, rnn_dropout, backbone_channels, lstm_hidden_size, lstm_num_layers)
-        else:
-            self._init_simple_crnn(vocab, max_length, rnn_dropout, backbone_channels, lstm_hidden_size, lstm_num_layers)
+        # Print model info
+        n_params = sum(p.numel() for p in self.parseq_system.parameters())
+        print(f"  PARSeq parameters: {n_params:,}")
+        print(f"  Native vocab size: {len(self._parseq_tokenizer)} tokens")
+        print(f"  Max label length: {self._parseq_raw.max_label_length}")
+        print(f"  Training: teacher forcing + PLM ({self._perm_num} permutations)")
 
         # Freeze weights if specified
         if frozen:
             for param in self.parameters():
                 param.requires_grad = False
-
-    def _init_simple_crnn(self, vocab: str, max_length: int, rnn_dropout: float, backbone_channels: int = 256, lstm_hidden_size: int = 256, lstm_num_layers: int = 1):
-        """Initialize SimpleCRNN as fallback."""
-        self.model = SimpleCRNN(
-            vocab_size=len(vocab),
-            max_length=max_length,
-            use_ctc=True,
-            rnn_dropout=rnn_dropout,
-            backbone_channels=backbone_channels,
-            lstm_hidden_size=lstm_hidden_size,
-            lstm_num_layers=lstm_num_layers,
-        )
-        self.use_parseq = False
-        self.blank_idx = len(vocab)
-        self.parseq_system = None  # no PARSeq
-        print(f"Using SimpleCRNN model (backbone={backbone_channels}, LSTM={lstm_hidden_size}x{lstm_num_layers}) with CTC decoding")
-        self.tokenizer = ParseqTokenizer(vocab, max_length, use_parseq_vocab=False)
 
     def _preprocess_for_parseq(self, images: torch.Tensor) -> torch.Tensor:
         """
@@ -535,8 +485,6 @@ class OCRModel(nn.Module):
         Returns:
             Loss tensor with gradients
         """
-        assert self.use_parseq, "forward_train is only for PARSeq, not SimpleCRNN"
-
         # Preprocess images
         if images.min() < 0:
             x = (images + 1.0) / 2.0
@@ -595,7 +543,6 @@ class OCRModel(nn.Module):
 
         return loss
 
-
     def forward(
         self,
         images: torch.Tensor,
@@ -604,8 +551,7 @@ class OCRModel(nn.Module):
         """
         Forward pass (inference mode).
 
-        For PARSeq: uses autoregressive decoding with native tokenizer.
-        For SimpleCRNN: uses CTC-based forward pass.
+        Uses autoregressive decoding with PARSeq's native tokenizer.
 
         Args:
             images: Input images of shape (B, 3, H, W) in range [-1, 1]
@@ -622,23 +568,19 @@ class OCRModel(nn.Module):
         else:
             x = images
 
-        if not self.use_parseq:
-            # SimpleCRNN handles normalization internally
-            return self.model(x, return_logits=return_logits)
+        # PARSeq inference: preprocess + native forward (AR decode)
+        x = self._preprocess_for_parseq(x)
+        logits = self.parseq_system(x, self.max_length)  # (B, max_length+1, num_classes)
+        if return_logits:
+            # Truncate or pad to max_length
+            if logits.shape[1] > self.max_length:
+                logits = logits[:, :self.max_length, :]
+            elif logits.shape[1] < self.max_length:
+                pad_len = self.max_length - logits.shape[1]
+                logits = F.pad(logits, (0, 0, 0, pad_len))
+            return logits
         else:
-            # PARSeq inference: preprocess + native forward (AR decode)
-            x = self._preprocess_for_parseq(x)
-            logits = self.parseq_system(x, self.max_length)  # (B, max_length+1, num_classes)
-            if return_logits:
-                # Truncate or pad to max_length
-                if logits.shape[1] > self.max_length:
-                    logits = logits[:, :self.max_length, :]
-                elif logits.shape[1] < self.max_length:
-                    pad_len = self.max_length - logits.shape[1]
-                    logits = F.pad(logits, (0, 0, 0, pad_len))
-                return logits
-            else:
-                return logits
+            return logits
 
     def predict(self, images: torch.Tensor, beam_width: int = 1) -> List[str]:
         """
@@ -646,7 +588,7 @@ class OCRModel(nn.Module):
 
         Args:
             images: Input images of shape (B, 3, H, W)
-            beam_width: Beam width for CTC decoding (1 = greedy/fast, 5 = accurate/slow)
+            beam_width: Beam width for decoding (1 = greedy/fast, 5 = accurate/slow)
 
         Returns:
             List of predicted text strings
@@ -654,37 +596,17 @@ class OCRModel(nn.Module):
         with torch.no_grad():
             logits = self.forward(images, return_logits=True)
 
-        if not self.use_parseq:
-            # SimpleCRNN with CTC decoding
-            if beam_width == 1:
-                decoded_indices_list = self.model.ctc_decode_greedy(logits)
-            else:
-                decoded_indices_list = self.model.ctc_decode_beam_search(logits, beam_width=beam_width)
-
-            texts = []
-            for indices in decoded_indices_list:
-                text = ""
-                for idx in indices:
-                    if 0 <= idx < self.blank_idx:
-                        char = self.tokenizer.idx_to_char.get(idx, "")
-                        if char in self.tokenizer.vocab:
-                            text += char
-                texts.append(text)
-
-            texts = [PlateFormatValidator.correct(t) for t in texts]
-            return texts
-        else:
-            # PARSeq: decode using native tokenizer then filter to our vocab
-            probs = logits.softmax(-1)
-            preds, _ = self._parseq_tokenizer.decode(probs)
-            # Filter to uppercase + digits (our LP vocabulary)
-            allowed = set(self.vocab)
-            texts = []
-            for pred in preds:
-                text = ''.join(c.upper() if c.upper() in allowed else '' for c in pred)
-                texts.append(text[:self.max_length])
-            texts = [PlateFormatValidator.correct(t) for t in texts]
-            return texts
+        # PARSeq: decode using native tokenizer then filter to our vocab
+        probs = logits.softmax(-1)
+        preds, _ = self._parseq_tokenizer.decode(probs)
+        # Filter to uppercase + digits (our LP vocabulary)
+        allowed = set(self.vocab)
+        texts = []
+        for pred in preds:
+            text = ''.join(c.upper() if c.upper() in allowed else '' for c in pred)
+            texts.append(text[:self.max_length])
+        texts = [PlateFormatValidator.correct(t) for t in texts]
+        return texts
 
     def finetune(
         self,
@@ -695,7 +617,7 @@ class OCRModel(nn.Module):
         device: str = "cuda",
     ):
         """
-        Fine-tune Parseq on license plate data.
+        Fine-tune PARSeq on license plate data.
 
         Args:
             train_loader: Training data loader
@@ -800,533 +722,10 @@ class OCRModel(nn.Module):
         self.vocab = checkpoint["vocab"]
         self.max_length = checkpoint["max_length"]
 
-    def compute_ctc_loss(
-        self,
-        logits: torch.Tensor,
-        targets: List[str],
-        device: str = "cuda",
-        label_smoothing: float = 0.1,
-    ) -> torch.Tensor:
-        """
-        Compute CTC loss for training.
-
-        Args:
-            logits: (B, T, C) predictions from model
-            targets: List of target text strings
-            device: Device to compute loss on
-            label_smoothing: Label smoothing factor (0.0 = disabled, 0.1 = recommended)
-
-        Returns:
-            CTC loss tensor
-        """
-        import torch.nn.functional as F
-
-        B, T, C = logits.shape
-
-        # Encode targets as indices
-        target_lengths = []
-        target_indices_list = []
-
-        for text in targets:
-            # Encode each character to its index
-            indices = [self.tokenizer.char_to_idx.get(c, 0) for c in text if c in self.tokenizer.char_to_idx]
-            target_indices_list.extend(indices)
-            target_lengths.append(len(indices))
-
-        if len(target_indices_list) == 0:
-            return torch.tensor(0.0, device=device, requires_grad=True)
-
-        target_indices = torch.tensor(target_indices_list, dtype=torch.long, device=device)
-        target_lengths = torch.tensor(target_lengths, dtype=torch.long, device=device)
-
-        # Input lengths are all T (logits sequence length)
-        input_lengths = torch.full((B,), T, dtype=torch.long, device=device)
-
-        # Log softmax for CTC
-        log_probs = F.log_softmax(logits, dim=-1)
-
-        # Transpose for CTC loss: (T, B, C)
-        log_probs = log_probs.transpose(0, 1)
-
-        # Compute CTC loss
-        ctc_loss = F.ctc_loss(
-            log_probs,
-            target_indices,
-            input_lengths,
-            target_lengths,
-            blank=self.blank_idx,
-            zero_infinity=True,
-            reduction='none',
-        )
-
-        # Focal CTC weighting (optional, controlled by focal_gamma)
-        # gamma=0: standard CTC (default, safer for initial training)
-        # gamma=1.5-2.0: focal weighting for fine-tuning hard examples
-        focal_gamma = getattr(self, 'focal_gamma', 0.0)
-
-        if focal_gamma > 0:
-            with torch.no_grad():
-                loss_normalized = torch.clamp(ctc_loss / (ctc_loss.max() + 1e-8), 0, 1)
-                focal_weight = (loss_normalized ** focal_gamma) + 0.5
-                focal_weight = focal_weight / focal_weight.mean()
-            return (ctc_loss * focal_weight).mean()
-        else:
-            return ctc_loss.mean()
-
-    def compute_loss(
-        self,
-        logits: torch.Tensor,
-        targets: List[str],
-        device: str = "cuda",
-        label_smoothing: float = 0.1,
-    ) -> torch.Tensor:
-        """
-        Compute loss for training.
-
-        For SimpleCRNN: computes CTC loss from logits.
-        For PARSeq: raises error — use forward_train() instead.
-
-        Args:
-            logits: (B, T, C) predictions from model
-            targets: List of target text strings
-            device: Device to compute loss on
-            label_smoothing: Label smoothing factor
-
-        Returns:
-            Loss tensor
-        """
-        if self.use_parseq:
-            raise RuntimeError(
-                "PARSeq training must use forward_train(images, targets) instead of "
-                "forward() + compute_loss(). forward_train() implements teacher forcing "
-                "with PLM, which is required for proper gradient flow."
-            )
-        return self.compute_ctc_loss(logits, targets, device, label_smoothing)
-
-
-
-class ConvBNReLU(nn.Module):
-    """Basic convolution block with BatchNorm and ReLU."""
-
-    def __init__(self, in_ch, out_ch, kernel_size=3):
-        super().__init__()
-        self.conv = nn.Conv2d(in_ch, out_ch, kernel_size, padding=kernel_size // 2)
-        self.bn = nn.BatchNorm2d(out_ch)
-
-    def forward(self, x):
-        return F.relu(self.bn(self.conv(x)), inplace=True)
-
-
-class SEBlock(nn.Module):
-    """Squeeze-and-Excitation attention block."""
-
-    def __init__(self, channels, reduction=16):
-        super().__init__()
-        self.fc1 = nn.Linear(channels, channels // reduction)
-        self.fc2 = nn.Linear(channels // reduction, channels)
-
-    def forward(self, x):
-        b, c, _, _ = x.size()
-        y = x.view(b, c, -1).mean(-1)
-        y = F.relu(self.fc1(y), inplace=True)
-        y = torch.sigmoid(self.fc2(y)).view(b, c, 1, 1)
-        return x * y
-
-
-class ResidualBlock(nn.Module):
-    """Residual block with two convolutions."""
-
-    def __init__(self, in_ch, out_ch):
-        super().__init__()
-        self.conv1 = nn.Conv2d(in_ch, out_ch, 3, padding=1)
-        self.bn1 = nn.BatchNorm2d(out_ch)
-        self.conv2 = nn.Conv2d(out_ch, out_ch, 3, padding=1)
-        self.bn2 = nn.BatchNorm2d(out_ch)
-        self.skip = nn.Conv2d(in_ch, out_ch, 1) if in_ch != out_ch else nn.Identity()
-
-    def forward(self, x):
-        identity = self.skip(x)
-        out = F.relu(self.bn1(self.conv1(x)), inplace=True)
-        out = self.bn2(self.conv2(out))
-        return F.relu(out + identity, inplace=True)
-
-
-class SequenceAttention(nn.Module):
-    """Multi-head self-attention for improved sequence modeling."""
-
-    def __init__(self, hidden_size, num_heads=8, dropout=0.1):
-        super().__init__()
-        self.hidden_size = hidden_size
-        self.num_heads = num_heads
-        self.head_dim = hidden_size // num_heads
-
-        assert hidden_size % num_heads == 0, "hidden_size must be divisible by num_heads"
-
-        self.q_proj = nn.Linear(hidden_size, hidden_size)
-        self.k_proj = nn.Linear(hidden_size, hidden_size)
-        self.v_proj = nn.Linear(hidden_size, hidden_size)
-        self.out_proj = nn.Linear(hidden_size, hidden_size)
-        self.dropout = nn.Dropout(dropout)
-        self.layer_norm = nn.LayerNorm(hidden_size)
-
-    def forward(self, x):
-        # x: (B, T, H)
-        B, T, H = x.shape
-
-        # Residual connection
-        residual = x
-
-        # Project to Q, K, V
-        q = self.q_proj(x).view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
-        k = self.k_proj(x).view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
-        v = self.v_proj(x).view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
-
-        # Scaled dot-product attention
-        scale = self.head_dim ** -0.5
-        attn = torch.matmul(q, k.transpose(-2, -1)) * scale
-        attn = F.softmax(attn, dim=-1)
-        attn = self.dropout(attn)
-
-        # Apply attention to values
-        out = torch.matmul(attn, v)
-        out = out.transpose(1, 2).contiguous().view(B, T, H)
-        out = self.out_proj(out)
-
-        # Residual + LayerNorm
-        return self.layer_norm(out + residual)
-
-
-class TPS_SpatialTransformerNetwork(nn.Module):
-    """Thin-Plate Spline spatial transformer for text rectification."""
-
-    def __init__(self, input_size=(32, 100), output_size=(32, 100), num_fiducial=20):
-        super().__init__()
-        self.input_size = input_size
-        self.output_size = output_size
-        self.num_fiducial = num_fiducial
-
-        # Localization network
-        self.localization = nn.Sequential(
-            nn.Conv2d(3, 64, 3, padding=1),
-            nn.ReLU(True),
-            nn.MaxPool2d(2, 2),
-            nn.Conv2d(64, 128, 3, padding=1),
-            nn.ReLU(True),
-            nn.MaxPool2d(2, 2),
-            nn.Conv2d(128, 256, 3, padding=1),
-            nn.ReLU(True),
-            nn.MaxPool2d(2, 2),
-            nn.Flatten(),
-        )
-
-        # Calculate flattened size
-        with torch.no_grad():
-            dummy = torch.zeros(1, 3, *input_size)
-            flat_size = self.localization(dummy).shape[1]
-
-        self.fc_loc = nn.Sequential(
-            nn.Linear(flat_size, 256),
-            nn.ReLU(True),
-            nn.Linear(256, 6),  # 6 parameters for affine transform
-        )
-
-        # Initialize to identity transform
-        self.fc_loc[-1].weight.data.zero_()
-        self.fc_loc[-1].bias.data.copy_(torch.tensor([1, 0, 0, 0, 1, 0], dtype=torch.float))
-
-    def forward(self, x):
-        batch_size = x.size(0)
-        theta = self.localization(x)
-        theta = self.fc_loc(theta).view(batch_size, 2, 3)
-
-        grid = F.affine_grid(
-            theta,
-            [batch_size, 3, *self.output_size],
-            align_corners=True
-        )
-        return F.grid_sample(x, grid, align_corners=True)
-
-
-class SimpleCRNN(nn.Module):
-    """
-    Production-grade CRNN for >98% accuracy.
-
-    Architecture: TPS-STN -> ResNet backbone -> BiLSTM -> CTC
-    """
-
-    # Blank token for CTC
-    BLANK_TOKEN = "-"
-
-    def __init__(
-        self,
-        vocab_size: int = 36,
-        max_length: int = 7,
-        use_ctc: bool = True,
-        rnn_dropout: float = 0.3,
-        backbone_channels: int = 256,  # Final backbone channels (default 256 for lightweight)
-        lstm_hidden_size: int = 256,  # LSTM hidden size (default 256 for lightweight)
-        lstm_num_layers: int = 1,  # LSTM layers (default 1 for lightweight)
-    ):
-        """
-        Initialize SimpleCRNN.
-
-        Args:
-            vocab_size: Size of character vocabulary (excluding blank)
-            max_length: Maximum sequence length
-            use_ctc: If True, use CTC decoding (adds blank token to vocab)
-            rnn_dropout: Dropout rate after RNN layer (0.0 = disabled, 0.3 = recommended)
-            backbone_channels: Final backbone feature channels (256=lightweight, 384=full)
-            lstm_hidden_size: LSTM hidden size (256=lightweight, 384=full)
-            lstm_num_layers: Number of LSTM layers (1=lightweight, 2=full)
-        """
-        super().__init__()
-
-        self.vocab_size = vocab_size
-        self.max_length = max_length
-        self.use_ctc = use_ctc
-
-        # For CTC, output size is vocab_size + 1 (blank token)
-        self.output_size = vocab_size + 1 if use_ctc else vocab_size
-        self.blank_idx = vocab_size  # Blank is at the last index
-
-        # Adaptive dropout after RNN
-        self.rnn_dropout_rate = rnn_dropout
-        self.rnn_dropout = nn.Dropout(p=rnn_dropout) if rnn_dropout > 0 else nn.Identity()
-
-        # 1. Spatial Transformer (TPS) for text rectification
-        self.stn = TPS_SpatialTransformerNetwork(
-            input_size=(68, 124),  # Updated for new HR size (was 34, 62)
-            output_size=(32, 100),
-            num_fiducial=20,
-        )
-
-        # 2. CNN backbone with SE attention (configurable capacity)
-        if backbone_channels == 256:
-            # Lightweight: 3 -> 64 -> 128 -> 256
-            self.backbone = nn.Sequential(
-                # Block 1: 3 -> 64
-                ConvBNReLU(3, 64, 3),
-                SEBlock(64),
-                nn.MaxPool2d(2, 2),
-                # Block 2: 64 -> 128
-                ResidualBlock(64, 128),
-                SEBlock(128),
-                nn.MaxPool2d(2, 2),
-                # Block 3: 128 -> 256
-                ResidualBlock(128, 256),
-                ResidualBlock(256, 256),
-                SEBlock(256),
-                nn.MaxPool2d((2, 1), (2, 1)),  # Preserve width
-            )
-        elif backbone_channels == 384:
-            # Full: 3 -> 64 -> 128 -> 256 -> 384
-            self.backbone = nn.Sequential(
-                # Block 1: 3 -> 64
-                ConvBNReLU(3, 64, 3),
-                SEBlock(64),
-                nn.MaxPool2d(2, 2),
-                # Block 2: 64 -> 128
-                ResidualBlock(64, 128),
-                SEBlock(128),
-                nn.MaxPool2d(2, 2),
-                # Block 3: 128 -> 256
-                ResidualBlock(128, 256),
-                ResidualBlock(256, 256),
-                SEBlock(256),
-                nn.MaxPool2d((2, 1), (2, 1)),  # Preserve width
-                # Block 4: 256 -> 384
-                ResidualBlock(256, 384),
-                ResidualBlock(384, 384),
-                SEBlock(384),
-                nn.MaxPool2d((2, 1), (2, 1)),  # Preserve width
-            )
-        else:
-            raise ValueError(f"backbone_channels must be 256 or 384, got {backbone_channels}")
-
-        # Layer normalization before LSTM (stabilizes training)
-        self.layer_norm = nn.LayerNorm(backbone_channels)
-
-        # 3. Sequence modeling with BiLSTM (configurable capacity)
-        self.rnn = nn.LSTM(
-            input_size=backbone_channels,
-            hidden_size=lstm_hidden_size,
-            num_layers=lstm_num_layers,
-            batch_first=True,
-            bidirectional=True,
-            dropout=0.3 if lstm_num_layers > 1 else 0.0,
-        )
-
-        # 4. Output projection (removed MHSA - redundant for short plate sequences)
-        # Input size is hidden_size * 2 for bidirectional LSTM
-        self.fc = nn.Linear(lstm_hidden_size * 2, self.output_size)
-
-    def forward(self, x: torch.Tensor, return_logits: bool = True) -> torch.Tensor:
-        """
-        Forward pass.
-
-        Args:
-            x: Input images (B, 3, H, W) in range [0, 1] or [-1, 1]
-            return_logits: If True, return logits
-
-        Returns:
-            Logits of shape (B, max_length, vocab_size)
-        """
-        # Normalize input to [0, 1]
-        if x.min() < 0:
-            x = (x + 1.0) / 2.0
-            x = torch.clamp(x, 0, 1)
-
-        # Resize to STN expected input size if needed (STN expects 68x124)
-        if x.shape[2] != 68 or x.shape[3] != 124:
-            x = F.interpolate(x, size=(68, 124), mode='bilinear', align_corners=False)
-
-        # Apply STN for text rectification
-        x = self.stn(x)
-
-        # CNN backbone
-        features = self.backbone(x)  # (B, 512, H', W')
-
-        # Prepare sequence
-        B, C, H, W = features.shape
-        features = F.adaptive_avg_pool2d(features, (1, W))  # (B, 512, 1, W)
-        features = features.squeeze(2).permute(0, 2, 1)  # (B, W, 512)
-
-        # Apply layer normalization (stabilizes deeper LSTM training)
-        features = self.layer_norm(features)  # Normalize per timestep
-
-        # Pad or truncate to max_length
-        if W < self.max_length:
-            features = F.pad(features, (0, 0, 0, self.max_length - W))
-        elif W > self.max_length:
-            features = features[:, : self.max_length, :]
-
-        # RNN
-        rnn_out, _ = self.rnn(features)  # (B, max_length, 1024)
-
-        # Apply adaptive dropout after RNN (removed MHSA - BiLSTM alone is sufficient for plates)
-        rnn_out = self.rnn_dropout(rnn_out)
-
-        # Output projection
-        logits = self.fc(rnn_out)  # (B, max_length, output_size)
-
-        return logits
-
-    def ctc_decode_greedy(self, logits: torch.Tensor) -> List[str]:
-        """
-        Decode CTC logits using greedy decoding with blank removal.
-
-        Args:
-            logits: (B, T, C) predictions where C includes blank token
-
-        Returns:
-            List of decoded text strings
-        """
-        B, T, C = logits.shape
-
-        # Get predicted indices (greedy)
-        pred_indices = logits.argmax(dim=-1)  # (B, T)
-
-        results = []
-        for b in range(B):
-            # Remove blank tokens and consecutive duplicates (CTC decoding)
-            decoded = []
-            prev_idx = None
-
-            for t in range(T):
-                idx = pred_indices[b, t].item()
-
-                # Skip blank tokens
-                if idx == self.blank_idx:
-                    prev_idx = None  # Reset after blank
-                    continue
-
-                # Skip consecutive duplicates (CTC collapse)
-                if idx == prev_idx:
-                    continue
-
-                decoded.append(idx)
-                prev_idx = idx
-
-            # Convert indices to string (assuming 0-33 are valid characters)
-            # This will be handled by tokenizer in the wrapper
-            results.append(decoded)
-
-        return results
-
-    def ctc_decode_beam_search(self, logits: torch.Tensor, beam_width: int = 5, length_norm: float = 0.7) -> List[str]:
-        """
-        Decode CTC logits using beam search with length normalization.
-
-        Args:
-            logits: (B, T, C) predictions where C includes blank token
-            beam_width: Number of beams to keep
-            length_norm: Exponent for length normalization (0=no norm, 0.7=recommended)
-
-        Returns:
-            List of decoded text strings
-        """
-        B, T, C = logits.shape
-        log_probs = F.log_softmax(logits, dim=-1)
-
-        results = []
-        for b in range(B):
-            # Initialize beam with empty sequence
-            # Each beam entry: (sequence, log_prob, prev_idx, blank_count)
-            beam = [([], 0.0, None, 0)]  # (sequence, log_prob, prev_idx, blank_count)
-
-            for t in range(T):
-                new_beam = []
-
-                for seq, log_prob, prev_idx, blank_count in beam:
-                    # Top-k candidates at this timestep
-                    top_k_log_probs, top_k_indices = log_probs[b, t].topk(beam_width)
-
-                    for k in range(beam_width):
-                        idx = top_k_indices[k].item()
-                        prob = top_k_log_probs[k].item()
-
-                        new_seq = seq.copy()
-                        new_blank_count = blank_count
-
-                        # Proper CTC blank handling
-                        if idx == self.blank_idx:
-                            # Blank token - don't add to sequence but track blank count
-                            new_blank_count += 1
-                            new_prev_idx = None  # Reset prev_idx after blank
-                        elif prev_idx == idx and blank_count == 0:
-                            # Consecutive duplicate without blank - skip (CTC collapse)
-                            continue
-                        else:
-                            # Valid character
-                            new_seq.append(idx)
-                            new_blank_count = 0
-                            new_prev_idx = idx
-
-                        # Apply length normalization during beam selection
-                        norm_log_prob = log_prob + prob
-                        seq_len = len(new_seq) if len(new_seq) > 0 else 1
-                        norm_score = norm_log_prob / (seq_len ** length_norm)
-
-                        new_beam.append((new_seq, norm_log_prob, new_prev_idx, new_blank_count))
-
-                # Sort by normalized score and keep top beams
-                new_beam.sort(key=lambda x: x[1] / (len(x[0]) ** length_norm) if len(x[0]) > 0 else x[1], reverse=True)
-                beam = new_beam[:beam_width]
-
-            # Return best sequence using length-normalized score
-            if len(beam) > 0:
-                best_beam = max(beam, key=lambda x: x[1] / (max(len(x[0]), 1) ** length_norm))
-                best_seq = best_beam[0]
-            else:
-                best_seq = []
-            results.append(best_seq)
-
-        return results
-
 
 if __name__ == "__main__":
     # Test OCR Model
-    print("Testing OCRModel...")
+    print("Testing OCRModel with PARSeq...")
 
     ocr = OCRModel(
         vocab="0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ",
@@ -1337,7 +736,7 @@ if __name__ == "__main__":
     # Test forward pass
     images = torch.randn(2, 3, 32, 64) * 2 - 1  # Range [-1, 1]
     logits = ocr(images, return_logits=True)
-    print(f"Logits shape: {logits.shape}")  # Should be (2, 7, 36)
+    print(f"Logits shape: {logits.shape}")  # Should be (2, 7, vocab_size)
 
     # Test prediction
     texts = ocr.predict(images)

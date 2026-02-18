@@ -86,45 +86,79 @@ def _detect_architecture_from_checkpoint(gen_state):
     """
     Auto-detect generator architecture from checkpoint keys.
 
-    This avoids mismatches between config and what was actually trained.
-    The training script (train_progressive.py) does NOT pass
-    use_character_attention to Generator — so checkpoint won't have those keys.
+    Supports both SwinIR (new) and RRDB (old) architectures.
 
     Returns:
         dict of detected architecture parameters
     """
     detected = {}
 
-    # Detect use_character_attention: look for character_attention.* keys
-    has_char_attn = any(k.startswith("character_attention.") for k in gen_state)
-    detected["use_character_attention"] = has_char_attn
+    # Detect architecture type from key patterns
+    has_swinir = any(k.startswith("deep_features.layers.") for k in gen_state)
+    has_rrdb = any(k.startswith("deep_extractor.blocks.") for k in gen_state)
+    detected["architecture"] = "swinir" if has_swinir else ("rrdb" if has_rrdb else "unknown")
 
-    # Detect num_features from first conv weight shape
-    if "shallow_extractor.conv1.weight" in gen_state:
-        detected["num_features"] = gen_state["shallow_extractor.conv1.weight"].shape[0]
+    # For SwinIR: detect SwinIR-specific parameters
+    if has_swinir:
+        # Detect embed_dim from conv_first weight shape
+        if "conv_first.weight" in gen_state:
+            detected["embed_dim"] = gen_state["conv_first.weight"].shape[0]
 
-    # Detect num_blocks from deep_extractor block keys
-    block_indices = set()
-    for k in gen_state:
-        if k.startswith("deep_extractor.blocks."):
-            parts = k.split(".")
-            if len(parts) >= 3 and parts[2].isdigit():
-                block_indices.add(int(parts[2]))
-    if block_indices:
-        detected["num_blocks"] = max(block_indices) + 1
+        # Detect num_rstb from deep_features.layers keys
+        rstb_indices = set()
+        for k in gen_state:
+            if k.startswith("deep_features.layers."):
+                parts = k.split(".")
+                if len(parts) >= 3 and parts[2].isdigit():
+                    rstb_indices.add(int(parts[2]))
+        if rstb_indices:
+            detected["num_rstb"] = max(rstb_indices) + 1
 
-    # Detect use_deformable: look for deform conv keys in attention modules
-    has_deformable = any("deform" in k.lower() or "offset" in k.lower() for k in gen_state)
-    detected["use_deformable"] = has_deformable
+        # Detect num_heads from window attention keys
+        for k in gen_state:
+            if "attn.qkv.weight" in k:
+                # qkv has shape [embed_dim * 3, embed_dim]
+                detected["embed_dim"] = gen_state[k].shape[1]
+                break
+
+    # For RRDB: detect RRDB-specific parameters (legacy support)
+    elif has_rrdb:
+        # Detect use_character_attention: look for character_attention.* keys
+        has_char_attn = any(k.startswith("character_attention.") for k in gen_state)
+        detected["use_character_attention"] = has_char_attn
+
+        # Detect num_features from first conv weight shape
+        if "shallow_extractor.conv1.weight" in gen_state:
+            detected["num_features"] = gen_state["shallow_extractor.conv1.weight"].shape[0]
+
+        # Detect num_blocks from deep_extractor block keys
+        block_indices = set()
+        for k in gen_state:
+            if k.startswith("deep_extractor.blocks."):
+                parts = k.split(".")
+                if len(parts) >= 3 and parts[2].isdigit():
+                    block_indices.add(int(parts[2]))
+        if block_indices:
+            detected["num_blocks"] = max(block_indices) + 1
+
+        # Detect use_deformable: look for deform conv keys in attention modules
+        has_deformable = any("deform" in k.lower() or "offset" in k.lower() for k in gen_state)
+        detected["use_deformable"] = has_deformable
+
+    # Detect use_pyramid_attention from pyramid_attention keys
+    has_pyramid = any(k.startswith("pyramid_attention.") for k in gen_state)
+    detected["use_pyramid_attention"] = has_pyramid
 
     # Detect upscale_factor from upscaler weights
     if "upscaler.pre_conv.weight" in gen_state:
-        # For 2x: out_channels = 3 * 4 = 12
+        # For 2x: out_channels = embed_dim * 4 (for conv_first) or 3 * 4 (for output)
         out_ch = gen_state["upscaler.pre_conv.weight"].shape[0]
-        if out_ch == 12:
-            detected["upscale_factor"] = 2
-        elif out_ch == 48:
-            detected["upscale_factor"] = 4
+        # Check if it's the feature upscaler or output upscaler
+        if out_ch in [12, 48, 192, 576]:  # 12=3*4(2x), 48=3*16(4x), 192=48*4(2x), 576=144*16(4x)
+            if out_ch == 12 or out_ch == 192:
+                detected["upscale_factor"] = 2
+            elif out_ch == 48 or out_ch == 576:
+                detected["upscale_factor"] = 4
 
     return detected
 
@@ -164,35 +198,40 @@ def load_models(args, config, device):
         detected = _detect_architecture_from_checkpoint(gen_state)
         print(f"  Auto-detected architecture: {detected}")
 
-        # Use detected values, fall back to config, then defaults
-        use_char_attn = detected.get("use_character_attention", False)
-        num_features = detected.get("num_features", model_config.get("num_filters", 64))
-        num_blocks = detected.get("num_blocks", model_config.get("num_rrdb_blocks", 16))
-        upscale_factor = detected.get("upscale_factor", model_config.get("upscale_factor", 2))
-        use_deformable = detected.get("use_deformable", model_config.get("use_deformable", True))
+        # Check if SwinIR or RRDB architecture
+        is_swinir = detected.get("architecture") == "swinir"
 
-        # Warn if config disagrees with checkpoint
-        cfg_char_attn = model_config.get("use_character_attention", False)
-        if cfg_char_attn != use_char_attn:
-            print(f"  ⚠ Config says use_character_attention={cfg_char_attn}, "
-                  f"but checkpoint {'has' if use_char_attn else 'does NOT have'} "
-                  f"character_attention weights. Using checkpoint: {use_char_attn}")
+        if is_swinir:
+            # SwinIR architecture
+            embed_dim = detected.get("embed_dim", model_config.get("swinir_embed_dim", 144))
+            num_rstb = detected.get("num_rstb", model_config.get("swinir_num_rstb", 8))
+            upscale_factor = detected.get("upscale_factor", model_config.get("upscale_factor", 2))
+            use_pyramid_attn = detected.get("use_pyramid_attention", model_config.get("use_pyramid_attention", True))
 
-        print(f"  Creating generator: features={num_features}, blocks={num_blocks}, "
-              f"upscale={upscale_factor}, deformable={use_deformable}, "
-              f"char_attn={use_char_attn}")
+            print(f"  Creating SwinIR generator: embed_dim={embed_dim}, num_rstb={num_rstb}, "
+                  f"upscale={upscale_factor}, pyramid_attn={use_pyramid_attn}")
 
-        generator = Generator(
-            in_channels=3,
-            out_channels=3,
-            num_features=num_features,
-            num_blocks=num_blocks,
-            upscale_factor=upscale_factor,
-            use_deformable=use_deformable,
-            use_character_attention=use_char_attn,
-            msca_scales=tuple(model_config.get("msca_scales", [1.0, 0.5, 0.25])),
-            msca_num_prototypes=model_config.get("msca_num_prototypes", 36),
-        )
+            generator = Generator(
+                in_channels=3,
+                out_channels=3,
+                embed_dim=embed_dim,
+                num_rstb=num_rstb,
+                upscale_factor=upscale_factor,
+                use_pyramid_attention=use_pyramid_attn,
+                pyramid_layout=model_config.get("pyramid_layout", "brazilian"),
+            )
+        else:
+            # RRDB architecture (legacy support)
+            num_features = detected.get("num_features", model_config.get("num_filters", 64))
+            num_blocks = detected.get("num_blocks", model_config.get("num_rrdb_blocks", 16))
+            upscale_factor = detected.get("upscale_factor", model_config.get("upscale_factor", 2))
+            use_char_attn = detected.get("use_character_attention", model_config.get("use_character_attention", False))
+
+            print(f"  Creating RRDB generator (legacy): features={num_features}, blocks={num_blocks}, "
+                  f"upscale={upscale_factor}, char_attn={use_char_attn}")
+
+            print("  ⚠ WARNING: Loading legacy RRDB checkpoint. Consider retraining with SwinIR.")
+            generator = None  # RRDB is no longer supported
 
         # Load with strict=True to catch any mismatch
         try:
@@ -217,7 +256,7 @@ def load_models(args, config, device):
         print("Warning: No generator_state_dict in checkpoint. Running OCR-only mode.")
 
     # ── OCR ──────────────────────────────────────────────────────────
-    # Load OCR weights from checkpoint first to detect model type
+    # Load OCR weights from checkpoint (PARSeq only - SimpleCRNN removed)
     ocr_state = None
     ocr_source = None
     if "ocr_state_dict" in checkpoint:
@@ -227,26 +266,23 @@ def load_models(args, config, device):
         ocr_state = _strip_ddp_prefix(checkpoint["model_state_dict"])
         ocr_source = "model_state_dict"
 
-    # Detect OCR type from checkpoint (PARSeq vs SimpleCRNN)
-    # PARSeq has keys like 'parseq_system.model.encoder...', 'parseq_system.tokenizer...'
-    # SimpleCRNN has keys like 'model.stn...', 'model.backbone...', 'model.rnn...'
-    use_parseq = False
+    # Detect if checkpoint has PARSeq OCR
+    has_parseq = False
     if ocr_state is not None:
         # Check for PARSeq-specific keys
         parseq_keys = [k for k in ocr_state.keys() if 'parseq_system' in k]
-        use_parseq = len(parseq_keys) > 0
-        print(f"  Auto-detected OCR type: {'PARSeq' if use_parseq else 'SimpleCRNN'}")
+        has_parseq = len(parseq_keys) > 0
+        print(f"  Auto-detected OCR type: {'PARSeq' if has_parseq else 'Unknown'}")
 
     print("Creating OCR model...")
     ocr = OCRModel(
+        pretrained_path=ocr_config.get("pretrained_path", "baudm/parseq-base"),
         vocab=ocr_config.get("vocab", "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"),
         max_length=ocr_config.get("max_length", 7),
         frozen=True,
-        rnn_dropout=ocr_config.get("rnn_dropout", 0.3),
-        use_parseq=use_parseq,
     )
 
-    if ocr_state is not None:
+    if ocr_state is not None and has_parseq:
         try:
             ocr.load_state_dict(ocr_state, strict=True)
             print(f"  ✓ OCR loaded (strict=True) from {ocr_source}")
@@ -259,7 +295,7 @@ def load_models(args, config, device):
             if result.unexpected_keys:
                 print(f"  ⚠ Unexpected keys: {result.unexpected_keys[:5]}")
     else:
-        print("  ⚠ WARNING: No OCR weights in checkpoint! Using random weights.")
+        print("  ⚠ WARNING: No PARSeq OCR weights in checkpoint! Using pretrained weights.")
 
     ocr = ocr.to(device).eval()
 
@@ -851,23 +887,15 @@ def run_diagnose(args):
         logits = ocr(sr, return_logits=True)
 
         # Decode WITHOUT format correction (raw predictions)
-        if ocr.use_parseq:
-            # PARSeq: use native tokenizer without format correction
-            probs = logits.softmax(-1)
-            preds_list, _ = ocr._parseq_tokenizer.decode(probs)
-            allowed = set(ocr.vocab)
-            preds = []
-            for pred in preds_list:
-                text = ''.join(c.upper() if c.upper() in allowed else '' for c in pred)
-                # NO PlateFormatValidator.correct() here
-                preds.append((text[:ocr.max_length], 1.0))
-        else:
-            # SimpleCRNN: greedy decode without format correction
-            decoded_lists = ocr.model.ctc_decode_greedy(logits)
-            preds = []
-            for b in range(logits.shape[0]):
-                text = indices_to_text(decoded_lists[b], ocr)
-                preds.append((text, 1.0))
+        # PARSeq: use native tokenizer without format correction
+        probs = logits.softmax(-1)
+        preds_list, _ = ocr._parseq_tokenizer.decode(probs)
+        allowed = set(ocr.vocab)
+        preds = []
+        for pred in preds_list:
+            text = ''.join(c.upper() if c.upper() in allowed else '' for c in pred)
+            # NO PlateFormatValidator.correct() here
+            preds.append((text[:ocr.max_length], 1.0))
 
         text, conf = aggregate_track_predictions(preds)
         strat_e[track_id] = (text, conf)

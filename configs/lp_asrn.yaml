@@ -1,32 +1,43 @@
 # LP-ASRN Configuration
 # Layout-Aware and Character-Driven Super-Resolution Network
-# Enhanced with LCOFL-EC, DCNv4, Multi-Scale Character Attention, and OCR-Driven Curriculum
+# Enhanced with SwinIR, Character Pyramid Attention, and PARSeq OCR
 
 model:
-  # Number of RRDB-EA blocks in the deep feature extractor
-  # Balanced: 12 blocks for good capacity without being excessive (original: 24, papers: 16)
-  num_rrdb_blocks: 12
+  # ========== SwinIR Architecture Settings ==========
+  # MAXIMUM CONFIGURATION for best accuracy - prioritize results over speed
+  # Embedding dimension - increased from 120 to 144 for more capacity
+  swinir_embed_dim: 144
 
-  # Number of feature channels
-  # Reduced from 128 to 64 for lightweight model (4x parameter reduction)
-  num_filters: 64
+  # Number of Residual Swin Transformer Blocks - increased to 8
+  swinir_num_rstb: 8
 
+  # Number of attention heads (must divide embed_dim evenly)
+  # 144 / 8 = 18 heads per attention layer
+  swinir_num_heads: 8
+
+  # Window size for window-based attention (smaller = more fine-grained attention)
+  swinir_window_size: 6
+
+  # Number of Swin blocks per RSTB - increased for more depth
+  swinir_num_blocks_per_rstb: 3
+
+  # MLP expansion ratio - increased for more capacity
+  swinir_mlp_ratio: 6.0
+
+  # ========== Common Settings ==========
   # Upscaling factor (2 for 2x, 4 for 4x)
   # Paper 2 uses 2x which achieved 49.8% recognition rate
   upscale_factor: 2
-
-  # Use deformable convolutions in attention modules
-  use_deformable: true
-
-  # Phase 2: DCNv4 Configuration
-  use_dcnv4: true             # Use DCNv4 instead of DCNv3 (falls back to DCNv3 if unavailable)
-  dcnv4_groups: 4             # Number of groups for DCNv4
 
   # Phase 3: Multi-Scale Character Attention
   # DISABLED for lightweight model - saves computation and params
   use_character_attention: false  # Disabled for speed (not needed for fixed-format plates)
   msca_scales: [1.0, 0.5, 0.25]  # Scales for multi-scale processing
   msca_num_prototypes: 36          # Number of character prototypes
+
+  # Character Pyramid Attention - ENABLED for best accuracy
+  use_pyramid_attention: true
+  pyramid_layout: "brazilian"  # "brazilian" or "mercocur"
 
 data:
   # Scenarios to include in training
@@ -61,8 +72,9 @@ data:
   # while training crops resized to lr_size have ratio 0.55. This augmentation
   # pads images before resize to simulate the test distribution, teaching the
   # generator+OCR to handle varied aspect ratios.
+  # EXPANDED RANGE: [0.25, 0.45] for better coverage of test distribution
   aspect_ratio_augment: true
-  test_aspect_range: [0.29, 0.40]  # Min/max H/W ratios observed in test-public
+  test_aspect_range: [0.25, 0.45]  # Expanded from [0.29, 0.40] for better test coverage
 
 training:
   # Number of training epochs
@@ -138,14 +150,8 @@ loss:
   beta: 1.0
 
 ocr:
-  # OCR model type
-  model_type: "simplecrnn"
-
-  # Use PARSeq from HuggingFace (true) or SimpleCRNN (false)
-  # PARSeq: attention-based, pretrained on millions of text images, position-aligned
-  # SimpleCRNN: CTC-based, trained from scratch, lightweight
-  # To switch to PARSeq: set to true, retrain from stage 0
-  use_pretrained: true
+  # OCR model type - PARSeq (pretrained attention-based model from HuggingFace)
+  model_type: "parseq"
 
   # Pre-trained model path (HuggingFace model ID or local path)
   pretrained_path: "baudm/parseq-base"
@@ -161,24 +167,10 @@ ocr:
 
   # Maximum sequence length for OCR
   # PARSeq: 7 is correct (position-aligned, 1:1 char mapping)
-  # SimpleCRNN: use 20 for CTC (needs extra timesteps for blank insertion)
   max_length: 7
 
   # Character vocabulary
   vocab: "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-
-  # Label smoothing for loss (CTT for SimpleCRNN)
-  # 0.0 = disabled, 0.1 = recommended, 0.2 = strong
-  label_smoothing: 0.1  # Mild smoothing for better generalization
-
-  # Dropout rate for RNN layer in SimpleCRNN
-  # 0.0 = disabled, 0.3 = recommended, 0.5 = strong
-  rnn_dropout: 0.3  # Balanced dropout for OCR pretraining
-
-  # OCR model size configuration (lightweight settings)
-  backbone_channels: 256      # Backbone final channels (256=lightweight, 384=full)
-  lstm_hidden_size: 256       # LSTM hidden size (256=lightweight, 384=full)
-  lstm_num_layers: 1          # LSTM layers (1=lightweight, 2=full)
 
 # Progressive Training Configuration
 progressive_training:
@@ -194,6 +186,7 @@ progressive_training:
     loss_components: ["ocr"]
     freeze_ocr: false
     update_confusion: false
+    aspect_ratio_range: [0.40, 0.60]  # Mild aspect ratio variation
 
   # Stage 1: Warm-up (L1 loss only)
   # Purpose: Stabilize network before introducing complex losses
@@ -204,6 +197,7 @@ progressive_training:
     loss_components: ["l1"]
     freeze_ocr: true
     update_confusion: false
+    aspect_ratio_range: [0.35, 0.55]  # Moderate aspect ratio variation
 
   # Stage 2: LCOFL Training (Character-driven loss)
   # Purpose: Optimize for character recognition with frozen OCR
@@ -214,6 +208,7 @@ progressive_training:
     loss_components: ["l1", "lcofl"]
     freeze_ocr: true
     update_confusion: true
+    aspect_ratio_range: [0.25, 0.45]  # Full test range coverage
 
   # Stage 3: Fine-tuning (Joint optimization)
   # Purpose: Refine with unfrozen OCR for co-adaptation
@@ -224,6 +219,7 @@ progressive_training:
     loss_components: ["l1", "lcofl"]
     freeze_ocr: false
     update_confusion: true
+    aspect_ratio_range: [0.25, 0.45]  # Full test range coverage
 
   # Phase 4: Hard Example Mining Stage (OCR-Driven Curriculum)
   # Purpose: Focus training on samples that OCR struggles with
@@ -234,6 +230,7 @@ progressive_training:
     loss_components: ["l1", "lcofl"]  # No embedding loss for lightweight
     freeze_ocr: true
     update_confusion: true
+    aspect_ratio_range: [0.25, 0.40]  # Focus on hardest test cases
     hard_mining:
       difficulty_alpha: 2.0      # Exponent for difficulty weighting
       reweight_interval: 5       # Re-weight samples every N epochs

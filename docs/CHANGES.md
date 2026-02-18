@@ -1,72 +1,112 @@
-# Recent Changes and Fixes
+# Changelog
 
-## v2.0.0 - Hybrid Improvements (2026-02-04)
+All notable changes to LP-ASRN will be documented in this file.
 
-### New Features
+## [3.0.0] - 2025-02-18
 
-#### Phase 1: Enhanced Loss Function (LCOFL-EC)
-- **Embedding Consistency Loss**: Added contrastive loss component using Siamese network
-- **SiameseEmbedder**: Uses frozen ResNet-18 backbone for stable semantic features
-- **EmbeddingConsistencyLoss**: Manhattan distance-based contrastive loss with margin
-- **AdaptiveWeightScheduler**: Gradual warm-up of embedding loss weight (0 → 0.3)
+### Major Architecture Changes
 
-**New Files:**
-- `src/models/siamese_embedder.py`: SiameseEmbedder, LightweightSiameseEmbedder
-- `src/losses/embedding_loss.py`: EmbeddingConsistencyLoss, TripletEmbeddingLoss, CosineEmbeddingLoss
-- `src/utils/adaptive_scheduler.py`: AdaptiveWeightScheduler
+**Removed:**
+- RRDB-EA (Residual-in-Residual Dense Block with Enhanced Attention) generator
+- SimpleCRNN OCR model
+- DCNv4/DCNv3 deformable convolution support
+- Multi-Scale Character Attention (MSCA) module
+- Siamese Embedder and embedding consistency loss
 
-#### Phase 2: DCNv4 Integration
-- **DCNv4 Support**: 3x faster training with flash-attention inspired memory access
-- **Fallback Support**: Graceful fallback to DCNv3 if DCNv4 not available
-- **Updated Attention**: EnhancedAttentionModule now prefers DCNv4 when available
+**Added:**
+- **SwinIR Transformer Generator** (12.8M parameters)
+  - Shifted Window Attention (W-MSA/SW-MSA)
+  - Residual Swin Transformer Blocks (RSTB)
+  - 8 RSTB with 3 Swin blocks each
+  - 144 embedding dimension, 8 attention heads
+  - 6x6 window size for fine-grained attention
+- **PARSeq OCR** (pretrained from HuggingFace)
+  - Pretrained on millions of text images
+  - Attention-based autoregressive decoding
+  - Permutation Language Modeling (PLM) training
+- **Character Pyramid Attention**
+  - Layout-aware positional encoding
+  - Multi-scale stroke detection
+  - Gap detection between characters
+  - Support for Brazilian (LLLNNNN) and Mercosur (LLLNLNN) layouts
 
-**Modified Files:**
-- `src/models/deform_conv.py`: Added DCNv4 implementation with fallback
+### Configuration Changes
 
-#### Phase 3: Multi-Scale Character Attention (MSCA)
-- **CharacterRegionDetector**: Learns character-like spatial patterns
-- **MultiScaleCharacterAttention**: Processes features at multiple scales (1x, 0.5x, 0.25x)
-- **Generator Integration**: MSCA applied before upscaling for character-aware reconstruction
+**New config options:**
+```yaml
+model:
+  swinir_embed_dim: 144
+  swinir_num_rstb: 8
+  swinir_num_heads: 8
+  swinir_window_size: 6
+  swinir_num_blocks_per_rstb: 3
+  swinir_mlp_ratio: 6.0
+  use_pyramid_attention: true
+  pyramid_layout: "brazilian"
 
-**New Files:**
-- `src/models/character_attention.py`: CharacterRegionDetector, MultiScaleCharacterAttention
+ocr:
+  model_type: "parseq"
+  pretrained_path: "baudm/parseq-base"
+  freeze_ocr: true
+```
 
-#### Phase 4: OCR-Driven Curriculum (Stage 4)
-- **HardExampleMiner**: Tracks per-sample OCR accuracy for weighted sampling
-- **CharacterConfusionTracker**: Analyzes character-level confusion patterns
-- **CurriculumSampler**: Gradually transitions from easy to hard examples
-- **Stage 4 Training**: Focus on samples that OCR struggles with
+**Removed config options:**
+- `num_rrdb_blocks`
+- `num_filters`
+- `use_deformable`
+- `use_dcnv4`
+- `use_character_attention`
+- `msca_scales`
+- `msca_num_prototypes`
+- OCR `backbone_channels`, `lstm_hidden_size`, `lstm_num_layers`, `rnn_dropout`
 
-**New Files:**
-- `src/training/hard_example_miner.py`: HardExampleMiner, CharacterConfusionTracker, CurriculumSampler
+### Training Changes
 
----
-
-## v1.1.0 - Deformable Convolution Fix (2026-01-29)
-
-### Bug Fixes
-
-#### cuDNN Contiguous Tensor Fix
-- Added `.contiguous()` calls after `reshape()` operations in deformable convolution
-- Fixed `RuntimeError: cuDNN error: CUDNN_STATUS_NOT_SUPPORTED`
-
-**Files Modified:**
-- `src/models/deform_conv.py`: Lines 180, 189, 197, 416, 424, 431, 453
-
-### Configuration Updates
-- Changed default `num_rrdb_blocks` from 16 to 12 for stability
-
----
-
-## v1.0.0 - OCR Model Change (2026-01-29)
+- Stage 0 now fine-tunes PARSeq instead of training SimpleCRNN
+- All training scripts updated to use SwinIR Generator parameters
+- Inference script updated with SwinIR architecture detection
 
 ### Breaking Changes
 
-#### SimpleCRNN as Primary OCR
-- Uses SimpleCRNN for vocabulary compatibility
-- 36-character vocabulary (0-9, A-Z) optimized for license plates
-- CNN+BiLSTM architecture designed specifically for license plates
+- **Old RRDB checkpoints are NOT compatible** with v3.0
+- Must retrain from scratch with new SwinIR architecture
+- SimpleCRNN OCR checkpoints are NOT compatible (now using PARSeq)
 
-**Files Modified:**
-- `src/ocr/ocr_model.py`: SimpleCRNN implementation
-- `requirements.txt`: Removed external model-specific dependencies
+### Migration Guide
+
+To migrate from v2.0 to v3.0:
+
+1. Update config file (`configs/lp_asrn.yaml`)
+2. Remove old checkpoints
+3. Retrain from Stage 0:
+   ```bash
+   python scripts/train_progressive.py --config configs/lp_asrn.yaml
+   ```
+
+---
+
+## [2.0.0] - 2024-08-15 (v2.0.0 - Hybrid Improvements)
+
+### Added
+
+- **LCOFL-EC Loss**: Embedding consistency loss with Siamese network
+- **DCNv4 Support**: 3x faster deformable convolutions
+- **Multi-Scale Character Attention (MSCA)**: Character-aware attention at multiple scales
+- **Hard Example Mining (Stage 4)**: Curriculum learning focused on difficult samples
+
+### Changed
+
+- Improved progressive training pipeline
+- TensorBoard integration
+- Better data augmentation
+
+---
+
+## [1.0.0] - 2023-05-20
+
+### Initial Release
+
+- RRDB-EA based generator
+- SimpleCRNN OCR
+- LCOFL loss function
+- Three-stage progressive training

@@ -102,10 +102,15 @@ def evaluate(args):
     generator = Generator(
         in_channels=3,
         out_channels=3,
-        num_features=model_config.get("num_filters", 64),
-        num_blocks=model_config.get("num_rrdb_blocks", 16),
+        embed_dim=model_config.get("swinir_embed_dim", 144),
+        num_rstb=model_config.get("swinir_num_rstb", 8),
+        num_heads=model_config.get("swinir_num_heads", 8),
+        window_size=model_config.get("swinir_window_size", 6),
+        num_blocks_per_rstb=model_config.get("swinir_num_blocks_per_rstb", 3),
+        mlp_ratio=model_config.get("swinir_mlp_ratio", 6.0),
         upscale_factor=model_config.get("upscale_factor", 2),
-        use_deformable=model_config.get("use_deformable", True),
+        use_pyramid_attention=model_config.get("use_pyramid_attention", True),
+        pyramid_layout=model_config.get("pyramid_layout", "brazilian"),
     ).to(device)
 
     generator.load_state_dict(checkpoint["generator_state_dict"])
@@ -114,6 +119,7 @@ def evaluate(args):
     # Create OCR model
     ocr_config = config.get("ocr", {})
     ocr = OCRModel(
+        pretrained_path=ocr_config.get("pretrained_path", "baudm/parseq-base"),
         vocab=ocr_config.get("vocab", "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"),
         max_length=ocr_config.get("max_length", 7),
     ).to(device)

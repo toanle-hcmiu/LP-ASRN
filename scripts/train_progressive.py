@@ -338,10 +338,15 @@ def train_ddp(rank, world_size, args, config):
 
     model_config = config.get("model", {})
     generator = Generator(
-        num_features=model_config.get("num_filters", 64),
-        num_blocks=model_config.get("num_rrdb_blocks", 16),
+        embed_dim=model_config.get("swinir_embed_dim", 144),
+        num_rstb=model_config.get("swinir_num_rstb", 8),
+        num_heads=model_config.get("swinir_num_heads", 8),
+        window_size=model_config.get("swinir_window_size", 6),
+        num_blocks_per_rstb=model_config.get("swinir_num_blocks_per_rstb", 3),
+        mlp_ratio=model_config.get("swinir_mlp_ratio", 6.0),
         upscale_factor=model_config.get("upscale_factor", 2),
-        use_deformable=model_config.get("use_deformable", True),
+        use_pyramid_attention=model_config.get("use_pyramid_attention", True),
+        pyramid_layout=model_config.get("pyramid_layout", "brazilian"),
     )
 
     # Count parameters (only rank 0)
@@ -355,13 +360,10 @@ def train_ddp(rank, world_size, args, config):
 
     ocr_config = config.get("ocr", {})
     ocr = OCRModel(
+        pretrained_path=ocr_config.get("pretrained_path", "baudm/parseq-base"),
         vocab=ocr_config.get("vocab", "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"),
         max_length=ocr_config.get("max_length", 7),
-        rnn_dropout=ocr_config.get("rnn_dropout", 0.3),
-        use_parseq=ocr_config.get("use_pretrained", False),  # Use external pretrained model
-        backbone_channels=ocr_config.get("backbone_channels", 256),
-        lstm_hidden_size=ocr_config.get("lstm_hidden_size", 256),
-        lstm_num_layers=ocr_config.get("lstm_num_layers", 1),
+        frozen=ocr_config.get("freeze_ocr", True),
     )
 
     # Load fine-tuned OCR if available (all ranks need this)
@@ -586,10 +588,15 @@ def main():
         print("\nCreating generator...")
         model_config = config.get("model", {})
         generator = Generator(
-            num_features=model_config.get("num_filters", 64),
-            num_blocks=model_config.get("num_rrdb_blocks", 16),
+            embed_dim=model_config.get("swinir_embed_dim", 144),
+            num_rstb=model_config.get("swinir_num_rstb", 8),
+            num_heads=model_config.get("swinir_num_heads", 8),
+            window_size=model_config.get("swinir_window_size", 6),
+            num_blocks_per_rstb=model_config.get("swinir_num_blocks_per_rstb", 3),
+            mlp_ratio=model_config.get("swinir_mlp_ratio", 6.0),
             upscale_factor=model_config.get("upscale_factor", 2),
-            use_deformable=model_config.get("use_deformable", True),
+            use_pyramid_attention=model_config.get("use_pyramid_attention", True),
+            pyramid_layout=model_config.get("pyramid_layout", "brazilian"),
         )
 
         # Count parameters
@@ -600,13 +607,10 @@ def main():
         print("\nCreating OCR model...")
         ocr_config = config.get("ocr", {})
         ocr = OCRModel(
+            pretrained_path=ocr_config.get("pretrained_path", "baudm/parseq-base"),
             vocab=ocr_config.get("vocab", "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"),
             max_length=ocr_config.get("max_length", 7),
-            rnn_dropout=ocr_config.get("rnn_dropout", 0.3),
-            use_parseq=ocr_config.get("use_pretrained", False),  # Use external pretrained model
-            backbone_channels=ocr_config.get("backbone_channels", 256),
-            lstm_hidden_size=ocr_config.get("lstm_hidden_size", 256),
-            lstm_num_layers=ocr_config.get("lstm_num_layers", 1),
+            frozen=ocr_config.get("freeze_ocr", True),
         )
 
         # Load fine-tuned OCR if available

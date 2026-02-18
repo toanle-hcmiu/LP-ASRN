@@ -51,6 +51,7 @@ class StageConfig:
     loss_components: list  # ["l1"] or ["l1", "lcofl"]
     freeze_ocr: bool
     update_confusion: bool = False
+    aspect_ratio_range: tuple = (0.25, 0.45)  # Stage-specific aspect ratio range
 
 
 class ProgressiveTrainer:
@@ -142,6 +143,7 @@ class ProgressiveTrainer:
                 loss_components=["ocr"],
                 freeze_ocr=False,
                 update_confusion=False,
+                aspect_ratio_range=tuple(self.progressive_config.get("stage0", {}).get("aspect_ratio_range", [0.40, 0.60])),
             ),
             TrainingStage.WARMUP: StageConfig(
                 name="warmup",
@@ -149,6 +151,7 @@ class ProgressiveTrainer:
                 lr=self.progressive_config.get("stage1", {}).get("lr", 1e-4),
                 loss_components=["l1"],
                 freeze_ocr=True,
+                aspect_ratio_range=tuple(self.progressive_config.get("stage1", {}).get("aspect_ratio_range", [0.35, 0.55])),
             ),
             TrainingStage.LCOFL: StageConfig(
                 name="lcofl",
@@ -157,6 +160,7 @@ class ProgressiveTrainer:
                 loss_components=["l1", "lcofl"],
                 freeze_ocr=True,
                 update_confusion=True,
+                aspect_ratio_range=tuple(self.progressive_config.get("stage2", {}).get("aspect_ratio_range", [0.25, 0.45])),
             ),
             TrainingStage.FINETUNE: StageConfig(
                 name="finetune",
@@ -165,6 +169,7 @@ class ProgressiveTrainer:
                 loss_components=["l1", "lcofl"],
                 freeze_ocr=False,
                 update_confusion=True,
+                aspect_ratio_range=tuple(self.progressive_config.get("stage3", {}).get("aspect_ratio_range", [0.25, 0.45])),
             ),
             TrainingStage.HARD_MINING: StageConfig(
                 name="hard_mining",
@@ -173,6 +178,7 @@ class ProgressiveTrainer:
                 loss_components=["l1", "lcofl", "embedding"],
                 freeze_ocr=True,
                 update_confusion=True,
+                aspect_ratio_range=tuple(self.progressive_config.get("stage4", {}).get("aspect_ratio_range", [0.25, 0.40])),
             ),
         }
 
@@ -375,6 +381,12 @@ class ProgressiveTrainer:
         # Update OCR frozen state
         for param in self.ocr.parameters():
             param.requires_grad = not config.freeze_ocr
+
+        # Update aspect ratio range for training dataset
+        if hasattr(self.train_loader, 'dataset') and hasattr(self.train_loader.dataset, 'set_aspect_ratio_range'):
+            self.train_loader.dataset.set_aspect_ratio_range(config.aspect_ratio_range)
+            if self.is_main:
+                self._log(f"Updated aspect ratio range to {config.aspect_ratio_range} for stage {stage}")
 
     def set_text_logger(self, text_logger):
         """Set the text logger for file logging."""

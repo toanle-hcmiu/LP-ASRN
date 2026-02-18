@@ -1,10 +1,10 @@
 # LP-ASRN Architecture
 
-Detailed architectural documentation for the Layout-Aware and Character-Driven Super-Resolution Network.
+Detailed architectural documentation for the Layout-Aware and Character-Driven Super-Resolution Network with SwinIR Transformer.
 
 ## Overview
 
-LP-ASRN (License Plate Super-Resolution Network) is a specialized super-resolution architecture designed specifically for license plate recognition. Unlike generic SR methods that optimize for pixel-level metrics, LP-ASRN incorporates character recognition supervision directly into the training process.
+LP-ASRN (License Plate Super-Resolution Network) is a specialized super-resolution architecture designed specifically for license plate recognition. Unlike generic SR methods that optimize for pixel-level metrics, LP-ASRN incorporates character recognition supervision directly into the training process using **SwinIR Transformer** for the generator and **PARSeq** for OCR.
 
 ---
 
@@ -12,15 +12,16 @@ LP-ASRN (License Plate Super-Resolution Network) is a specialized super-resoluti
 
 ```
                     ┌─────────────────────────────────────────────────────┐
-                    │                    Generator                        │
-Input: LR Image     │  ┌────────────┐  ┌────────────┐  ┌──────────────┐  │
-   (B,3,H,W)  ───▶  │  │  Shallow   │  │    Deep    │  │    MSCA      │  │
-                    │  │  Extractor │─▶│  Extractor │─▶│  (Optional)  │  │
-                    │  └────────────┘  └────────────┘  └──────────────┘  │
+                    │              SwinIR Generator (12.8M params)        │
+Input: LR Image     │  ┌────────────┐  ┌──────────────────┐  ┌─────────┐  │
+   (B,3,H,W)  ───▶  │  │  Shallow   │  │  SwinIR Deep     │  │ Pyramid │  │
+                    │  │  Extractor │─▶│  Feature Extract.│─▶│ Attention│  │
+                    │  │  (Conv)    │  │  (8× RSTB)       │  │ (Optional│  │
+                    │  └────────────┘  └──────────────────┘  └─────────┘  │
                     │         │                               │          │
                     │         ▼                               ▼          │
                     │  ┌────────────┐  ┌────────────────────────────┐   │
-                    │  │  Upscaler  │◀─│  Multi-Scale Char Attention│   │
+                    │  │  Upscaler  │◀─│  Character Pyramid Attention│   │
                     │  └────────────┘  └────────────────────────────┘   │
                     │         │                                          │
                     │         ▼                                          │
@@ -28,78 +29,104 @@ Input: LR Image     │  ┌────────────┐  ┌──�
                     │  │ Reconstruct│                                    │    (B,3,2H,2W)
                     │  └────────────┘                                    │
                     └─────────────────────────────────────────────────────┘
+                              │
+                              ▼
+                    ┌─────────────────┐
+                    │   PARSeq OCR    │
+                    │  (Pretrained)    │
+                    └─────────────────┘
 ```
 
 ---
 
-## Generator Components
+## SwinIR Generator Components
 
 ### 1. Shallow Feature Extractor
 
-Extracts initial features using an auto-encoder structure with PixelShuffle.
+Extracts initial features using a simple convolution:
 
 ```
-LR Input → Conv5x5 → PixelUnshuffle → Conv → PixelShuffle → Conv → Shallow Features
-                                                                         ↓
-                                                              Skip Connection (+)
+LR Input → Conv3x3 → Shallow Features (embed_dim channels)
 ```
 
-### 2. Deep Feature Extractor
+### 2. SwinIR Deep Feature Extractor
 
-16 RRDB-EA blocks (Residual-in-Residual Dense Block with Enhanced Attention).
-
-```
-Shallow Features → [RRDB-EA × 16] → Global Conv → Deep Features
-                           ↓
-              Each RRDB-EA block contains:
-              - Dense layers with growth connections
-              - Enhanced Attention Module (EAM)
-              - Deformable Convolutions (DCNv4/DCNv3)
-```
-
-### 3. Enhanced Attention Module (EAM)
+**Residual Swin Transformer Blocks (RSTB)** for efficient long-range modeling:
 
 ```
-Input Features
+Shallow Features → Conv_First → [RSTB × 8] → Conv_After → Deep Features
+                              ↓
+                    Each RSTB contains:
+                    - Swin Transformer Blocks (3 per RSTB)
+                    - Window-based Multi-head Self Attention
+                    - Shifted Window Attention for cross-window connections
+                    - MLP with GELU activation
+                    - Residual connection
+```
+
+#### Window-based Multi-head Self Attention (W-MSA)
+
+```
+Input Features (B, C, H, W)
       │
-      ├──▶ Channel Attention (CA)
-      │         - Conv1x1 parallel branches
-      │         - PixelUnshuffle → Conv → PixelShuffle
+      ├──▶ Window Partition (6×6 windows)
+      │         └── Each window: (window_size², C)
       │
-      ├──▶ Spatial/Positional Attention (POS)
-      │         - DCNv4 (or DCNv3 fallback)
-      │         - Adaptive sampling locations
+      ├──▶ QKV Projection → Q, K, V
       │
-      └──▶ Geometrical Perception Unit (GP)
-                - Global avg pool (H/V directions)
-                - Point-wise convolutions
-
-      Output = Sigmoid(CA × POS + GP) × DeformConv(Input)
+      ├──▶ Attention: softmax(QK^T / √d + relative_pos_bias) × V
+      │
+      ├──▶ Window Reverse → Merge Windows
+      │
+      └──▶ Output Projection + Residual
 ```
 
-### 4. Multi-Scale Character Attention (MSCA) - NEW
+**Relative Position Bias**: Learnable biases for each relative position in the window.
 
-Character-aware attention module that focuses on text regions.
+#### Shifted Window Attention (SW-MSA)
+
+Alternates between regular and shifted windows to enable cross-window connections:
+- Even layers: Regular W-MSA
+- Odd layers: Shifted W-MSA (shifted by half window size)
+
+### 3. Character Pyramid Attention (Optional)
+
+Layout-aware multi-scale character attention:
 
 ```
 Deep Features (B, C, H, W)
       │
-      ├──▶ Scale 1.0x ──▶ CharRegionDetector ──▶ GuidedAttention ──┐
-      │                                                            │
-      ├──▶ Scale 0.5x ──▶ CharRegionDetector ──▶ GuidedAttention ──┼──▶ Fusion ──▶ Enhanced Features
-      │                                                            │
-      └──▶ Scale 0.25x ──▶ CharRegionDetector ──▶ GuidedAttention ─┘
+      ├──▶ Stroke Detection (H/V/Diagonal)
+      │         └── 4 learnable stroke kernels
+      │
+      ├──▶ Gap Detection
+      │         └── Detect spaces between characters
+      │
+      ├──▶ Multi-Scale Processing
+      │         ├── Scale 1.0×: Full resolution
+      │         ├── Scale 0.5×: Half resolution
+      │         └── Scale 0.25×: Quarter resolution
+      │
+      ├──▶ Layout-Aware Positional Encoding
+      │         └── Brazilian: LLLNNNN (7 positions)
+      │         └── Mercosur: LLLNLNN (7 positions)
+      │
+      └──▶ Fusion → Enhanced Features
 ```
 
-**CharacterRegionDetector**: Learns 36 character prototypes (0-9, A-Z) to identify text regions.
+**Layout Types**:
+- **Brazilian**: LLLNNNN (3 letters + 4 digits)
+- **Mercosur**: LLLNLNN (3 letters + digit + letter + 2 digits)
 
-### 5. Upscaling Module
+### 4. Upscaling Module
 
 ```
-Features → Conv(C, 3×r²) → PixelShuffle(r=2) → Upscaled (2× resolution)
+Features → Conv(embed_dim, embed_dim × 4) → PixelShuffle(2) → Upscaled (2× resolution)
 ```
 
-### 6. Reconstruction Layer
+**Progressive Refinement**: Intermediate convolutions and attention after upscaling.
+
+### 5. Reconstruction Layer
 
 ```
 Upscaled → Conv3x3 → Tanh → Skip(LR upsampled) → SR Output [-1, 1]
@@ -107,65 +134,84 @@ Upscaled → Conv3x3 → Tanh → Skip(LR upsampled) → SR Output [-1, 1]
 
 ---
 
-## Deformable Convolution
+## PARSeq OCR Model
 
-### DCNv4 (Preferred) vs DCNv3
+**Pretrained attention-based OCR** from HuggingFace (`baudm/parseq-base`).
 
-| Aspect | DCNv3 | DCNv4 |
-|--------|-------|-------|
-| Weight normalization | Softmax (bounded) | Unbounded |
-| Skip connection | Internal | External |
-| Memory access | Standard | Flash-attention optimized |
-| Speed | Baseline | **~3x faster** |
+### Architecture
 
-### Implementation
-
-DCNv4 is preferred when available, with automatic fallback to DCNv3:
-
-```python
-if DCNV4_AVAILABLE:
-    self.deform_conv = DeformableConv2dV4(in_channels, out_channels)
-else:
-    self.deform_conv = DeformableConv2d(in_channels, out_channels)  # DCNv3
 ```
+Input Image (B, 3, 32, 128)
+      │
+      ├──▶ ViT Encoder
+      │         └── Patch embedding + Transformer layers
+      │
+      ├──▶ Autoregressive Decoder
+      │         ├── Cross-attention (encoder features)
+      │         ├── Self-attention (target tokens)
+      │         ├── Permutation Language Modeling (PLM)
+      │         └── Character prediction head
+      │
+      └──▶ Output: Character sequence (7 chars)
+```
+
+### Training Protocol
+
+**Permutation Language Modeling (PLM)**:
+- Teacher forcing during training
+- Multiple permutation orderings per batch
+- Canonical + reverse + random permutations
+
+### Fine-tuning
+
+1. **Stage 0**: Fine-tune PARSeq on license plate HR images
+2. **Stages 1-2**: Freeze OCR weights, use for LCOFL loss
+3. **Stage 3**: Unfreeze for joint optimization
+4. **Stage 4**: Refreeze for hard example mining
 
 ---
 
 ## Loss Functions
 
-### LCOFL-EC (Extended with Embedding Consistency)
+### LCOFL (Layout-Constrained Optical Flow Loss)
 
 ```
-L_total = L_LCOFL + λ_embed × L_EC
+L_LCOFL = L_C + λ_layout × L_P + λ_ssim × L_S
 
 Where:
-- L_LCOFL = L_C + λ_layout × L_P + λ_ssim × L_S
-- L_EC = max(m - D(V_SR, V_HR), 0)²
+- L_C = Classification Loss (weighted cross-entropy)
+- L_P = Layout Penalty (position mismatches)
+- L_S = SSIM Loss (structural similarity)
 ```
 
 #### Classification Loss (L_C)
+
 Weighted cross-entropy adapting to character confusions:
 ```
 L_C = -(1/K) × Σ w_k × log(p(y_GT_k | x_SR))
 w_k = 1 + α × confusion_count(k)
 ```
 
+- Confused characters get higher weight
+- Alpha increases over time (adaptive)
+
 #### Layout Penalty (L_P)
+
 Penalizes digit/letter position mismatches:
 ```
 L_P = Σ [D(pred_i) × A(GT_i) + A(pred_i) × D(GT_i)]
 ```
 
-#### Embedding Consistency Loss (L_EC) - NEW
-Contrastive loss using Siamese network embeddings:
-```
-L_EC = max(margin - ManhattanDist(V_SR, V_HR), 0)²
-```
+- `D(c)`: Is character a digit?
+- `A(c)`: Is character a letter?
+- Penalizes letter↔digit confusion at each position
 
-**SiameseEmbedder Architecture**:
-- Frozen ResNet-18 backbone
-- 128-dim L2-normalized embeddings
-- Manhattan distance for loss computation
+#### SSIM Loss (L_S)
+
+Structural similarity for perceptual quality:
+```
+L_S = 1 - SSIM(SR, HR)
+```
 
 ---
 
@@ -174,13 +220,39 @@ L_EC = max(margin - ManhattanDist(V_SR, V_HR), 0)²
 ```
 ┌──────────────────────────────────────────────────────────────────┐
 │ Stage 0   │ Stage 1   │ Stage 2   │ Stage 3    │ Stage 4        │
-│ OCR       │ Warm-up   │ LCOFL     │ Fine-tune  │ Hard Mining    │
-│ Pretrain  │ (L1)      │ Training  │ (Joint)    │ (Curriculum)   │
+│ PARSeq    │ Warm-up   │ LCOFL     │ Fine-tune  │ Hard Mining    │
+│ Fine-tune │ (L1)      │ Training  │ (Joint)    │ (Curriculum)   │
 │           │           │           │            │                │
-│ 50 epochs │ 30 epochs │ 300 epochs│ 150 epochs │ 50 epochs      │
+│ 50 epochs │ 30 epochs │ 200 epochs│ 100 epochs │ 50 epochs      │
 │ OCR only  │ Gen only  │ Gen only  │ Gen + OCR  │ Gen + Weighted │
 └──────────────────────────────────────────────────────────────────┘
 ```
+
+### Stage 0: PARSeq Pretraining
+- Fine-tune PARSeq on HR license plate images
+- PLM training with teacher forcing
+- Result: `checkpoints/ocr/best.pth`
+
+### Stage 1: Warm-up
+- Generator with L1 loss only
+- Stabilizes training before complex losses
+- Frozen OCR
+
+### Stage 2: LCOFL Training
+- Character-driven optimization
+- L1 + LCOFL loss
+- Update confusion weights
+- Frozen OCR
+
+### Stage 3: Fine-tuning
+- Joint optimization of generator + OCR
+- Lower learning rate
+- Unfrozen OCR
+
+### Stage 4: Hard Example Mining
+- Focus on difficult samples
+- Weighted sampling by OCR confidence
+- Frozen OCR
 
 ---
 
@@ -188,33 +260,75 @@ L_EC = max(margin - ManhattanDist(V_SR, V_HR), 0)²
 
 | Component | Parameters |
 |-----------|------------|
-| Shallow Extractor | ~50K |
-| RRDB-EA Block (×16) | ~1.28M |
-| MSCA Module | ~100K |
-| SiameseEmbedder | ~11M (frozen backbone) |
-| Upscaler + Reconstruction | ~6K |
-| **Total Generator** | **~1.5M** |
+| Shallow Extractor | ~100K |
+| SwinIR Deep Features (8 RSTB) | ~12.5M |
+| Character Pyramid Attention | ~200K |
+| Upscaler + Reconstruction | ~10K |
+| **Total Generator** | **~12.8M** |
+| PARSeq OCR (frozen) | ~51M (pretrained) |
 
 ---
 
 ## Key Design Decisions
 
+### Why SwinIR over CNN?
+
+| Aspect | CNN (RRDB) | SwinIR |
+|--------|-----------|--------|
+| Long-range modeling | Limited (receptive field) | Excellent (global attention) |
+| Parameter efficiency | Moderate | High |
+| Training stability | Good | Better |
+| Recognition accuracy | ~50% | **Target: 60%+** |
+
 ### Why 2x Upscaling?
 - More stable training than 4x
 - Better matches real-world surveillance constraints
-- Paper 2 achieved 49.8% vs Paper 1's 39.0% with 4x
+- Paper 2 achieved 49.8% vs Paper 1's 39.0% with 2x
 
-### Why DCNv4?
-- 3x faster training
-- Better memory efficiency
-- Unbounded weights learn more flexibly
+### Why PARSeq OCR?
+- Pretrained on millions of text images
+- Attention-based architecture
+- Autoregressive decoding with language modeling
+- State-of-the-art accuracy on text recognition
 
-### Why Multi-Scale Character Attention?
-- Characters appear at different sizes in LR images
-- Learned prototypes focus attention on text regions
-- Improves recognition of small/blurry characters
+### Why Character Pyramid Attention?
+- Layout-aware positional encoding
+- Multi-scale stroke detection
+- Focus on character regions
+- Adapts to different plate formats (Brazilian/Mercosur)
 
-### Why Embedding Consistency?
-- Perceptual similarity beyond pixel metrics
-- Frozen backbone provides stable gradients
-- Contrastive loss prevents mode collapse
+### Why Shifted Window Attention?
+- Linear complexity (O(n) vs O(n²) for global attention)
+- Efficient implementation
+- Cross-window connections via shifting
+- Better for small license plate images
+
+---
+
+## Configuration Reference
+
+### Maximum Configuration (Best Accuracy)
+
+```yaml
+model:
+  swinir_embed_dim: 144         # High capacity
+  swinir_num_rstb: 8            # Deep transformer
+  swinir_num_heads: 8           # 144 / 8 = 18
+  swinir_window_size: 6         # Fine-grained attention
+  swinir_num_blocks_per_rstb: 3 # More depth per RSTB
+  swinir_mlp_ratio: 6.0         # Wide MLP
+  use_pyramid_attention: true   # Character-aware
+```
+
+### Lightweight Configuration (Faster Training)
+
+```yaml
+model:
+  swinir_embed_dim: 96          # Reduced
+  swinir_num_rstb: 4            # Shallower
+  swinir_num_heads: 6
+  swinir_window_size: 8
+  swinir_num_blocks_per_rstb: 2
+  swinir_mlp_ratio: 4.0
+  use_pyramid_attention: false  # Disable for speed
+```

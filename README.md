@@ -6,29 +6,29 @@
 [![PyTorch](https://img.shields.io/badge/pytorch-2.0+-red.svg)](https://pytorch.org/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-A PyTorch implementation of LP-ASRN for license plate super-resolution with progressive training, TensorBoard integration, and character-driven optimization.
+A PyTorch implementation of LP-ASRN for license plate super-resolution using **SwinIR Transformer** architecture, **PARSeq OCR**, and progressive character-driven optimization.
 
-## ✨ What's New in v2.0
+## ✨ What's New in v3.0
 
 | Feature | Description | Benefit |
 |---------|-------------|---------|
-| **LCOFL-EC** | Embedding consistency loss with Siamese network | +3-5% accuracy |
-| **DCNv4** | Flash-attention optimized deformable convs | 3x faster training |
-| **MSCA** | Multi-scale character attention | Better text focus |
-| **Stage 4** | Hard example mining curriculum | +1-2% accuracy |
+| **SwinIR Architecture** | Transformer-based generator with shifted window attention | Better long-range modeling |
+| **Character Pyramid Attention** | Layout-aware multi-scale character attention | +5-10% accuracy |
+| **PARSeq OCR** | Pretrained attention-based OCR from HuggingFace | State-of-the-art recognition |
+| **12.8M Parameters** | Maximum configuration for best results | Prioritizes accuracy over speed |
 
 ---
 
 ## Overview
 
-LP-ASRN addresses the challenge of recognizing license plates from low-resolution surveillance footage using a task-specific super-resolution approach that maximizes recognition accuracy.
+LP-ASRN addresses the challenge of recognizing license plates from low-resolution surveillance footage using a task-specific super-resolution approach that maximizes recognition accuracy through character-level optimization.
 
 ### Key Features
 
 - **Five-Stage Progressive Training**: OCR Pretrain → Warm-up → LCOFL → Fine-tune → Hard Mining
-- **LCOFL-EC Loss**: Layout penalty + character classification + embedding consistency
-- **Multi-Scale Character Attention**: Focus on text regions at multiple scales
-- **DCNv4 Support**: 3x faster training with optional DCNv4
+- **SwinIR Generator**: Transformer-based architecture with shifted window attention
+- **Character Pyramid Attention**: Layout-aware multi-scale character focus
+- **PARSeq OCR**: Pretrained attention-based text recognition
 - **TensorBoard Integration**: Real-time visualization of metrics and images
 
 ---
@@ -39,7 +39,7 @@ LP-ASRN addresses the challenge of recognizing license plates from low-resolutio
 |--------|---------|---------------|
 | Paper 1 (2023) | RodoSol-ALPR | 39.0% |
 | Paper 2 (2024) | RodoSol-ALPR | 49.8% |
-| **LP-ASRN v2.0** | RodoSol-ALPR | **>55%** (target) |
+| **LP-ASRN v3.0** | RodoSol-ALPR | **>60%** (target) |
 
 ---
 
@@ -50,9 +50,6 @@ LP-ASRN addresses the challenge of recognizing license plates from low-resolutio
 git clone <repository-url>
 cd LP-ASRN
 pip install -r requirements.txt
-
-# Optional: DCNv4 for 3x faster training
-pip install dcnv4
 ```
 
 ---
@@ -61,10 +58,10 @@ pip install dcnv4
 
 ```bash
 # Train all stages (TensorBoard auto-starts on :6007)
-python scripts/train_progressive.py --stage all
+python scripts/train_progressive.py --config configs/lp_asrn.yaml
 
 # Evaluate
-python scripts/evaluate.py --checkpoint checkpoints/lp_asrn/best.pth
+python scripts/evaluate.py --checkpoint outputs/lp_asrn/best.pth --data-root data/test
 ```
 
 ---
@@ -73,19 +70,19 @@ python scripts/evaluate.py --checkpoint checkpoints/lp_asrn/best.pth
 
 | Stage | Name | Purpose | Epochs |
 |-------|------|---------|--------|
-| 0 | OCR Pretrain | Train OCR on HR images | 50 |
+| 0 | OCR Pretrain | Fine-tune PARSeq on HR images | 50 |
 | 1 | Warm-up | Stabilize with L1 loss | 30 |
-| 2 | LCOFL | Character-driven training | 300 |
-| 3 | Fine-tune | Joint OCR optimization | 150 |
+| 2 | LCOFL | Character-driven training | 200 |
+| 3 | Fine-tune | Joint OCR optimization | 100 |
 | 4 | Hard Mining | Focus on difficult samples | 50 |
 
 Train individual stages:
 ```bash
-python scripts/train_progressive.py --stage 0  # OCR Pretrain
-python scripts/train_progressive.py --stage 1  # Warm-up
-python scripts/train_progressive.py --stage 2  # LCOFL
-python scripts/train_progressive.py --stage 3  # Fine-tune
-python scripts/train_progressive.py --stage 4  # Hard Mining
+python scripts/train_progressive.py --config configs/lp_asrn.yaml --stage 0  # OCR Pretrain
+python scripts/train_progressive.py --config configs/lp_asrn.yaml --stage 1  # Warm-up
+python scripts/train_progressive.py --config configs/lp_asrn.yaml --stage 2  # LCOFL
+python scripts/train_progressive.py --config configs/lp_asrn.yaml --stage 3  # Fine-tune
+python scripts/train_progressive.py --config configs/lp_asrn.yaml --stage 4  # Hard Mining
 ```
 
 ---
@@ -93,24 +90,30 @@ python scripts/train_progressive.py --stage 4  # Hard Mining
 ## Architecture
 
 ```
-LR Image → [Generator] → SR Image (2x)
+LR Image → [SwinIR Generator] → SR Image (2x)
               │
-              ├── Shallow Feature Extractor
-              ├── 16× RRDB-EA Blocks (with DCNv4)
-              ├── Multi-Scale Character Attention (NEW)
-              ├── Upscaling Module
+              ├── Shallow Feature Extractor (Conv)
+              ├── 8× Residual Swin Transformer Blocks
+              │   └── Window-based Multi-head Self Attention
+              ├── Character Pyramid Attention (Layout-aware)
+              ├── Upscaling Module (PixelShuffle)
               └── Reconstruction Layer
 ```
 
-### Loss Function (LCOFL-EC)
+### SwinIR Generator
 
-```
-L = L1 + λ_lcofl × L_LCOFL + λ_embed × L_EC
+**Transformer-based architecture** for license plate super-resolution:
+- **Shifted Window Attention**: Efficient self-attention with linear complexity
+- **Hierarchical Representation**: Multi-scale feature extraction
+- **Character Pyramid Attention**: Layout-aware character focus
+- **Maximum Configuration**: 12.8M parameters for best accuracy
 
-Where:
-- L_LCOFL = Classification + Layout Penalty + SSIM
-- L_EC = Embedding Consistency (Siamese network)
-```
+### OCR Model (PARSeq)
+
+**Pretrained attention-based OCR** from HuggingFace:
+- Autoregressive decoding with language modeling
+- Pretrained on millions of text images
+- Fine-tuned on license plate data
 
 ---
 
@@ -120,19 +123,28 @@ Key settings in `configs/lp_asrn.yaml`:
 
 ```yaml
 model:
-  num_rrdb_blocks: 12
-  use_dcnv4: true                    # 3x faster training
-  use_character_attention: true       # Multi-scale attention
+  # SwinIR Architecture (MAXIMUM for best accuracy)
+  swinir_embed_dim: 144         # Embedding dimension
+  swinir_num_rstb: 8            # Number of Residual Swin Transformer Blocks
+  swinir_num_heads: 8           # Number of attention heads
+  swinir_window_size: 6         # Window size for attention
+  swinir_num_blocks_per_rstb: 3 # Swin blocks per RSTB
+  swinir_mlp_ratio: 6.0         # MLP expansion ratio
 
-loss:
-  lambda_embed: 0.3                  # Embedding consistency
-  lambda_layout: 0.5                 # Layout penalty
+  # Character Pyramid Attention
+  use_pyramid_attention: true   # Layout-aware character attention
+  pyramid_layout: "brazilian"   # "brazilian" or "mercocur"
+
+ocr:
+  model_type: "parseq"          # PARSeq pretrained OCR
+  pretrained_path: "baudm/parseq-base"
+  freeze_ocr: true              # Keep OCR frozen during SR training
 
 progressive_training:
   stage4:
     epochs: 50
     hard_mining:
-      difficulty_alpha: 2.0
+      difficulty_alpha: 2.0     # Hard example weighting
 ```
 
 ---
@@ -144,21 +156,22 @@ LP-ASRN/
 ├── configs/lp_asrn.yaml           # Training configuration
 ├── src/
 │   ├── models/
-│   │   ├── generator.py           # Main generator
-│   │   ├── character_attention.py # MSCA module (NEW)
-│   │   ├── siamese_embedder.py    # Embedding network (NEW)
-│   │   └── deform_conv.py         # DCNv4/DCNv3
+│   │   ├── generator.py           # SwinIR Generator
+│   │   ├── swinir_blocks.py       # SwinIR building blocks
+│   │   ├── character_attention.py # Character Pyramid Attention
+│   │   └── attention.py           # Attention modules
+│   ├── ocr/
+│   │   └── ocr_model.py           # PARSeq OCR wrapper
 │   ├── losses/
-│   │   ├── lcofl.py               # LCOFL-EC loss
-│   │   └── embedding_loss.py      # Embedding loss (NEW)
+│   │   └── lcofl.py               # LCOFL loss
 │   ├── training/
-│   │   ├── progressive_trainer.py # 5-stage trainer
-│   │   └── hard_example_miner.py  # Stage 4 miner (NEW)
-│   └── utils/
-│       └── adaptive_scheduler.py  # Weight scheduling (NEW)
+│   │   └── progressive_trainer.py # 5-stage trainer
+│   └── data/
+│       └── dataset.py             # License plate dataset
 ├── scripts/
 │   ├── train_progressive.py
-│   └── evaluate.py
+│   ├── evaluate.py
+│   └── inference.py
 └── docs/
     ├── architecture.md
     ├── training.md
@@ -186,6 +199,13 @@ Access at `http://localhost:6007` during training:
   journal={arXiv preprint arXiv:2408.15103},
   year={2024}
 }
+
+@inproceedings{liang2022swinir,
+  title={SwinIR: Image Restoration Using Swin Transformer},
+  author={Liang, Jingyun and Cao, Jiezhang and Sun, Guolei and others},
+  booktitle={CVPR},
+  year={2022}
+}
 ```
 
 ---
@@ -194,6 +214,8 @@ Access at `http://localhost:6007` during training:
 
 - [Paper 1 (2023)](https://arxiv.org/abs/2305.17313): Attention-based LP Super-Resolution
 - [Paper 2 (2024)](https://arxiv.org/abs/2408.15103): Layout-Aware LP Super-Resolution
+- [SwinIR (2022)](https://arxiv.org/abs/2109.15272): Image Restoration Using Swin Transformer
+- [PARSeq (2022)](https://arxiv.org/abs/2207.06966): Pre-training Autoregressive Objectively
 
 ## License
 
