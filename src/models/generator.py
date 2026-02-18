@@ -562,9 +562,9 @@ class SwinIRDeepFeatureExtractor(nn.Module):
         for layer in self.layers:
             x = layer(x)
 
-        # Remove padding
+        # Remove padding (crop back to original size)
         if pad_h > 0 or pad_w > 0:
-            x = x[:, :, :H + pad_h, :W + pad_w]
+            x = x[:, :, :H, :W]
 
         # Final conv + residual
         x = self.conv_after_body(x)
