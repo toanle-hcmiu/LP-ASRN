@@ -346,9 +346,8 @@ class LicensePlateDataset(Dataset):
         if not self.aspect_ratio_augment or not self.augment:
             return image
 
-        # Apply with 50% probability — keep some training at native ratio
-        if random.random() > 0.5:
-            return image
+        # NOTE: Removed 50% probability skip - always apply for test distribution consistency
+        # This ensures the model learns to handle test-time aspect ratios (0.29-0.40)
 
         orig_w, orig_h = image.size
         orig_ratio = orig_h / orig_w
@@ -493,7 +492,8 @@ class LicensePlateDataset(Dataset):
         # Aspect ratio augmentation: randomly pad to simulate test-time aspect ratios
         # Applied BEFORE resize so the generator learns to handle varied ratios
         # Must use same padding for both LR and HR to keep them aligned
-        if self.aspect_ratio_augment and self.augment:
+        # NOTE: Now applied during validation too to match test distribution
+        if self.aspect_ratio_augment:
             # Save random state to apply identical padding to both LR and HR
             rng_state = random.getstate()
             np_rng_state = np.random.get_state()
