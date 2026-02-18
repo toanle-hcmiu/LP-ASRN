@@ -471,11 +471,31 @@ def predict_with_confidence(ocr, logits, beam_width=1):
         List of (text, confidence) tuples
     """
     B, T, C = logits.shape
-    is_ctc = hasattr(ocr.model, 'use_ctc') and ocr.model.use_ctc
+    is_parseq = ocr.use_parseq  # Check if using PARSeq
+    is_ctc = not is_parseq and hasattr(ocr.model, 'use_ctc') and ocr.model.use_ctc
 
     results = []
 
-    if is_ctc and beam_width > 1:
+    if is_parseq:
+        # ── PARSeq decoding (uses native tokenizer) ───────────────────
+        probs = logits.softmax(-1)
+        preds, _ = ocr._parseq_tokenizer.decode(probs)
+        # Filter to uppercase + digits (our LP vocabulary)
+        allowed = set(ocr.vocab)
+        for b, pred in enumerate(preds):
+            text = ''.join(c.upper() if c.upper() in allowed else '' for c in pred)
+            text = text[:ocr.max_length]
+            text = PlateFormatValidator.correct(text)
+            # Confidence: average probability of predicted characters
+            char_probs = []
+            for i, c in enumerate(text):
+                if i < T and c in ocr._parseq_tokenizer._stoi:
+                    char_idx = ocr._parseq_tokenizer._stoi[c]
+                    char_probs.append(probs[b, i, char_idx].item())
+            confidence = sum(char_probs) / len(char_probs) if char_probs else 0.0
+            results.append((text, confidence))
+
+    elif is_ctc and beam_width > 1:
         # ── Format-aware beam search (best quality) ──────────────────
         for b in range(B):
             text, confidence = format_aware_beam_search(
