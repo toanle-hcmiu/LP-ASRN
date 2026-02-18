@@ -246,6 +246,9 @@ class ClassificationLoss(nn.Module):
             reduction='mean',
         )
 
+        # Normalize by sequence length K as per paper formula: L_C = -(1/K) * Σ ...
+        loss = loss / K
+
         return loss, {"classification_loss": loss, "loss_mode": "ctc"}
 
     def _ce_classification_loss(
@@ -283,6 +286,8 @@ class ClassificationLoss(nn.Module):
             weights = self.weights.to(pred_logits.device)
             weighted_loss = nll_loss * weights[targets_flat[mask]]
             loss = weighted_loss.mean()
+            # Normalize by sequence length K as per paper formula: L_C = -(1/K) * Σ ...
+            loss = loss / K
         else:
             loss = torch.tensor(0.0, device=pred_logits.device, requires_grad=True)
 
