@@ -308,30 +308,12 @@ class OCRModel(nn.Module):
         self.max_length = max_length
         self.frozen = frozen
 
-        # Load PARSeq model from HuggingFace
-        print(f"Loading PARSeq model from HuggingFace ({pretrained_path})...")
-
-        try:
-            # Try loading with torch.hub (from deepmind org)
-            self.parseq_system = torch.hub.load(
-                'deepmind-udini-UoA', 'parseq_torchvision',
-                pretrained=True,
-                source='github',
-                trust_repo=True
-            )
-            print("Successfully loaded PARSeq model from torch.hub")
-        except Exception as e:
-            print(f"torch.hub load failed: {e}")
-            # Fallback: try installing and importing from str package
-            try:
-                from strhub.data import parseq
-                self.parseq_system = parseq(pretrained=True)
-                print("Successfully loaded PARSeq model from strhub")
-            except ImportError:
-                raise ImportError(
-                    "Failed to load PARSeq. Please install:\n"
-                    "pip install strhub"
-                )
+        # Load PARSeq model from torch.hub
+        print(f"Loading PARSeq model from torch.hub...")
+        self.parseq_system = torch.hub.load(
+            'baudm/parseq', 'parseq', pretrained=True, trust_repo=True
+        )
+        print("Successfully loaded PARSeq model")
 
         # Store references to PARSeq's internal components
         # self.parseq_system.model = raw PARSeq (encoder + decoder + head)
