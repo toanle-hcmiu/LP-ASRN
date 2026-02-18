@@ -307,6 +307,7 @@ class OCRModel(nn.Module):
         self.vocab = vocab
         self.max_length = max_length
         self.frozen = frozen
+        self.use_parseq = True  # Always using PARSeq now (SimpleCRNN removed)
 
         # Load PARSeq model from torch.hub
         print(f"Loading PARSeq model from torch.hub...")
