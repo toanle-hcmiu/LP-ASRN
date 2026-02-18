@@ -217,16 +217,7 @@ def load_models(args, config, device):
         print("Warning: No generator_state_dict in checkpoint. Running OCR-only mode.")
 
     # ── OCR ──────────────────────────────────────────────────────────
-    print("Creating OCR model...")
-    ocr = OCRModel(
-        vocab=ocr_config.get("vocab", "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"),
-        max_length=ocr_config.get("max_length", 7),
-        frozen=True,
-        rnn_dropout=ocr_config.get("rnn_dropout", 0.3),
-        use_parseq=ocr_config.get("use_pretrained", False),
-    )
-
-    # Load OCR weights from checkpoint if available
+    # Load OCR weights from checkpoint first to detect model type
     ocr_state = None
     ocr_source = None
     if "ocr_state_dict" in checkpoint:
@@ -235,6 +226,25 @@ def load_models(args, config, device):
     elif "model_state_dict" in checkpoint:
         ocr_state = _strip_ddp_prefix(checkpoint["model_state_dict"])
         ocr_source = "model_state_dict"
+
+    # Detect OCR type from checkpoint (PARSeq vs SimpleCRNN)
+    # PARSeq has keys like 'parseq_system.model.encoder...', 'parseq_system.tokenizer...'
+    # SimpleCRNN has keys like 'model.stn...', 'model.backbone...', 'model.rnn...'
+    use_parseq = False
+    if ocr_state is not None:
+        # Check for PARSeq-specific keys
+        parseq_keys = [k for k in ocr_state.keys() if 'parseq_system' in k]
+        use_parseq = len(parseq_keys) > 0
+        print(f"  Auto-detected OCR type: {'PARSeq' if use_parseq else 'SimpleCRNN'}")
+
+    print("Creating OCR model...")
+    ocr = OCRModel(
+        vocab=ocr_config.get("vocab", "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"),
+        max_length=ocr_config.get("max_length", 7),
+        frozen=True,
+        rnn_dropout=ocr_config.get("rnn_dropout", 0.3),
+        use_parseq=use_parseq,
+    )
 
     if ocr_state is not None:
         try:
