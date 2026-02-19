@@ -1,276 +1,148 @@
-# LP-ASRN Configuration
-# Layout-Aware and Character-Driven Super-Resolution Network
-# Enhanced with SwinIR, Character Pyramid Attention, and PARSeq OCR
-
 model:
-  # ========== SwinIR Architecture Settings ==========
-  # MAXIMUM CONFIGURATION for best accuracy - prioritize results over speed
-  # Embedding dimension - increased from 120 to 144 for more capacity
-  swinir_embed_dim: 144
-
-  # Number of Residual Swin Transformer Blocks - increased to 8
-  swinir_num_rstb: 8
-
-  # Number of attention heads (must divide embed_dim evenly)
-  # 144 / 8 = 18 heads per attention layer
-  swinir_num_heads: 8
-
-  # Window size for window-based attention (smaller = more fine-grained attention)
-  swinir_window_size: 6
-
-  # Number of Swin blocks per RSTB - increased for more depth
-  swinir_num_blocks_per_rstb: 3
-
-  # MLP expansion ratio - increased for more capacity
-  swinir_mlp_ratio: 6.0
-
-  # Path to pre-trained SwinIR weights (for better initialization)
-  # Download from: https://github.com/JingyunLiang/SwinIR/releases
-  # Recommended: 003_realSR_BSRGAN_DFOWMFC_s64w8_SwinIR-L_x4_GAN
-  # Set to null to train from scratch
-  swinir_pretrained: "checkpoints/003_realSR_BSRGAN_DFOWMFC_s64w8_SwinIR-L_x4_GAN.pth"
-
-  # ========== Common Settings ==========
-  # Upscaling factor (2 for 2x, 4 for 4x)
-  # Paper 2 uses 2x which achieved 49.8% recognition rate
   upscale_factor: 2
-
-  # Phase 3: Multi-Scale Character Attention
-  # DISABLED for lightweight model - saves computation and params
-  use_character_attention: false  # Disabled for speed (not needed for fixed-format plates)
-  msca_scales: [1.0, 0.5, 0.25]  # Scales for multi-scale processing
-  msca_num_prototypes: 36          # Number of character prototypes
-
-  # Character Pyramid Attention - ENABLED for best accuracy
-  use_pyramid_attention: true
-  pyramid_layout: "brazilian"  # "brazilian" or "mercocur"
-
+  use_character_attention: false
+  msca_scales:
+  - 1.0
+  - 0.5
+  - 0.25
+  msca_num_prototypes: 36
+  num_features: 64
+  num_blocks: 12
+  num_layers_per_block: 3
+  use_enhanced_attention: true
+  use_deformable: false
+  use_pyramid_attention: false
 data:
-  # Scenarios to include in training
   scenarios:
-    - "Scenario-A"  # Light degradation
-    - "Scenario-B"  # Heavy degradation
-
-  # Layouts to include
+  - Scenario-A
+  - Scenario-B
   layouts:
-    - "Brazilian"   # LLLNNNN pattern
-    - "Mercosur"    # LLLNLNN pattern
-
-  # Target size for LR images (height, width)
-  # Increased from 17x31 to 34x62 (2x) for better OCR - each character now ~10-12 pixels instead of ~5-6
-  lr_size: [34, 62]
-
-  # Batch size for training (64 fits comfortably with lightweight model)
-  batch_size: 64
-
-  # Number of data loading workers (reduced for DDP stability)
+  - Brazilian
+  - Mercosur
+  lr_size:
+  - 34
+  - 62
+  batch_size: 16
   num_workers: 4
-
-  # Validation split
   val_split: 0.05
-
-  # Enable OCR-specific augmentation during pretraining
-  # Set to true when running stage0 (OCR pretraining) for better robustness
   ocr_pretrain_augmentation: true
-
-  # Aspect ratio augmentation: randomly varies crop aspect ratio during training
-  # to match test-time image distribution. Test images have H/W ratios of 0.29-0.40
-  # while training crops resized to lr_size have ratio 0.55. This augmentation
-  # pads images before resize to simulate the test distribution, teaching the
-  # generator+OCR to handle varied aspect ratios.
-  # EXPANDED RANGE: [0.25, 0.45] for better coverage of test distribution
   aspect_ratio_augment: true
-  test_aspect_range: [0.25, 0.45]  # Expanded from [0.29, 0.40] for better test coverage
-
+  test_aspect_range:
+  - 0.25
+  - 0.45
 training:
-  # Number of training epochs
   epochs: 100
-
-  # Learning rate
   lr: 0.0001
-
-  # Validation interval (validate every N epochs to save time)
-  val_interval: 5  # Reduced validation frequency for faster training
-
-  # Beam width for validation (higher = more accurate but slower)
-  val_beam_width: 5
-
-  # Adam optimizer betas
+  val_interval: 2
+  val_beam_width: 3
   beta1: 0.9
   beta2: 0.999
-
-  # Gradient clipping for stability (prevents exploding gradients)
   gradient_clip: 1.0
-
-  # StepLR learning rate schedule
-  # Reduces LR by this factor every lr_step_size epochs
-  # Paper 2 uses this to prevent oscillations
-  lr_scheduler: "StepLR"
+  lr_scheduler: StepLR
   lr_step_size: 10
   lr_gamma: 0.95
-
-  # Early stopping patience (from Paper 1)
-  # Stops after 30 epochs without improvement (increased for 98% target)
   early_stop_patience: 30
-
-  # Validation settings
-  val_interval: 2         # Validate every N epochs
-  val_beam_width: 3       # Beam width for OCR during validation (3 = good balance of speed/accuracy)
-
-  # Monitor metric for early stopping
-  # "recognition_rate" monitors OCR accuracy (Paper 2 innovation)
-  # "loss" monitors total loss
-  monitor_metric: "recognition_rate"
-
-  # Output directory for all training outputs (checkpoints, logs, etc.)
-  # Auto-formatted with timestamp at runtime: outputs/run_YYYYMMDD_HHMMSS
-  save_dir: "outputs/run_%Y%m%d_%H%M%S"
-
+  monitor_metric: recognition_rate
+  save_dir: outputs/run_%Y%m%d_%H%M%S
 loss:
-  # Weight for LCOFL loss (character-driven loss)
   lambda_lcofl: 1.0
-
-  # Weight for layout penalty
   lambda_layout: 0.5
-
-  # Weight for SSIM loss (from Paper 2)
   lambda_ssim: 0.2
-
-  # Weight for VGG perceptual loss (sharper textures)
-  # Active during LCOFL and finetune stages
   lambda_perceptual: 0.1
-
-  # Phase 1: Embedding Consistency Loss (LCOFL-EC)
-  # DISABLED for lightweight model - saves ResNet-18 backbone (~11M params)
-  lambda_embed: 0.0           # Disabled for lightweight model
-  embed_target_weight: 0.0    # Disabled for lightweight model
-  embed_warmup_epochs: 50     # Epochs for warm-up
-  embedding_dim: 128          # Embedding dimension
-  embed_margin: 2.0           # Contrastive loss margin
-  use_lightweight_embedder: false  # Use lightweight embedder instead of ResNet-18
-
-  # Confusion weight increment (added to confused character weights)
+  lambda_embed: 0.0
+  embed_target_weight: 0.0
+  embed_warmup_epochs: 50
+  embedding_dim: 128
+  embed_margin: 2.0
+  use_lightweight_embedder: false
   alpha: 0.1
-
-  # Layout penalty value (for each digit/letter mismatch)
   beta: 1.0
-
 ocr:
-  # OCR model type - PARSeq (pretrained attention-based model from HuggingFace)
-  model_type: "parseq"
-
-  # Pre-trained model path (HuggingFace model ID or local path)
-  pretrained_path: "baudm/parseq-base"
-
-  # Fine-tune OCR on HR images before SR training
+  model_type: parseq
+  pretrained_path: baudm/parseq-base
   finetune_first: true
-
-  # Path to fine-tuned model (after fine-tuning)
-  finetuned_path: "checkpoints/ocr/best.pth"
-
-  # Keep OCR frozen during SR training (critical for stability)
+  finetuned_path: checkpoints/ocr/best.pth
   freeze_ocr: true
-
-  # Maximum sequence length for OCR
-  # PARSeq: 7 is correct (position-aligned, 1:1 char mapping)
   max_length: 7
-
-  # Character vocabulary
-  vocab: "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-
-# Progressive Training Configuration
+  vocab: 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ
 progressive_training:
   enabled: true
-
-  # Stage 0: OCR Pretraining
-  # Purpose: Train OCR model on license plate data before SR training
-  # This ensures OCR can provide meaningful guidance to the generator
   stage0:
-    name: "pretrain"
-    epochs: 50  # Reduced - model plateaus around epoch 50
-    lr: 0.0005   # Reduced from 0.001 to prevent loss spikes
-    loss_components: ["ocr"]
+    name: pretrain
+    epochs: 50
+    lr: 0.0005
+    loss_components:
+    - ocr
     freeze_ocr: false
     update_confusion: false
-    aspect_ratio_range: [0.40, 0.60]  # Mild aspect ratio variation
-
-  # Stage 1: Warm-up (L1 loss only)
-  # Purpose: Stabilize network before introducing complex losses
+    aspect_ratio_range:
+    - 0.4
+    - 0.6
   stage1:
-    name: "warmup"
-    epochs: 80    # Increased for better stabilization
-    lr: 0.0001   # Original LR (stable enough)
-    loss_components: ["l1"]
+    name: warmup
+    epochs: 80
+    lr: 0.0001
+    loss_components:
+    - l1
     freeze_ocr: true
     update_confusion: false
-    aspect_ratio_range: [0.35, 0.55]  # Moderate aspect ratio variation
-
-  # Stage 2: LCOFL Training (Character-driven loss)
-  # Purpose: Optimize for character recognition with frozen OCR
+    aspect_ratio_range:
+    - 0.4
+    - 0.55
   stage2:
-    name: "lcofl"
-    epochs: 200   # Reduced - smaller model needs less training
-    lr: 0.0001   # Lower LR for stability
-    loss_components: ["l1", "lcofl"]
+    name: lcofl
+    epochs: 200
+    lr: 0.0001
+    loss_components:
+    - l1
+    - lcofl
     freeze_ocr: true
     update_confusion: true
-    aspect_ratio_range: [0.30, 0.50]  # Less aggressive change from stage1
-
-  # Stage 3: Fine-tuning (Joint optimization)
-  # Purpose: Refine with unfrozen OCR for co-adaptation
+    aspect_ratio_range:
+    - 0.35
+    - 0.5
   stage3:
-    name: "finetune"
-    epochs: 100   # Reduced for lightweight model
-    lr: 0.00001   # Lower LR for joint training
-    loss_components: ["l1", "lcofl"]
+    name: finetune
+    epochs: 100
+    lr: 1.0e-05
+    loss_components:
+    - l1
+    - lcofl
     freeze_ocr: false
     update_confusion: true
-    aspect_ratio_range: [0.25, 0.45]  # Full test range coverage
-
-  # Phase 4: Hard Example Mining Stage (OCR-Driven Curriculum)
-  # Purpose: Focus training on samples that OCR struggles with
+    aspect_ratio_range:
+    - 0.25
+    - 0.45
   stage4:
-    name: "hard_mining"
-    epochs: 50    # Additional epochs focusing on hard examples
-    lr: 0.000005  # Lower LR for fine-tuning on hard examples
-    loss_components: ["l1", "lcofl"]  # No embedding loss for lightweight
+    name: hard_mining
+    epochs: 50
+    lr: 5.0e-06
+    loss_components:
+    - l1
+    - lcofl
     freeze_ocr: true
     update_confusion: true
-    aspect_ratio_range: [0.25, 0.40]  # Focus on hardest test cases
+    aspect_ratio_range:
+    - 0.25
+    - 0.4
     hard_mining:
-      difficulty_alpha: 2.0      # Exponent for difficulty weighting
-      reweight_interval: 5       # Re-weight samples every N epochs
-      min_samples_seen: 100      # Min samples before weighting
-
-# TensorBoard Configuration
+      difficulty_alpha: 2.0
+      reweight_interval: 5
+      min_samples_seen: 100
 tensorboard:
   enabled: true
-  # Logs are stored in <save_dir>/logs subdirectory
-  log_dir: "logs"
+  log_dir: logs
   port: 6007
-
-  # Logging intervals
-  log_interval: 5      # Log scalars every N steps
-  log_images_every: 5   # Log images every N epochs
-  log_histograms_every: 5  # Log histograms every N epochs
-
-  # Maximum images to log per batch
+  log_interval: 5
+  log_images_every: 5
+  log_histograms_every: 5
   max_images: 16
-
-# Evaluation settings
 evaluation:
-  # Batch size for evaluation (reduced from 32 to 16 due to larger input images)
   batch_size: 16
-
-  # Metrics to compute
   metrics:
-    - "psnr"        # Peak Signal-to-Noise Ratio
-    - "ssim"        # Structural Similarity Index
-    - "char_acc"    # Character-level accuracy
-    - "word_acc"    # Word-level (full plate) accuracy
-
-  # Number of visualization samples
+  - psnr
+  - ssim
+  - char_acc
+  - word_acc
   num_vis_samples: 10
-
-  # Visualization save directory
-  vis_dir: "results/visualizations"
+  vis_dir: results/visualizations

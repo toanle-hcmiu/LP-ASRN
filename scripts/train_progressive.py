@@ -338,26 +338,16 @@ def train_ddp(rank, world_size, args, config):
 
     model_config = config.get("model", {})
     generator = Generator(
-        embed_dim=model_config.get("swinir_embed_dim", 144),
-        num_rstb=model_config.get("swinir_num_rstb", 8),
-        num_heads=model_config.get("swinir_num_heads", 8),
-        window_size=model_config.get("swinir_window_size", 6),
-        num_blocks_per_rstb=model_config.get("swinir_num_blocks_per_rstb", 3),
-        mlp_ratio=model_config.get("swinir_mlp_ratio", 6.0),
+        in_channels=3,
+        out_channels=3,
+        num_features=model_config.get("num_features", 64),
+        num_blocks=model_config.get("num_blocks", 12),
+        num_layers_per_block=model_config.get("num_layers_per_block", 3),
         upscale_factor=model_config.get("upscale_factor", 2),
-        use_pyramid_attention=model_config.get("use_pyramid_attention", True),
-        pyramid_layout=model_config.get("pyramid_layout", "brazilian"),
+        use_enhanced_attention=model_config.get("use_enhanced_attention", True),
+        use_deformable=model_config.get("use_deformable", False),
+        use_autoencoder=True,
     )
-
-    # Load SwinIR pre-trained weights if specified
-    pretrained_path = model_config.get("swinir_pretrained")
-    if pretrained_path and Path(pretrained_path).exists():
-        if is_main:
-            print(f"\nLoading SwinIR pre-trained weights from {pretrained_path}...")
-        generator.load_swinir_pretrained(pretrained_path)
-    elif pretrained_path:
-        if is_main:
-            print(f"\nWarning: SwinIR pre-trained path specified but not found: {pretrained_path}")
 
     # Count parameters (only rank 0)
     if is_main:
@@ -598,24 +588,19 @@ def main():
         print("\nCreating generator...")
         model_config = config.get("model", {})
         generator = Generator(
-            embed_dim=model_config.get("swinir_embed_dim", 144),
-            num_rstb=model_config.get("swinir_num_rstb", 8),
-            num_heads=model_config.get("swinir_num_heads", 8),
-            window_size=model_config.get("swinir_window_size", 6),
-            num_blocks_per_rstb=model_config.get("swinir_num_blocks_per_rstb", 3),
-            mlp_ratio=model_config.get("swinir_mlp_ratio", 6.0),
+            in_channels=3,
+            out_channels=3,
+            num_features=model_config.get("num_features", 64),
+            num_blocks=model_config.get("num_blocks", 12),
+            num_layers_per_block=model_config.get("num_layers_per_block", 3),
             upscale_factor=model_config.get("upscale_factor", 2),
-            use_pyramid_attention=model_config.get("use_pyramid_attention", True),
-            pyramid_layout=model_config.get("pyramid_layout", "brazilian"),
+            use_enhanced_attention=model_config.get("use_enhanced_attention", True),
+            use_deformable=model_config.get("use_deformable", False),
+            use_character_attention=model_config.get("use_character_attention", False),
+            msca_scales=tuple(model_config.get("msca_scales", (1.0, 0.5, 0.25))),
+            msca_num_prototypes=model_config.get("msca_num_prototypes", 36),
+            use_autoencoder=True,
         )
-
-        # Load SwinIR pre-trained weights if specified
-        pretrained_path = model_config.get("swinir_pretrained")
-        if pretrained_path and Path(pretrained_path).exists():
-            print(f"\nLoading SwinIR pre-trained weights from {pretrained_path}...")
-            generator.load_swinir_pretrained(pretrained_path)
-        elif pretrained_path:
-            print(f"\nWarning: SwinIR pre-trained path specified but not found: {pretrained_path}")
 
         # Count parameters
         total_params = sum(p.numel() for p in generator.parameters())

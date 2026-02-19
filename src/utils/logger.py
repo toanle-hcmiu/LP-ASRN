@@ -91,7 +91,12 @@ class TextLogger:
         with open(self.log_file, "a", encoding="utf-8") as f:
             f.write(message + "\n")
         if self.also_console:
-            print(message)
+            try:
+                print(message)
+            except UnicodeEncodeError:
+                # Fallback for Windows console that doesn't support Unicode
+                ascii_message = message.encode('ascii', 'replace').decode('ascii')
+                print(ascii_message)
 
     def _write(self, message: str):
         """Write message to log file with timestamp."""
