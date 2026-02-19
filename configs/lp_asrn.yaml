@@ -22,7 +22,7 @@ data:
   lr_size:
   - 34
   - 62
-  batch_size: 16
+  batch_size: 64
   num_workers: 4
   val_split: 0.05
   ocr_pretrain_augmentation: true
@@ -138,7 +138,7 @@ tensorboard:
   log_histograms_every: 5
   max_images: 16
 evaluation:
-  batch_size: 16
+  batch_size: 64
   metrics:
   - psnr
   - ssim
