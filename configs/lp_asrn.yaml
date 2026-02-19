@@ -24,6 +24,12 @@ model:
   # MLP expansion ratio - increased for more capacity
   swinir_mlp_ratio: 6.0
 
+  # Path to pre-trained SwinIR weights (for better initialization)
+  # Download from: https://github.com/JingyunLiang/SwinIR/releases
+  # Recommended: 003_realSR_BSRGAN_DFOWMFC_s64w8_SwinIR-L_x4_GAN
+  # Set to null to train from scratch
+  swinir_pretrained: "checkpoints/003_realSR_BSRGAN_DFOWMFC_s64w8_SwinIR-L_x4_GAN.pth"
+
   # ========== Common Settings ==========
   # Upscaling factor (2 for 2x, 4 for 4x)
   # Paper 2 uses 2x which achieved 49.8% recognition rate
@@ -192,8 +198,8 @@ progressive_training:
   # Purpose: Stabilize network before introducing complex losses
   stage1:
     name: "warmup"
-    epochs: 30    # Reduced - lightweight model converges faster
-    lr: 0.0001
+    epochs: 80    # Increased for better stabilization
+    lr: 0.0001   # Original LR (stable enough)
     loss_components: ["l1"]
     freeze_ocr: true
     update_confusion: false
@@ -204,11 +210,11 @@ progressive_training:
   stage2:
     name: "lcofl"
     epochs: 200   # Reduced - smaller model needs less training
-    lr: 0.0002   # Increased for faster convergence
+    lr: 0.0001   # Lower LR for stability
     loss_components: ["l1", "lcofl"]
     freeze_ocr: true
     update_confusion: true
-    aspect_ratio_range: [0.25, 0.45]  # Full test range coverage
+    aspect_ratio_range: [0.30, 0.50]  # Less aggressive change from stage1
 
   # Stage 3: Fine-tuning (Joint optimization)
   # Purpose: Refine with unfrozen OCR for co-adaptation

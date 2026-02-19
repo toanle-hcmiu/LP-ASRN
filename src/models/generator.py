@@ -18,11 +18,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import List, Optional, Tuple
+import logging
 
 from .attention import ThreeFoldAttentionModule, ResidualChannelAttentionBlock
 from .deform_conv import DeformableConv2d
 from .character_attention import MultiScaleCharacterAttention
 from .swinir_blocks import ResidualSwinTransformerBlock
+
+logger = logging.getLogger(__name__)
 
 
 class ShallowFeatureExtractor(nn.Module):
@@ -723,6 +726,57 @@ class Generator(nn.Module):
         )
 
         return output
+
+    def load_swinir_pretrained(self, pretrained_path: str = None, strict: bool = False):
+        """
+        Load pre-trained SwinIR weights for the deep feature extractor.
+
+        This initializes the SwinIR backbone with weights pre-trained on image
+        restoration tasks, providing a better starting point for training.
+
+        Args:
+            pretrained_path: Path to pre-trained SwinIR checkpoint (.pth file).
+                          If None, uses default URL.
+            strict: Whether to strictly enforce that the keys match.
+        """
+        if pretrained_path is None:
+            # Default: use SwinIR lightweight pre-trained weights for SR
+            # This can be downloaded from the official SwinIR repository
+            logger.warning("No pre-trained path provided. Skipping SwinIR pre-training.")
+            return
+
+        try:
+            state_dict = torch.load(pretrained_path, map_location='cpu')
+
+            # Handle different checkpoint formats
+            if 'params' in state_dict:
+                # SwinIR official format
+                state_dict = state_dict['params']
+            elif 'model' in state_dict:
+                state_dict = state_dict['model']
+            elif 'state_dict' in state_dict:
+                state_dict = state_dict['state_dict']
+
+            # Filter keys to only load SwinIR deep feature extractor
+            model_dict = self.state_dict()
+
+            # Build mapping from checkpoint keys to model keys
+            pretrained_dict = {}
+            for k, v in state_dict.items():
+                # Skip non-SwinIR layers (upscaler, reconstruction, etc.)
+                if k.startswith('deep_features.') or k.startswith('conv_first') or k.startswith('conv_after_body'):
+                    pretrained_dict[k] = v
+
+            # Load with loose matching (ignore missing/extra keys)
+            missing, unexpected = self.load_state_dict(pretrained_dict, strict=False)
+
+            logger.info(f"Loaded SwinIR pre-trained weights from {pretrained_path}")
+            logger.info(f"  Matched keys: {len(pretrained_dict)}")
+            logger.info(f"  Missing keys: {len(missing)}")
+            logger.info(f"  Unexpected keys: {len(unexpected)}")
+
+        except Exception as e:
+            logger.warning(f"Failed to load SwinIR pre-trained weights: {e}")
 
     def get_last_layer_weights(self):
         """Get weights of the last reconstruction layer for visualization."""

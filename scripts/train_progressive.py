@@ -349,6 +349,16 @@ def train_ddp(rank, world_size, args, config):
         pyramid_layout=model_config.get("pyramid_layout", "brazilian"),
     )
 
+    # Load SwinIR pre-trained weights if specified
+    pretrained_path = model_config.get("swinir_pretrained")
+    if pretrained_path and Path(pretrained_path).exists():
+        if is_main:
+            print(f"\nLoading SwinIR pre-trained weights from {pretrained_path}...")
+        generator.load_swinir_pretrained(pretrained_path)
+    elif pretrained_path:
+        if is_main:
+            print(f"\nWarning: SwinIR pre-trained path specified but not found: {pretrained_path}")
+
     # Count parameters (only rank 0)
     if is_main:
         total_params = sum(p.numel() for p in generator.parameters())
@@ -598,6 +608,14 @@ def main():
             use_pyramid_attention=model_config.get("use_pyramid_attention", True),
             pyramid_layout=model_config.get("pyramid_layout", "brazilian"),
         )
+
+        # Load SwinIR pre-trained weights if specified
+        pretrained_path = model_config.get("swinir_pretrained")
+        if pretrained_path and Path(pretrained_path).exists():
+            print(f"\nLoading SwinIR pre-trained weights from {pretrained_path}...")
+            generator.load_swinir_pretrained(pretrained_path)
+        elif pretrained_path:
+            print(f"\nWarning: SwinIR pre-trained path specified but not found: {pretrained_path}")
 
         # Count parameters
         total_params = sum(p.numel() for p in generator.parameters())
