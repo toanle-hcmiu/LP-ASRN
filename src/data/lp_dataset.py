@@ -240,17 +240,17 @@ class LicensePlateDataset(Dataset):
                 ),
             ])
         else:
-            # ENHANCED: Added perspective transform and increased affine range
+            # STRONG augmentation for better generalization
             return transforms.Compose([
                 transforms.RandomAffine(
-                    degrees=10,    # Increased from 5
-                    translate=(0.1, 0.15),  # Increased from (0.05, 0.1)
-                    scale=(0.85, 1.15),  # Increased from (0.9, 1.1)
-                    shear=8,    # Increased from 5
+                    degrees=15,    # More rotation
+                    translate=(0.15, 0.2),  # More translation
+                    scale=(0.8, 1.2),  # Wider scale
+                    shear=10,   # More shear
                 ),
                 transforms.RandomPerspective(
-                    distortion_scale=0.15,
-                    p=0.5   # 50% chance - was missing before
+                    distortion_scale=0.25,  # More perspective distortion
+                    p=0.6   # 60% chance
                 ),
             ])
 
@@ -288,30 +288,30 @@ class LicensePlateDataset(Dataset):
                 ], p=0.25),
             ])
         else:
-            # ENHANCED: Added heavier degradation for better test robustness
+            # STRONG photometric degradation for better robustness
             return transforms.Compose([
                 transforms.ColorJitter(
-                    brightness=0.5,  # Increased from 0.4
-                    contrast=0.5,   # Increased from 0.4
-                    saturation=0.3, # Increased from 0.2
-                    hue=0.15,      # Increased from 0.1
+                    brightness=0.6,  # More brightness variation
+                    contrast=0.6,   # More contrast variation
+                    saturation=0.4, # More saturation variation
+                    hue=0.2,       # More hue shift
                 ),
-                # Standard blur (30% chance)
+                # Standard blur (40% chance)
                 transforms.RandomApply([
-                    transforms.GaussianBlur(kernel_size=3, sigma=(0.5, 2.0)),
+                    transforms.GaussianBlur(kernel_size=5, sigma=(0.5, 3.0)),
+                ], p=0.4),
+                # HEAVY blur for extreme cases (30% chance)
+                transforms.RandomApply([
+                    transforms.GaussianBlur(kernel_size=7, sigma=(2.0, 6.0)),
                 ], p=0.3),
-                # HEAVY blur for extreme cases (20% chance)
+                # Standard noise (40% chance)
                 transforms.RandomApply([
-                    transforms.GaussianBlur(kernel_size=7, sigma=(2.0, 5.0)),
-                ], p=0.2),
-                # Standard noise (30% chance)
-                transforms.RandomApply([
-                    AddGaussianNoise(mean=0, std=0.05),
-                ], p=0.3),
-                # STRONGER noise for extreme cases (20% chance)
+                    AddGaussianNoise(mean=0, std=0.08),
+                ], p=0.4),
+                # STRONGER noise for extreme cases (30% chance)
                 transforms.RandomApply([
                     AddGaussianNoise(mean=0, std=0.02),
-                ], p=0.2),
+                ], p=0.3),
             ])
 
     def _load_image(self, path: str) -> Image.Image:

@@ -10,7 +10,7 @@ model:
   num_blocks: 12
   num_layers_per_block: 3
   use_enhanced_attention: true
-  use_deformable: false
+  use_deformable: true
   use_pyramid_attention: false
 data:
   scenarios:
@@ -76,8 +76,8 @@ progressive_training:
     freeze_ocr: false
     update_confusion: false
     aspect_ratio_range:
-    - 0.4
-    - 0.6
+    - 0.25
+    - 0.65
   stage1:
     name: warmup
     epochs: 80
@@ -87,8 +87,8 @@ progressive_training:
     freeze_ocr: true
     update_confusion: false
     aspect_ratio_range:
-    - 0.4
-    - 0.55
+    - 0.25
+    - 0.6
   stage2:
     name: lcofl
     epochs: 200
@@ -99,8 +99,8 @@ progressive_training:
     freeze_ocr: true
     update_confusion: true
     aspect_ratio_range:
-    - 0.35
-    - 0.5
+    - 0.2
+    - 0.55
   stage3:
     name: finetune
     epochs: 100
@@ -111,8 +111,8 @@ progressive_training:
     freeze_ocr: false
     update_confusion: true
     aspect_ratio_range:
-    - 0.25
-    - 0.45
+    - 0.2
+    - 0.5
   stage4:
     name: hard_mining
     epochs: 50
@@ -123,8 +123,8 @@ progressive_training:
     freeze_ocr: true
     update_confusion: true
     aspect_ratio_range:
-    - 0.25
-    - 0.4
+    - 0.2
+    - 0.45
     hard_mining:
       difficulty_alpha: 2.0
       reweight_interval: 5
