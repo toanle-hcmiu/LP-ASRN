@@ -484,6 +484,12 @@ class ProgressiveTrainer:
             # - Generator learns to produce SR images that are OCR-friendly
             # - OCR learns to better recognize the SR output
             if "ocr" in stage_config.loss_components:
+                # Debug: Log first batch of first epoch to verify OCR loss is being computed
+                if self.global_step == 0 and self.is_main:
+                    self._log(f"DEBUG: OCR loss component ENABLED for stage {self.current_stage.value}", "info")
+                    self._log(f"DEBUG: loss_components = {stage_config.loss_components}", "info")
+                    self._log(f"DEBUG: freeze_ocr = {stage_config.freeze_ocr}", "info")
+
                 ocr_unwrapped = self._unwrap_model(self.ocr)
                 label_smoothing = self.config.get("ocr", {}).get("label_smoothing", 0.1)
 
@@ -497,6 +503,16 @@ class ProgressiveTrainer:
                 lambda_ocr = self.config.get("loss", {}).get("lambda_ocr", 1.0)
                 loss = loss + lambda_ocr * ocr_loss
                 total_ocr += ocr_loss.item()
+
+                # Debug: Log first batch loss value
+                if self.global_step == 0 and self.is_main:
+                    self._log(f"DEBUG: ocr_loss = {ocr_loss.item():.6f}, lambda_ocr = {lambda_ocr}", "info")
+            else:
+                # Debug: Log why OCR loss is NOT being computed
+                if self.global_step == 0 and self.is_main:
+                    self._log(f"DEBUG: OCR loss component DISABLED", "info")
+                    self._log(f"DEBUG: loss_components = {stage_config.loss_components}", "info")
+                    self._log(f"DEBUG: 'ocr' in loss_components = {'ocr' in stage_config.loss_components}", "info")
 
             # LCOFL loss - character-driven supervision for generator
             if "lcofl" in stage_config.loss_components:
