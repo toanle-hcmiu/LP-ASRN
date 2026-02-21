@@ -341,10 +341,13 @@ class GradientLoss(nn.Module):
         """Compute 2nd order gradients (Laplacian)."""
         # Laplacian = d²x/dx² + d²x/dy²
         # Using discrete approximation
-        laplacian = (
-            x[..., :, 2:] - 2 * x[..., :, 1:-1] + x[..., :, :-2] +  # d²/dx²
-            x[..., 2:, :] - 2 * x[..., 1:-1, :] + x[..., :-2, :]  # d²/dy²
-        )
+        # Horizontal: d²/dx², produces (B, C, H-4, W)
+        lap_x = x[..., :, 2:] - 2 * x[..., :, 1:-1] + x[..., :, :-2]
+        # Vertical: d²/dy², produces (B, C, H, W-4)
+        lap_y = x[..., 2:, :] - 2 * x[..., 1:-1, :] + x[..., :-2, :]
+
+        # Crop to common size (H-4, W-4)
+        laplacian = lap_x[..., 2:, :] + lap_y[..., :, 2:]
         return laplacian
 
     def forward(
