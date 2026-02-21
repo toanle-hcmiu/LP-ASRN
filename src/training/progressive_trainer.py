@@ -431,6 +431,7 @@ class ProgressiveTrainer:
         total_loss = 0.0
         total_l1 = 0.0
         total_lcofl = 0.0
+        total_ocr = 0.0
 
         pred_texts_all = []
         gt_texts_all = []
@@ -448,11 +449,9 @@ class ProgressiveTrainer:
             l1 = self.l1_loss(sr_images, hr_images)
             loss = l1
 
-            if "lcofl" in stage_config.loss_components:
-                # Get OCR logits WITH gradient flow enabled.
-                # OCR params are frozen (requires_grad=False) so they won't update,
-                # but gradients must flow THROUGH the OCR back to the generator.
-                # Without this, LCOFL loss has no effect on generator training.
+            # Get OCR logits for LCOFL and/or OCR loss
+            # Always get logits when either loss component is active
+            if "lcofl" in stage_config.loss_components or "ocr" in stage_config.loss_components:
                 pred_logits = self.ocr(sr_images, return_logits=True)
 
                 # Decode texts from logits for confusion tracking (non-differentiable)
@@ -480,11 +479,33 @@ class ProgressiveTrainer:
                             text = ''.join(c.upper() if c.upper() in allowed else '' for c in pred)
                             pred_texts.append(text[:ocr_unwrapped.max_length])
 
-                # Compute LCOFL (layout penalty now uses logits directly)
+            # OCR loss (cross-entropy/CTC) - trains OCR to recognize SR output
+            # When OCR is unfrozen, this acts adversarially:
+            # - Generator learns to produce SR images that are OCR-friendly
+            # - OCR learns to better recognize the SR output
+            if "ocr" in stage_config.loss_components:
+                ocr_unwrapped = self._unwrap_model(self.ocr)
+                label_smoothing = self.config.get("ocr", {}).get("label_smoothing", 0.1)
+
+                if ocr_unwrapped.use_parseq:
+                    # PARSeq: use forward_train for proper loss computation
+                    ocr_loss = ocr_unwrapped.forward_train(sr_images, gt_texts, label_smoothing=label_smoothing)
+                else:
+                    # SimpleCRNN: compute CTC loss
+                    ocr_loss = ocr_unwrapped.compute_loss(pred_logits, gt_texts, device=self.device, label_smoothing=label_smoothing)
+
+                lambda_ocr = self.config.get("loss", {}).get("lambda_ocr", 1.0)
+                loss = loss + lambda_ocr * ocr_loss
+                total_ocr += ocr_loss.item()
+
+            # LCOFL loss - character-driven supervision for generator
+            if "lcofl" in stage_config.loss_components:
+                # When OCR is frozen: LCOFL gradients flow through OCR to generator
+                # When OCR is unfrozen: LCOFL provides additional character-level supervision
+                # Note: pred_logits already computed above
                 lcofl, lcofl_info = self.lcofl_loss(
                     sr_images, hr_images, pred_logits, gt_texts, pred_texts
                 )
-                # Use configurable lambda_lcofl weight (default 1.0 instead of 0.1)
                 lambda_lcofl = self.config.get("loss", {}).get("lambda_lcofl", 1.0)
                 loss = loss + lambda_lcofl * lcofl
                 total_lcofl += lcofl.item()
@@ -504,12 +525,14 @@ class ProgressiveTrainer:
             self.optimizer.zero_grad()
             loss.backward()
 
-            # Gradient clipping
+            # Gradient clipping - apply to both generator and OCR when unfrozen
             if self.config.get("training", {}).get("gradient_clip"):
-                torch.nn.utils.clip_grad_norm_(
-                    self.generator.parameters(),
-                    max_norm=self.config["training"]["gradient_clip"],
-                )
+                max_norm = self.config["training"]["gradient_clip"]
+                # Clip generator gradients
+                torch.nn.utils.clip_grad_norm_(self.generator.parameters(), max_norm=max_norm)
+                # Clip OCR gradients if unfrozen (has requires_grad)
+                if not stage_config.freeze_ocr:
+                    torch.nn.utils.clip_grad_norm_(self.ocr.parameters(), max_norm=max_norm)
 
             self.optimizer.step()
 
@@ -529,11 +552,13 @@ class ProgressiveTrainer:
         avg_loss = total_loss / len(self.train_loader)
         avg_l1 = total_l1 / len(self.train_loader)
         avg_lcofl = total_lcofl / len(self.train_loader) if "lcofl" in stage_config.loss_components else 0
+        avg_ocr = total_ocr / len(self.train_loader) if "ocr" in stage_config.loss_components else 0
 
         return {
             "loss": avg_loss,
             "l1": avg_l1,
             "lcofl": avg_lcofl,
+            "ocr": avg_ocr,
             "pred_texts": pred_texts_all,
             "gt_texts": gt_texts_all,
         }
@@ -1582,6 +1607,7 @@ class ProgressiveTrainer:
                             "loss": train_metrics['loss'],
                             "l1": train_metrics.get('l1', 0.0),
                             "lcofl": train_metrics.get('lcofl', 0.0),
+                            "ocr": train_metrics.get('ocr', 0.0),
                         },
                         val_metrics={
                             "psnr": val_metrics['psnr'],

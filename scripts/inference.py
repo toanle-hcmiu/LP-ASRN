@@ -346,7 +346,7 @@ def discover_tracks(data_root: str):
     return tracks
 
 
-def load_and_preprocess(image_path: Path, lr_size=None, normalize=True, preserve_aspect=False):
+def load_and_preprocess(image_path: Path, lr_size=None, normalize=True, preserve_aspect=False, test_aspect_range=(0.25, 0.45)):
     """
     Load a single image and convert to tensor.
 
@@ -354,22 +354,32 @@ def load_and_preprocess(image_path: Path, lr_size=None, normalize=True, preserve
         image_path: Path to image file
         lr_size: Optional (H, W) to resize to
         normalize: If True, normalize to [-1, 1]
-        preserve_aspect: If True, pad to target aspect ratio BEFORE resizing.
-                         This avoids distorting characters when test images have
-                         different aspect ratios than training data.
+        preserve_aspect: If True, pad to match training aspect ratio distribution BEFORE resizing.
+                         This matches the training preprocessing where images are padded to
+                         random ratios from test_aspect_range (default 0.25-0.45).
+        test_aspect_range: (min_ratio, max_ratio) for aspect ratio augmentation during inference.
+                          Should match the training config's test_aspect_range.
 
     Returns:
         Tensor of shape (3, H, W)
     """
+    import numpy as np
+    import random
+
     img = Image.open(image_path).convert("RGB")
 
     if lr_size is not None:
         target_h, target_w = lr_size
-        target_ratio = target_h / target_w  # e.g. 34/62 = 0.548
 
         if preserve_aspect:
-            # Pad image to match target aspect ratio before resizing
-            # This preserves character shapes without distortion
+            # CRITICAL: Use training distribution, NOT target image ratio
+            # Training pads to random ratios from test_aspect_range (e.g., 0.25-0.45)
+            # We sample a fixed ratio for consistency, but from the TRAINING distribution
+            # Use middle of range for stability (0.35 for [0.25, 0.45])
+            min_ratio, max_ratio = test_aspect_range
+            target_ratio = (min_ratio + max_ratio) / 2  # Use midpoint
+
+            # Pad image to match training aspect ratio before resizing
             orig_w, orig_h = img.size
             orig_ratio = orig_h / orig_w
 
@@ -378,9 +388,8 @@ def load_and_preprocess(image_path: Path, lr_size=None, normalize=True, preserve
                 new_h = int(orig_w * target_ratio)
                 pad_top = (new_h - orig_h) // 2
                 pad_bottom = new_h - orig_h - pad_top
-                import numpy as np
                 img_arr = np.array(img)
-                # Pad with edge pixels (better than black for plates)
+                # Pad with edge pixels (matches training preprocessing)
                 img_arr = np.pad(img_arr,
                                  ((pad_top, pad_bottom), (0, 0), (0, 0)),
                                  mode='edge')
@@ -390,7 +399,6 @@ def load_and_preprocess(image_path: Path, lr_size=None, normalize=True, preserve
                 new_w = int(orig_h / target_ratio)
                 pad_left = (new_w - orig_w) // 2
                 pad_right = new_w - orig_w - pad_left
-                import numpy as np
                 img_arr = np.array(img)
                 img_arr = np.pad(img_arr,
                                  ((0, 0), (pad_left, pad_right), (0, 0)),
@@ -776,6 +784,9 @@ def run_diagnose(args):
     data_config = config.get("data", {})
     config_lr_size = tuple(data_config.get("lr_size", [34, 62]))
 
+    # Get test_aspect_range from config (for preserve_aspect mode)
+    test_aspect_range = tuple(data_config.get("test_aspect_range", [0.25, 0.45]))
+
     tracks = discover_tracks(args.data_root)
     if not tracks:
         print("No tracks found!")
@@ -920,7 +931,7 @@ def run_diagnose(args):
     print("  Running Strategy F: aspect-preserving resize + SR...")
     strat_f = {}
     for track_id, image_paths in test_tracks:
-        tensors = [load_and_preprocess(p, lr_size=config_lr_size, preserve_aspect=True) for p in image_paths]
+        tensors = [load_and_preprocess(p, lr_size=config_lr_size, preserve_aspect=True, test_aspect_range=test_aspect_range) for p in image_paths]
         batch = torch.stack(tensors).to(device)
         if generator is not None:
             sr = generator(batch)
@@ -1063,6 +1074,10 @@ def run_inference(args):
     # Data config
     data_config = config.get("data", {})
 
+    # Get test_aspect_range from config (for preserve_aspect mode)
+    # This should match the training distribution
+    test_aspect_range = tuple(data_config.get("test_aspect_range", [0.25, 0.45]))
+
     # Determine resize behavior
     if args.lr_size is not None:
         lr_size = tuple(args.lr_size)
@@ -1113,6 +1128,7 @@ def run_inference(args):
                 tensor = load_and_preprocess(
                     img_path, lr_size=lr_size, normalize=True,
                     preserve_aspect=args.preserve_aspect,
+                    test_aspect_range=test_aspect_range,
                 )
                 batch_tensors.append(tensor)
 
