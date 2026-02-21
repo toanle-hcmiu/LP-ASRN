@@ -593,18 +593,22 @@ class ProgressiveTrainer:
 
             # Additional losses: Gradient, Frequency, Edge
             # These help with edge sharpness and high-frequency detail
+            # Compute on subset of batch for efficiency (every iteration)
+            subset_size = min(8, sr_images.size(0))  # Use only 8 samples
+            sr_sub, hr_sub = sr_images[:subset_size], hr_images[:subset_size]
+
             if self.gradient_loss is not None:
-                grad_loss = self.gradient_loss(sr_images, hr_images)
+                grad_loss = self.gradient_loss(sr_sub, hr_sub)
                 loss = loss + self.lambda_gradient * grad_loss
                 total_gradient += grad_loss.item()
 
             if self.frequency_loss is not None:
-                freq_loss = self.frequency_loss(sr_images, hr_images)
+                freq_loss = self.frequency_loss(sr_sub, hr_sub)
                 loss = loss + self.lambda_frequency * freq_loss
                 total_frequency += freq_loss.item()
 
             if self.edge_loss is not None:
-                edge_loss = self.edge_loss(sr_images, hr_images)
+                edge_loss = self.edge_loss(sr_sub, hr_sub)
                 loss = loss + self.lambda_edge * edge_loss
                 total_edge += edge_loss.item()
 
