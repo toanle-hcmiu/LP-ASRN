@@ -166,9 +166,9 @@ class ProgressiveTrainer:
                 name="finetune",
                 epochs=self.progressive_config.get("stage3", {}).get("epochs", 20),
                 lr=self.progressive_config.get("stage3", {}).get("lr", 1e-5),
-                loss_components=["l1", "lcofl"],
-                freeze_ocr=False,
-                update_confusion=True,
+                loss_components=self.progressive_config.get("stage3", {}).get("loss_components", ["l1", "lcofl", "ocr"]),
+                freeze_ocr=self.progressive_config.get("stage3", {}).get("freeze_ocr", False),
+                update_confusion=self.progressive_config.get("stage3", {}).get("update_confusion", True),
                 aspect_ratio_range=tuple(self.progressive_config.get("stage3", {}).get("aspect_ratio_range", [0.25, 0.45])),
             ),
             TrainingStage.HARD_MINING: StageConfig(
