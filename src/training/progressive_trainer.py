@@ -27,7 +27,14 @@ from tqdm import tqdm
 from src.models.generator import Generator
 from src.ocr.ocr_model import OCRModel
 from src.losses.lcofl import LCOFL
-from src.losses.basic import L1Loss, PerceptualLoss
+from src.losses.basic import (
+    L1Loss,
+    PerceptualLoss,
+    GradientLoss,
+    FrequencyLoss,
+    EdgeLoss,
+)
+from src.losses.gan_loss import Discriminator, GANLoss, FeatureMatchingLoss
 from src.ocr.confusion_tracker import ConfusionTracker, MetricsTracker
 from src.utils.logger import TensorBoardLogger
 from src.utils.visualizer import create_comparison_grid
@@ -133,6 +140,53 @@ class ProgressiveTrainer:
             self.perceptual_loss = PerceptualLoss().to(device)
         else:
             self.perceptual_loss = None
+
+        # Additional losses for edge sharpness and detail
+        self.lambda_gradient = config.get("loss", {}).get("lambda_gradient", 0.0)
+        if self.lambda_gradient > 0:
+            self.gradient_loss = GradientLoss().to(device)
+        else:
+            self.gradient_loss = None
+
+        self.lambda_frequency = config.get("loss", {}).get("lambda_frequency", 0.0)
+        if self.lambda_frequency > 0:
+            self.frequency_loss = FrequencyLoss().to(device)
+        else:
+            self.frequency_loss = None
+
+        self.lambda_edge = config.get("loss", {}).get("lambda_edge", 0.0)
+        if self.lambda_edge > 0:
+            self.edge_loss = EdgeLoss().to(device)
+        else:
+            self.edge_loss = None
+
+        # GAN losses (optional, enabled via config)
+        self.gan_enabled = config.get("loss", {}).get("gan_enabled", False)
+        self.lambda_gan = config.get("loss", {}).get("lambda_gan", 0.01)
+        self.lambda_feature_matching = config.get("loss", {}).get("lambda_feature_matching", 0.0)
+
+        if self.gan_enabled:
+            # Create discriminator
+            num_filters = config.get("loss", {}).get("disc_num_filters", 64)
+            num_layers = config.get("loss", {}).get("disc_num_layers", 3)
+            self.discriminator = Discriminator(
+                in_channels=3,
+                num_filters=num_filters,
+                num_layers=num_layers,
+            ).to(device)
+            self.gan_loss = GANLoss()
+
+            if self.lambda_feature_matching > 0:
+                self.feature_matching_loss = FeatureMatchingLoss(self.discriminator)
+            else:
+                self.feature_matching_loss = None
+
+            # Separate optimizer for discriminator
+            self.disc_optimizer = None  # Will be created when needed
+        else:
+            self.discriminator = None
+            self.gan_loss = None
+            self.feature_matching_loss = None
 
         # Stage configurations
         self.stage_configs = {
@@ -432,6 +486,9 @@ class ProgressiveTrainer:
         total_l1 = 0.0
         total_lcofl = 0.0
         total_ocr = 0.0
+        total_gradient = 0.0
+        total_frequency = 0.0
+        total_edge = 0.0
 
         pred_texts_all = []
         gt_texts_all = []
@@ -534,6 +591,23 @@ class ProgressiveTrainer:
                 pred_texts_all.extend(pred_texts)
                 gt_texts_all.extend(gt_texts)
 
+            # Additional losses: Gradient, Frequency, Edge
+            # These help with edge sharpness and high-frequency detail
+            if self.gradient_loss is not None:
+                grad_loss = self.gradient_loss(sr_images, hr_images)
+                loss = loss + self.lambda_gradient * grad_loss
+                total_gradient += grad_loss.item()
+
+            if self.frequency_loss is not None:
+                freq_loss = self.frequency_loss(sr_images, hr_images)
+                loss = loss + self.lambda_frequency * freq_loss
+                total_frequency += freq_loss.item()
+
+            if self.edge_loss is not None:
+                edge_loss = self.edge_loss(sr_images, hr_images)
+                loss = loss + self.lambda_edge * edge_loss
+                total_edge += edge_loss.item()
+
             total_loss += loss.item()
             total_l1 += l1.item()
 
@@ -569,12 +643,18 @@ class ProgressiveTrainer:
         avg_l1 = total_l1 / len(self.train_loader)
         avg_lcofl = total_lcofl / len(self.train_loader) if "lcofl" in stage_config.loss_components else 0
         avg_ocr = total_ocr / len(self.train_loader) if "ocr" in stage_config.loss_components else 0
+        avg_gradient = total_gradient / len(self.train_loader) if self.gradient_loss is not None else 0
+        avg_frequency = total_frequency / len(self.train_loader) if self.frequency_loss is not None else 0
+        avg_edge = total_edge / len(self.train_loader) if self.edge_loss is not None else 0
 
         return {
             "loss": avg_loss,
             "l1": avg_l1,
             "lcofl": avg_lcofl,
             "ocr": avg_ocr,
+            "gradient": avg_gradient,
+            "frequency": avg_frequency,
+            "edge": avg_edge,
             "pred_texts": pred_texts_all,
             "gt_texts": gt_texts_all,
         }
@@ -1624,6 +1704,9 @@ class ProgressiveTrainer:
                             "l1": train_metrics.get('l1', 0.0),
                             "lcofl": train_metrics.get('lcofl', 0.0),
                             "ocr": train_metrics.get('ocr', 0.0),
+                            "gradient": train_metrics.get('gradient', 0.0),
+                            "frequency": train_metrics.get('frequency', 0.0),
+                            "edge": train_metrics.get('edge', 0.0),
                         },
                         val_metrics={
                             "psnr": val_metrics['psnr'],

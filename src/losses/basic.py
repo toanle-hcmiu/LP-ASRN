@@ -307,6 +307,210 @@ class CharbonnierLoss(nn.Module):
         return torch.sqrt(diff**2 + self.eps**2).mean()
 
 
+class GradientLoss(nn.Module):
+    """
+    Gradient Loss (1st and 2nd order image gradients).
+
+    Encforces similarity of image gradients between pred and target.
+    This promotes sharp edges and better local structure.
+
+    L = |∇pred - ∇target| + |∇²pred - ∇²target|
+    """
+
+    def __init__(self, alpha: float = 1.0, beta: float = 1.0):
+        """
+        Initialize Gradient Loss.
+
+        Args:
+            alpha: Weight for 1st order gradients
+            beta: Weight for 2nd order gradients
+        """
+        super().__init__()
+        self.alpha = alpha
+        self.beta = beta
+
+    def _gradient(self, x: torch.Tensor) -> tuple:
+        """Compute 1st order gradients (dx, dy)."""
+        # Horizontal gradient: difference between adjacent columns
+        grad_x = x[..., :, 1:] - x[..., :, :-1]
+        # Vertical gradient: difference between adjacent rows
+        grad_y = x[..., 1:, :] - x[..., :-1, :]
+        return grad_x, grad_y
+
+    def _laplacian(self, x: torch.Tensor) -> torch.Tensor:
+        """Compute 2nd order gradients (Laplacian)."""
+        # Laplacian = d²x/dx² + d²x/dy²
+        # Using discrete approximation
+        laplacian = (
+            x[..., :, 2:] - 2 * x[..., :, 1:-1] + x[..., :, :-2] +  # d²/dx²
+            x[..., 2:, :] - 2 * x[..., 1:-1, :] + x[..., :-2, :]  # d²/dy²
+        )
+        return laplacian
+
+    def forward(
+        self, pred: torch.Tensor, target: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Compute Gradient loss.
+
+        Args:
+            pred: Predicted image (B, C, H, W)
+            target: Target image (B, C, H, W)
+
+        Returns:
+            Gradient loss scalar
+        """
+        # 1st order gradient loss
+        pred_grad_x, pred_grad_y = self._gradient(pred)
+        target_grad_x, target_grad_y = self._gradient(target)
+
+        grad_loss = (
+            F.l1_loss(pred_grad_x, target_grad_x) +
+            F.l1_loss(pred_grad_y, target_grad_y)
+        )
+
+        # 2nd order gradient loss
+        pred_lap = self._laplacian(pred)
+        target_lap = self._laplacian(target)
+        lap_loss = F.l1_loss(pred_lap, target_lap)
+
+        return self.alpha * grad_loss + self.beta * lap_loss
+
+
+class FrequencyLoss(nn.Module):
+    """
+    Frequency Domain Loss (FFT-based).
+
+    Compares images in the frequency domain using FFT.
+    This ensures better reconstruction of high-frequency details
+    like edges and textures.
+
+    L = |FFT(pred) - FFT(target)|
+    """
+
+    def __init__(self, log_freq: bool = True, weight_high_freq: float = 2.0):
+        """
+        Initialize Frequency Loss.
+
+        Args:
+            log_freq: Use log frequency for weighting (emphasizes high freq)
+            weight_high_freq: Additional weight for high frequencies
+        """
+        super().__init__()
+        self.log_freq = log_freq
+        self.weight_high_freq = weight_high_freq
+
+    def forward(
+        self, pred: torch.Tensor, target: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Compute Frequency loss.
+
+        Args:
+            pred: Predicted image (B, C, H, W)
+            target: Target image (B, C, H, W)
+
+        Returns:
+            Frequency loss scalar
+        """
+        # Convert from [-1, 1] to [0, 1] if needed
+        if pred.min() < 0:
+            pred = (pred + 1.0) / 2.0
+            target = (target + 1.0) / 2.0
+
+        # Compute FFT
+        pred_fft = torch.fft.rfft2(pred, norm='ortho')
+        target_fft = torch.fft.rfft2(target, norm='ortho')
+
+        # Compute loss in frequency domain
+        loss = F.l1_loss(pred_fft.real, target_fft.real) + \
+               F.l1_loss(pred_fft.imag, target_fft.imag)
+
+        if self.weight_high_freq > 1.0:
+            # Create high frequency mask (upper frequencies)
+            B, C, H, W_fft = pred_fft.shape
+            mask = torch.zeros_like(pred_fft.real)
+
+            # Weight higher frequencies more
+            for i in range(W_fft):
+                freq_weight = 1.0 + (self.weight_high_freq - 1.0) * (i / W_fft)
+                mask[..., i] = freq_weight
+
+            weighted_loss = F.l1_loss(
+                pred_fft.real * mask, target_fft.real * mask
+            ) + F.l1_loss(
+                pred_fft.imag * mask, target_fft.imag * mask
+            )
+            loss = weighted_loss
+
+        return loss
+
+
+class EdgeLoss(nn.Module):
+    """
+    Edge Loss using Sobel filters.
+
+    Specifically targets edge preservation by comparing
+    detected edges between pred and target.
+
+    L = |Sobel(pred) - Sobel(target)|
+    """
+
+    def __init__(self):
+        """Initialize Edge Loss."""
+        super().__init__()
+
+        # Sobel kernels
+        sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32)
+        sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32)
+
+        # Reshape to (1, 1, 3, 3) for conv2d
+        sobel_x = sobel_x.view(1, 1, 3, 3)
+        sobel_y = sobel_y.view(1, 1, 3, 3)
+
+        # Register as buffers (not trainable)
+        self.register_buffer('sobel_x', sobel_x)
+        self.register_buffer('sobel_y', sobel_y)
+
+    def _sobel(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply Sobel filter and return edge magnitude."""
+        # Apply to each channel separately
+        B, C, H, W = x.shape
+
+        # Reshape for grouped convolution (apply sobel to each channel independently)
+        sobel_x = self.sobel_x.repeat(C, 1, 1, 1)  # (C, 1, 3, 3)
+        sobel_y = self.sobel_y.repeat(C, 1, 1, 1)
+
+        # Apply padding
+        x_pad = F.pad(x, (1, 1, 1, 1), mode='reflect')
+
+        # Apply Sobel filters
+        grad_x = F.conv2d(x_pad, sobel_x, groups=C)
+        grad_y = F.conv2d(x_pad, sobel_y, groups=C)
+
+        # Edge magnitude
+        edge = torch.sqrt(grad_x**2 + grad_y**2 + 1e-6)
+        return edge
+
+    def forward(
+        self, pred: torch.Tensor, target: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Compute Edge loss.
+
+        Args:
+            pred: Predicted image (B, C, H, W)
+            target: Target image (B, C, H, W)
+
+        Returns:
+            Edge loss scalar
+        """
+        pred_edges = self._sobel(pred)
+        target_edges = self._sobel(target)
+
+        return F.l1_loss(pred_edges, target_edges)
+
+
 if __name__ == "__main__":
     # Test losses
     print("Testing basic losses...")

@@ -50,6 +50,11 @@ loss:
   lambda_layout: 0.5
   lambda_ssim: 0.2
   lambda_perceptual: 0.1
+  lambda_gradient: 0.05
+  lambda_frequency: 0.05
+  lambda_edge: 0.05
+  lambda_gan: 0.01
+  lambda_feature_matching: 0.1
   lambda_embed: 0.0
   embed_target_weight: 0.0
   embed_warmup_epochs: 50
@@ -58,6 +63,13 @@ loss:
   use_lightweight_embedder: false
   alpha: 0.1
   beta: 1.0
+  # GAN settings
+  gan_enabled: false
+  gan_type: hinge  # hinge or relativistic
+  disc_num_filters: 64
+  disc_num_layers: 3
+  disc_update_interval: 1
+  disc_start_epoch: 0
 ocr:
   model_type: parseq
   pretrained_path: baudm/parseq-base
@@ -109,8 +121,10 @@ progressive_training:
     loss_components:
     - l1
     - lcofl
-    - ocr
-    freeze_ocr: false
+    - gradient
+    - frequency
+    - edge
+    freeze_ocr: true
     update_confusion: true
     aspect_ratio_range:
     - 0.2
