@@ -51,7 +51,7 @@ loss:
   lambda_ssim: 0.2
   lambda_perceptual: 0.1
   lambda_gradient: 0.05
-  lambda_frequency: 0.05
+  lambda_frequency: 0.0  # Disabled - FFT is too slow (~3-5x slower)
   lambda_edge: 0.05
   lambda_gan: 0.01
   lambda_feature_matching: 0.1
