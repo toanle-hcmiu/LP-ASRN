@@ -227,11 +227,26 @@ def load_models(args, config, device):
             upscale_factor = detected.get("upscale_factor", model_config.get("upscale_factor", 2))
             use_char_attn = detected.get("use_character_attention", model_config.get("use_character_attention", False))
 
-            print(f"  Creating RRDB generator (legacy): features={num_features}, blocks={num_blocks}, "
-                  f"upscale={upscale_factor}, char_attn={use_char_attn}")
+            # Get additional parameters from detection
+            use_enhanced_attn = detected.get("use_enhanced_attention", True)
+            use_deformable = detected.get("use_deformable", True)
+            use_pyramid = detected.get("use_pyramid_attention", False)
 
-            print("  ⚠ WARNING: Loading legacy RRDB checkpoint. Consider retraining with SwinIR.")
-            generator = None  # RRDB is no longer supported
+            print(f"  Creating RRDB Generator: features={num_features}, blocks={num_blocks}, "
+                  f"upscale={upscale_factor}, enhanced_attn={use_enhanced_attn}, deformable={use_deformable}")
+
+            from src.models.generator import Generator
+            generator = Generator(
+                in_channels=3,
+                out_channels=3,
+                num_features=num_features,
+                num_blocks=num_blocks,
+                num_layers_per_block=3,
+                upscale_factor=upscale_factor,
+                use_enhanced_attention=use_enhanced_attn,
+                use_deformable=use_deformable,
+                use_character_attention=use_char_attn,
+            )
 
         # Load with strict=True to catch any mismatch
         try:
