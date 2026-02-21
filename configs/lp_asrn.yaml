@@ -46,7 +46,7 @@ training:
   save_dir: outputs/run_%Y%m%d_%H%M%S
 loss:
   lambda_lcofl: 1.0
-  lambda_ocr: 0.5
+  lambda_ocr: 0.1
   lambda_layout: 0.5
   lambda_ssim: 0.2
   lambda_perceptual: 0.1
