@@ -39,20 +39,20 @@ training:
   beta2: 0.999
   gradient_clip: 1.0
   lr_scheduler: StepLR
-  lr_step_size: 10
-  lr_gamma: 0.95
+  lr_step_size: 20  # Increased from 10 for slower decay
+  lr_gamma: 0.98  # Increased from 0.95 for gentler decay
   early_stop_patience: 30
   monitor_metric: recognition_rate
   save_dir: outputs/run_%Y%m%d_%H%M%S
 loss:
-  lambda_lcofl: 1.0
+  lambda_lcofl: 1.5  # Increased for better character accuracy
   lambda_ocr: 0.1
   lambda_layout: 0.5
   lambda_ssim: 0.2
   lambda_perceptual: 0.1
-  lambda_gradient: 0.05
-  lambda_frequency: 0.0  # Disabled - FFT is too slow (~3-5x slower)
-  lambda_edge: 0.05
+  lambda_gradient: 0.0  # Too slow
+  lambda_frequency: 0.0  # Too slow
+  lambda_edge: 0.0  # Too slow
   lambda_gan: 0.01
   lambda_feature_matching: 0.1
   lambda_embed: 0.0
@@ -116,14 +116,12 @@ progressive_training:
     - 0.55
   stage3:
     name: finetune
-    epochs: 100
+    epochs: 200  # Increased from 100 for better convergence
     lr: 1.0e-05
     loss_components:
     - l1
     - lcofl
-    - gradient
-    - frequency
-    - edge
+    - ssim
     freeze_ocr: true
     update_confusion: true
     aspect_ratio_range:
