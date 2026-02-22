@@ -128,8 +128,8 @@ progressive_training:
     freeze_ocr: true
     update_confusion: true
     aspect_ratio_range:
-    - 0.2
-    - 0.5
+    - 0.3
+    - 0.6  # Wider range to match test data (~0.37)
   stage4:
     name: hard_mining
     epochs: 50
