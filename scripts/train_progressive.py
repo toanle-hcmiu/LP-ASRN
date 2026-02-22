@@ -326,6 +326,8 @@ def train_ddp(rank, world_size, args, config):
         ocr_pretrain_mode=config["data"].get("ocr_pretrain_augmentation", False),
         aspect_ratio_augment=config["data"].get("aspect_ratio_augment", False),
         test_aspect_range=tuple(config["data"].get("test_aspect_range", [0.29, 0.40])),
+        test_resolution_augment=config["data"].get("test_resolution_augment", False),
+        test_resolution_prob=config["data"].get("test_resolution_prob", 0.5),
     )
 
     if is_main:

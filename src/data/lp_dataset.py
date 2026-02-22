@@ -60,6 +60,8 @@ class LicensePlateDataset(Dataset):
         ocr_pretrain_mode: bool = False,
         aspect_ratio_augment: bool = False,
         test_aspect_range: Tuple[float, float] = (0.29, 0.40),
+        test_resolution_augment: bool = False,
+        test_resolution_prob: float = 0.5,
     ):
         """
         Initialize the dataset.
@@ -80,6 +82,9 @@ class LicensePlateDataset(Dataset):
             test_aspect_range: (min_ratio, max_ratio) of test image aspect ratios (H/W).
                 Used to sample random target ratios during augmentation.
                 Default (0.29, 0.40) matches observed test-public distribution.
+            test_resolution_augment: If True, randomly downsample LR images to match
+                test-time resolution (test images are ~17x49 vs training ~30x87).
+            test_resolution_prob: Probability (0-1) of applying test-resolution augmentation.
         """
         self.root_dir = Path(root_dir)
         self.scenarios = scenarios or ["Scenario-A", "Scenario-B"]
@@ -91,6 +96,8 @@ class LicensePlateDataset(Dataset):
         self.ocr_pretrain_mode = ocr_pretrain_mode
         self.aspect_ratio_augment = aspect_ratio_augment
         self.test_aspect_range = test_aspect_range
+        self.test_resolution_augment = test_resolution_augment
+        self.test_resolution_prob = test_resolution_prob
 
         # Load all samples
         self.samples = self._load_samples()
@@ -424,6 +431,40 @@ class LicensePlateDataset(Dataset):
 
         return Image.fromarray(img_arr)
 
+    def _apply_test_resolution(self, lr_image: Image.Image) -> Image.Image:
+        """
+        Randomly downsample LR image to simulate test-time resolution.
+
+        Test images are significantly smaller (avg 17x49) than training images
+        (avg 30x87). This augmentation downsamples training LR images to test
+        resolution so the model learns to handle low-resolution inputs.
+
+        Args:
+            lr_image: PIL LR image (after cropping, before aspect ratio augment)
+
+        Returns:
+            Downsampled PIL image or original (based on probability)
+        """
+        if not self.test_resolution_augment or not self.augment:
+            return lr_image
+
+        if random.random() > self.test_resolution_prob:
+            return lr_image  # Skip this augmentation
+
+        # Sample from test distribution (from analyze_data_mismatch.py results)
+        # Test: height=17.9±1.6, width=49.1±4.8
+        target_h = int(random.gauss(17.9, 1.6))
+        target_w = int(random.gauss(49.1, 4.8))
+        target_h = max(12, min(25, target_h))  # Clamp to reasonable range
+        target_w = max(35, min(65, target_w))
+
+        # Downsample LR image (simulates low-res source like test images)
+        try:
+            return lr_image.resize((target_w, target_h), Image.Resampling.BICUBIC)
+        except AttributeError:
+            # For older Pillow versions
+            return lr_image.resize((target_w, target_h), Image.BICUBIC)
+
     def _resize_image(
         self,
         image: Image.Image,
@@ -520,6 +561,13 @@ class LicensePlateDataset(Dataset):
         lr_image = self._crop_with_corners(lr_image, sample["lr_corners"])
         hr_image = self._crop_with_corners(hr_image, sample["hr_corners"])
 
+        # Test-resolution augmentation: downsample LR to match test distribution
+        # Applied BEFORE aspect ratio augmentation so both work correctly
+        # Only applied to LR (HR stays high-res as the target)
+        if self.augment and self.test_resolution_augment:
+            lr_image = self._apply_test_resolution(lr_image)
+            # HR is not downsampled - it's the high-quality target
+
         # Aspect ratio augmentation: randomly pad to simulate test-time aspect ratios
         # Applied BEFORE resize so the generator learns to handle varied ratios
         # Must use same padding for both LR and HR to keep them aligned
@@ -614,6 +662,8 @@ def create_dataloaders(
     ocr_pretrain_mode: bool = False,
     aspect_ratio_augment: bool = False,
     test_aspect_range: Tuple[float, float] = (0.29, 0.40),
+    test_resolution_augment: bool = False,
+    test_resolution_prob: float = 0.5,
 ) -> Tuple[DataLoader, DataLoader, Optional["DistributedSampler"]]:
     """
     Create train and validation dataloaders.
@@ -633,6 +683,8 @@ def create_dataloaders(
         ocr_pretrain_mode: If True, use OCR-specific augmentation for pretraining
         aspect_ratio_augment: If True, randomly vary aspect ratio to match test distribution
         test_aspect_range: (min_ratio, max_ratio) of test image H/W ratios
+        test_resolution_augment: If True, randomly downsample LR to match test resolution
+        test_resolution_prob: Probability (0-1) of applying test-resolution augmentation
 
     Returns:
         Tuple of (train_dataloader, val_dataloader, train_sampler)
@@ -648,6 +700,8 @@ def create_dataloaders(
         ocr_pretrain_mode=ocr_pretrain_mode,
         aspect_ratio_augment=aspect_ratio_augment,
         test_aspect_range=test_aspect_range,
+        test_resolution_augment=test_resolution_augment,
+        test_resolution_prob=test_resolution_prob,
     )
 
     # Split into train and validation
@@ -716,6 +770,8 @@ def create_dataloaders(
             val_loader = None
     else:
         # Single GPU training
+        # When num_workers=0, timeout must be 0 (no workers to timeout)
+        loader_timeout = 0 if num_workers == 0 else 300
         train_loader = DataLoader(
             train_dataset,
             batch_size=batch_size,
@@ -723,8 +779,8 @@ def create_dataloaders(
             num_workers=num_workers,
             pin_memory=True,
             drop_last=True,
-            timeout=300,  # 5 minute timeout for worker response
-            persistent_workers=False,  # Recreate workers each epoch for stability
+            timeout=loader_timeout,
+            persistent_workers=num_workers > 0,  # Only use persistent workers when num_workers > 0
         )
 
         val_loader = DataLoader(
@@ -734,8 +790,8 @@ def create_dataloaders(
             num_workers=num_workers,
             pin_memory=True,
             drop_last=False,
-            timeout=300,  # 5 minute timeout for worker response
-            persistent_workers=False,  # Recreate workers each epoch for stability
+            timeout=loader_timeout,
+            persistent_workers=num_workers > 0,
         )
 
     if distributed:
