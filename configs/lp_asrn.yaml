@@ -34,6 +34,14 @@ data:
   # Test images are ~17x49 (3.7x smaller) than training images (~30x87)
   test_resolution_augment: true
   test_resolution_prob: 0.7  # 70% of training data uses test-size inputs
+  # JPEG compression augmentation (test images are JPGs, training are PNGs)
+  jpeg_augment: true
+  jpeg_quality_range:
+  - 60
+  - 95
+  # No-crop probability: skip corner cropping to simulate test conditions
+  # (test images have no corner annotations — plate boundaries unknown)
+  no_crop_prob: 0.3
 training:
   epochs: 100
   lr: 0.0001
@@ -48,6 +56,10 @@ training:
   early_stop_patience: 30
   monitor_metric: recognition_rate
   save_dir: outputs/run_%Y%m%d_%H%M%S
+  # Test-like validation: simulate test conditions during training
+  # Provides realistic accuracy estimate vs misleading training-distribution val
+  test_like_val: true
+  test_like_val_fraction: 0.1  # Use 10% of val set for test-like evaluation
 loss:
   lambda_lcofl: 1.5  # Increased for better character accuracy
   lambda_ocr: 0.1
@@ -132,8 +144,8 @@ progressive_training:
     freeze_ocr: true
     update_confusion: true
     aspect_ratio_range:
-    - 0.3
-    - 0.6  # Wider range to match test data (~0.37)
+    - 0.25
+    - 0.45  # Narrowed to match actual test distribution (0.29-0.40)
   stage4:
     name: hard_mining
     epochs: 50

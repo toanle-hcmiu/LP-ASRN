@@ -60,6 +60,10 @@ def parse_args():
                         help="Override LR size (default: from config or no resize)")
     parser.add_argument("--preserve-aspect", action="store_true",
                         help="Pad images to match target aspect ratio before resizing (avoids distortion)")
+    parser.add_argument("--multi-scale", action="store_true",
+                        help="Multi-scale inference: fuse logits from 3 scales for robustness")
+    parser.add_argument("--jpeg-deblock", action="store_true",
+                        help="Apply mild Gaussian deblocking to test JPEGs before SR")
     parser.add_argument("--diagnose", action="store_true",
                         help="Run diagnostic mode: compare strategies, print samples, check pipeline")
     parser.add_argument("--diagnose-val", type=str, default=None,
@@ -346,7 +350,7 @@ def discover_tracks(data_root: str):
     return tracks
 
 
-def load_and_preprocess(image_path: Path, lr_size=None, normalize=True, preserve_aspect=False, test_aspect_range=(0.25, 0.45)):
+def load_and_preprocess(image_path: Path, lr_size=None, normalize=True, preserve_aspect=False, test_aspect_range=(0.25, 0.45), jpeg_deblock=False):
     """
     Load a single image and convert to tensor.
 
@@ -355,10 +359,11 @@ def load_and_preprocess(image_path: Path, lr_size=None, normalize=True, preserve
         lr_size: Optional (H, W) to resize to
         normalize: If True, normalize to [-1, 1]
         preserve_aspect: If True, pad to match training aspect ratio distribution BEFORE resizing.
-                         This matches the training preprocessing where images are padded to
-                         random ratios from test_aspect_range (default 0.25-0.45).
-        test_aspect_range: (min_ratio, max_ratio) for aspect ratio augmentation during inference.
+                         Uses smart padding: if native ratio is within test_aspect_range, no padding;
+                         if outside, pad minimally to bring to nearest edge of range.
+        test_aspect_range: (min_ratio, max_ratio) for aspect ratio during inference.
                           Should match the training config's test_aspect_range.
+        jpeg_deblock: If True, apply mild Gaussian deblocking to reduce JPEG artifacts
 
     Returns:
         Tensor of shape (3, H, W)
@@ -368,34 +373,37 @@ def load_and_preprocess(image_path: Path, lr_size=None, normalize=True, preserve
 
     img = Image.open(image_path).convert("RGB")
 
+    # Optional JPEG deblocking: mild Gaussian filter to reduce block artifacts
+    if jpeg_deblock:
+        from PIL import ImageFilter
+        img = img.filter(ImageFilter.GaussianBlur(radius=0.5))
+
     if lr_size is not None:
         target_h, target_w = lr_size
 
         if preserve_aspect:
-            # CRITICAL: Use training distribution, NOT target image ratio
-            # Training pads to random ratios from test_aspect_range (e.g., 0.25-0.45)
-            # We sample a fixed ratio for consistency, but from the TRAINING distribution
-            # Use middle of range for stability (0.35 for [0.25, 0.45])
             min_ratio, max_ratio = test_aspect_range
-            target_ratio = (min_ratio + max_ratio) / 2  # Use midpoint
 
             # Pad image to match training aspect ratio before resizing
             orig_w, orig_h = img.size
             orig_ratio = orig_h / orig_w
 
-            if orig_ratio < target_ratio:
-                # Image is too wide — pad height
+            # Smart padding: only pad if native ratio is OUTSIDE the test range
+            # If already within range, the model has seen this ratio during training
+            if orig_ratio < min_ratio:
+                # Image is too wide — pad height to reach min_ratio
+                target_ratio = min_ratio
                 new_h = int(orig_w * target_ratio)
                 pad_top = (new_h - orig_h) // 2
                 pad_bottom = new_h - orig_h - pad_top
                 img_arr = np.array(img)
-                # Pad with edge pixels (matches training preprocessing)
                 img_arr = np.pad(img_arr,
                                  ((pad_top, pad_bottom), (0, 0), (0, 0)),
                                  mode='edge')
                 img = Image.fromarray(img_arr)
-            elif orig_ratio > target_ratio:
-                # Image is too tall — pad width
+            elif orig_ratio > max_ratio:
+                # Image is too tall — pad width to reach max_ratio
+                target_ratio = max_ratio
                 new_w = int(orig_h / target_ratio)
                 pad_left = (new_w - orig_w) // 2
                 pad_right = new_w - orig_w - pad_left
@@ -404,6 +412,7 @@ def load_and_preprocess(image_path: Path, lr_size=None, normalize=True, preserve
                                  ((0, 0), (pad_left, pad_right), (0, 0)),
                                  mode='edge')
                 img = Image.fromarray(img_arr)
+            # else: ratio is within range — no padding needed
 
         # Now resize to exact target size
         try:
@@ -1056,6 +1065,61 @@ def run_diagnose(args):
     print(f"{'='*60}")
 
 
+def multi_scale_predict(generator, ocr, images, beam_width=5, scales=(0.8, 1.0, 1.2)):
+    """
+    Multi-scale inference: run at multiple scales and fuse logits.
+
+    For each scale, resize the input, run SR+OCR, then fuse logits
+    at the original resolution before final decoding. This robustifies
+    against the unknown optimal resize ratio for test images.
+
+    Args:
+        generator: SR generator (or None for OCR-only)
+        ocr: OCR model
+        images: (B, 3, H, W) input tensor at base lr_size
+        beam_width: Beam width for final decoding
+        scales: Tuple of scale factors relative to base size
+
+    Returns:
+        List of (text, confidence) tuples
+    """
+    all_logits = []
+    weights = []
+
+    B, C, H, W = images.shape
+
+    for scale in scales:
+        new_h = max(4, int(H * scale))
+        new_w = max(4, int(W * scale))
+        # Make dimensions even for PixelShuffle
+        new_h = new_h + (new_h % 2)
+        new_w = new_w + (new_w % 2)
+
+        if scale != 1.0:
+            scaled_images = F.interpolate(images, size=(new_h, new_w), mode='bilinear', align_corners=False)
+        else:
+            scaled_images = images
+
+        if generator is not None:
+            sr = generator(scaled_images)
+        else:
+            sr = scaled_images
+
+        logits = ocr(sr, return_logits=True)
+        all_logits.append(logits)
+
+        # Higher weight for the base scale (1.0)
+        weight = 1.0 if abs(scale - 1.0) < 0.01 else 0.7
+        weights.append(weight)
+
+    # Fuse logits (weighted average) — all should have same T, C dimensions
+    # since PARSeq internally resizes to 32x128 regardless of input size
+    total_weight = sum(weights)
+    fused_logits = sum(l * w for l, w in zip(all_logits, weights)) / total_weight
+
+    return predict_with_confidence(ocr, fused_logits, beam_width=beam_width)
+
+
 @torch.no_grad()
 def run_inference(args):
     """Main inference pipeline."""
@@ -1113,6 +1177,8 @@ def run_inference(args):
     print(f"  SR: {'enabled' if generator is not None else 'disabled (OCR-only)'}")
     print(f"  Beam width: {args.beam_width}")
     print(f"  TTA: {'enabled (7 augmentations, logit-level fusion)' if args.tta else 'disabled'}")
+    print(f"  Multi-scale: {'enabled (scales: 0.8, 1.0, 1.2)' if args.multi_scale else 'disabled'}")
+    print(f"  JPEG deblock: {'enabled' if args.jpeg_deblock else 'disabled'}")
     print(f"  LR size: {lr_size}")
 
     for track_id, image_paths in tqdm(tracks, desc="Processing tracks"):
@@ -1129,6 +1195,7 @@ def run_inference(args):
                     img_path, lr_size=lr_size, normalize=True,
                     preserve_aspect=args.preserve_aspect,
                     test_aspect_range=test_aspect_range,
+                    jpeg_deblock=args.jpeg_deblock,
                 )
                 batch_tensors.append(tensor)
 
@@ -1150,6 +1217,11 @@ def run_inference(args):
             if args.tta:
                 # TTA: logit-level fusion across augmented versions
                 preds_with_conf = tta_predict(
+                    generator, ocr, batch, beam_width=args.beam_width
+                )
+            elif args.multi_scale:
+                # Multi-scale: fuse predictions at 0.8x, 1.0x, 1.2x
+                preds_with_conf = multi_scale_predict(
                     generator, ocr, batch, beam_width=args.beam_width
                 )
             else:

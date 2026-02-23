@@ -31,6 +31,34 @@ class AddGaussianNoise:
         return torch.clamp(img + noise, 0, 1)
 
 
+class JPEGCompression:
+    """
+    Simulate JPEG compression artifacts.
+
+    Test images are JPGs (lossy) while training images are PNGs (lossless).
+    This augmentation bridges that format gap by randomly JPEG-compressing
+    images during training.
+    """
+
+    def __init__(self, quality_range: Tuple[int, int] = (60, 95)):
+        self.quality_range = quality_range
+
+    def __call__(self, img):
+        if not isinstance(img, Image.Image):
+            # Convert tensor to PIL for JPEG compression
+            if isinstance(img, torch.Tensor):
+                img = transforms.ToPILImage()(img)
+            else:
+                return img
+
+        import io
+        quality = random.randint(self.quality_range[0], self.quality_range[1])
+        buffer = io.BytesIO()
+        img.save(buffer, format='JPEG', quality=quality)
+        buffer.seek(0)
+        return Image.open(buffer).convert('RGB')
+
+
 class LicensePlateDataset(Dataset):
     """
     Dataset for license plate super-resolution.
@@ -62,6 +90,9 @@ class LicensePlateDataset(Dataset):
         test_aspect_range: Tuple[float, float] = (0.29, 0.40),
         test_resolution_augment: bool = False,
         test_resolution_prob: float = 0.5,
+        jpeg_augment: bool = False,
+        jpeg_quality_range: Tuple[int, int] = (60, 95),
+        no_crop_prob: float = 0.0,
     ):
         """
         Initialize the dataset.
@@ -85,6 +116,11 @@ class LicensePlateDataset(Dataset):
             test_resolution_augment: If True, randomly downsample LR images to match
                 test-time resolution (test images are ~17x49 vs training ~30x87).
             test_resolution_prob: Probability (0-1) of applying test-resolution augmentation.
+            jpeg_augment: If True, randomly apply JPEG compression to LR images to
+                simulate test-time JPG artifacts (training uses PNG, test uses JPG).
+            jpeg_quality_range: (min_quality, max_quality) for JPEG compression (1-100).
+            no_crop_prob: Probability (0-1) of skipping corner cropping for a sample.
+                Simulates test conditions where plate boundaries are unknown.
         """
         self.root_dir = Path(root_dir)
         self.scenarios = scenarios or ["Scenario-A", "Scenario-B"]
@@ -98,6 +134,9 @@ class LicensePlateDataset(Dataset):
         self.test_aspect_range = test_aspect_range
         self.test_resolution_augment = test_resolution_augment
         self.test_resolution_prob = test_resolution_prob
+        self.jpeg_augment = jpeg_augment
+        self.jpeg_quality_range = jpeg_quality_range
+        self.no_crop_prob = no_crop_prob
 
         # Load all samples
         self.samples = self._load_samples()
@@ -293,6 +332,11 @@ class LicensePlateDataset(Dataset):
                 transforms.RandomApply([
                     AddGaussianNoise(mean=0, std=0.015),
                 ], p=0.25),
+                # JPEG compression artifacts (50% chance)
+                # Test images are JPGs — simulate compression artifacts
+                transforms.RandomApply([
+                    JPEGCompression(quality_range=self.jpeg_quality_range),
+                ], p=0.5 if self.jpeg_augment else 0.0),
             ])
         else:
             # STRONG photometric degradation for better robustness
@@ -319,6 +363,11 @@ class LicensePlateDataset(Dataset):
                 transforms.RandomApply([
                     AddGaussianNoise(mean=0, std=0.02),
                 ], p=0.3),
+                # JPEG compression artifacts (50% chance)
+                # Test images are JPGs — simulate compression artifacts
+                transforms.RandomApply([
+                    JPEGCompression(quality_range=self.jpeg_quality_range),
+                ], p=0.5 if self.jpeg_augment else 0.0),
             ])
 
     def _load_image(self, path: str) -> Image.Image:
@@ -558,8 +607,12 @@ class LicensePlateDataset(Dataset):
         hr_image = self._load_image(sample["hr_path"])
 
         # Crop using corner coordinates
-        lr_image = self._crop_with_corners(lr_image, sample["lr_corners"])
-        hr_image = self._crop_with_corners(hr_image, sample["hr_corners"])
+        # With no_crop_prob, randomly skip cropping to simulate test conditions
+        # (test images have no corner annotations — plate boundaries unknown)
+        skip_crop = self.augment and self.no_crop_prob > 0 and random.random() < self.no_crop_prob
+        if not skip_crop:
+            lr_image = self._crop_with_corners(lr_image, sample["lr_corners"])
+            hr_image = self._crop_with_corners(hr_image, sample["hr_corners"])
 
         # Test-resolution augmentation: downsample LR to match test distribution
         # Applied BEFORE aspect ratio augmentation so both work correctly
@@ -647,6 +700,105 @@ class LicensePlateDataset(Dataset):
         return pattern[position] == "N"
 
 
+class TestLikeValidationDataset(Dataset):
+    """
+    Validation dataset that simulates test-time conditions.
+
+    The key insight: regular validation uses the same distribution as training
+    (corner-cropped PNGs at ~30x87), so val accuracy (~75%+) is misleading.
+    Test images are tiny JPGs (~17x49) with no corner annotations.
+
+    This dataset takes training samples and degrades them to match the test
+    distribution, providing a realistic estimate of test accuracy during training.
+
+    Pipeline per sample:
+    1. Load LR image (skip corner cropping to simulate no plate boundaries)
+    2. Downsample to test-native resolution (~17x49)
+    3. JPEG-compress in memory (quality 75-90) to simulate JPG artifacts
+    4. Resize to lr_size for the SR model (same as inference does)
+    5. Return tensor + ground truth text for accuracy computation
+    """
+
+    def __init__(
+        self,
+        samples: List[Dict[str, Any]],
+        image_size: Tuple[int, int] = (34, 62),
+        normalize: bool = True,
+        jpeg_quality_range: Tuple[int, int] = (75, 90),
+    ):
+        """
+        Args:
+            samples: List of sample dicts from LicensePlateDataset._load_samples()
+            image_size: Target LR size (H, W) — must match training lr_size
+            normalize: Whether to normalize to [-1, 1]
+            jpeg_quality_range: JPEG quality range to simulate test JPG artifacts
+        """
+        self.samples = samples
+        self.image_size = image_size
+        self.normalize = normalize
+        self.jpeg_quality_range = jpeg_quality_range
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        sample = self.samples[idx]
+        import io
+
+        # 1. Load LR image (NO corner cropping — simulates test conditions)
+        lr_image = Image.open(sample["lr_path"]).convert("RGB")
+
+        # 2. Downsample to test-native resolution (~17x49)
+        #    Sample from actual test distribution: height=17.9±1.6, width=49.1±4.8
+        target_h = int(random.gauss(17.9, 1.6))
+        target_w = int(random.gauss(49.1, 4.8))
+        target_h = max(12, min(25, target_h))
+        target_w = max(35, min(65, target_w))
+        try:
+            lr_image = lr_image.resize((target_w, target_h), Image.Resampling.BICUBIC)
+        except AttributeError:
+            lr_image = lr_image.resize((target_w, target_h), Image.BICUBIC)
+
+        # 3. JPEG compress in memory (simulate test JPG format)
+        quality = random.randint(self.jpeg_quality_range[0], self.jpeg_quality_range[1])
+        buffer = io.BytesIO()
+        lr_image.save(buffer, format='JPEG', quality=quality)
+        buffer.seek(0)
+        lr_image = Image.open(buffer).convert('RGB')
+
+        # 4. Resize to lr_size (what inference.py does with test images)
+        target_h, target_w = self.image_size
+        try:
+            lr_image = lr_image.resize((target_w, target_h), Image.Resampling.BICUBIC)
+        except AttributeError:
+            lr_image = lr_image.resize((target_w, target_h), Image.BICUBIC)
+
+        # 5. Convert to tensor
+        tensor = transforms.ToTensor()(lr_image)
+        if self.normalize:
+            tensor = tensor * 2.0 - 1.0
+
+        # Also create HR target for PSNR/SSIM (load HR, resize to 2x lr_size)
+        hr_image = Image.open(sample["hr_path"]).convert("RGB")
+        hr_h, hr_w = self.image_size[0] * 2, self.image_size[1] * 2
+        try:
+            hr_image = hr_image.resize((hr_w, hr_h), Image.Resampling.BICUBIC)
+        except AttributeError:
+            hr_image = hr_image.resize((hr_w, hr_h), Image.BICUBIC)
+        hr_tensor = transforms.ToTensor()(hr_image)
+        if self.normalize:
+            hr_tensor = hr_tensor * 2.0 - 1.0
+
+        return {
+            "lr": tensor,
+            "hr": hr_tensor,
+            "plate_text": sample["plate_text"],
+            "plate_layout": sample["plate_layout"],
+            "lr_path": sample["lr_path"],
+            "hr_path": sample["hr_path"],
+        }
+
+
 def create_dataloaders(
     root_dir: str,
     batch_size: int = 16,
@@ -664,6 +816,11 @@ def create_dataloaders(
     test_aspect_range: Tuple[float, float] = (0.29, 0.40),
     test_resolution_augment: bool = False,
     test_resolution_prob: float = 0.5,
+    jpeg_augment: bool = False,
+    jpeg_quality_range: Tuple[int, int] = (60, 95),
+    no_crop_prob: float = 0.0,
+    test_like_val: bool = False,
+    test_like_val_fraction: float = 0.1,
 ) -> Tuple[DataLoader, DataLoader, Optional["DistributedSampler"]]:
     """
     Create train and validation dataloaders.
@@ -685,9 +842,15 @@ def create_dataloaders(
         test_aspect_range: (min_ratio, max_ratio) of test image H/W ratios
         test_resolution_augment: If True, randomly downsample LR to match test resolution
         test_resolution_prob: Probability (0-1) of applying test-resolution augmentation
+        jpeg_augment: If True, add JPEG compression to augmentation pipeline
+        jpeg_quality_range: (min, max) JPEG quality for augmentation
+        no_crop_prob: Probability (0-1) of skipping corner cropping
+        test_like_val: If True, also create a test-like validation loader
+        test_like_val_fraction: Fraction of val set to use for test-like validation
 
     Returns:
         Tuple of (train_dataloader, val_dataloader, train_sampler)
+        When test_like_val=True, returns (train_dl, val_dl, train_sampler, test_like_val_dl)
         train_sampler is None when distributed=False
     """
     # Create full dataset
@@ -702,6 +865,9 @@ def create_dataloaders(
         test_aspect_range=test_aspect_range,
         test_resolution_augment=test_resolution_augment,
         test_resolution_prob=test_resolution_prob,
+        jpeg_augment=jpeg_augment,
+        jpeg_quality_range=jpeg_quality_range,
+        no_crop_prob=no_crop_prob,
     )
 
     # Split into train and validation
@@ -719,6 +885,33 @@ def create_dataloaders(
     if augment_train:
         # We need to wrap the train subset to enable augmentation
         train_dataset.dataset.augment = True
+
+    # Create test-like validation dataset (simulates test distribution)
+    test_like_val_loader = None
+    if test_like_val and image_size is not None:
+        # Use a subset of validation samples for test-like evaluation
+        val_indices = val_dataset.indices
+        test_like_size = max(1, int(len(val_indices) * test_like_val_fraction))
+        test_like_indices = val_indices[:test_like_size]
+        test_like_samples = [full_dataset.samples[i] for i in test_like_indices]
+
+        test_like_dataset = TestLikeValidationDataset(
+            samples=test_like_samples,
+            image_size=image_size,
+            normalize=True,
+            jpeg_quality_range=jpeg_quality_range,
+        )
+
+        loader_timeout = 0 if num_workers == 0 else 300
+        test_like_val_loader = DataLoader(
+            test_like_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=min(num_workers, 2),
+            pin_memory=True,
+            drop_last=False,
+            timeout=loader_timeout,
+        )
 
     # Create dataloaders
     if distributed:
@@ -793,6 +986,12 @@ def create_dataloaders(
             timeout=loader_timeout,
             persistent_workers=num_workers > 0,
         )
+
+    if test_like_val and test_like_val_loader is not None:
+        if distributed:
+            return train_loader, val_loader, train_sampler, test_like_val_loader
+        else:
+            return train_loader, val_loader, None, test_like_val_loader
 
     if distributed:
         return train_loader, val_loader, train_sampler

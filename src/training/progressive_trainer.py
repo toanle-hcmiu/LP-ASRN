@@ -86,6 +86,7 @@ class ProgressiveTrainer:
         rank: int = 0,
         world_size: int = 1,
         train_sampler: Optional["DistributedSampler"] = None,
+        test_like_val_loader: Optional[DataLoader] = None,
     ):
         """
         Initialize Progressive Trainer.
@@ -102,12 +103,14 @@ class ProgressiveTrainer:
             rank: Rank for DDP
             world_size: World size for DDP
             train_sampler: DistributedSampler for training data (for set_epoch calls)
+            test_like_val_loader: Optional DataLoader that simulates test distribution
         """
         # For DDP, models are already wrapped and moved to device
         self.generator = generator
         self.ocr = ocr
         self.train_loader = train_loader
         self.val_loader = val_loader
+        self.test_like_val_loader = test_like_val_loader
         self.config = config
         self.logger = logger
         self.text_logger = None  # Optional TextLogger
@@ -853,6 +856,88 @@ class ProgressiveTrainer:
             "char_acc": char_correct / char_total if char_total > 0 else 0,
         }
 
+    def validate_test_like(self, beam_width: int = 5) -> Dict[str, float]:
+        """
+        Validate on test-like conditions (simulated test distribution).
+
+        Unlike validate() which uses training-distribution data, this uses
+        TestLikeValidationDataset which:
+        - Skips corner cropping (no plate annotations in test)
+        - Downsamples to test resolution (~17x49)
+        - Applies JPEG compression (test is JPG, train is PNG)
+        - Resizes back to lr_size (like inference.py does)
+
+        This provides a realistic estimate of test accuracy during training,
+        bridging the gap between misleading val accuracy and actual test scores.
+
+        Args:
+            beam_width: Beam width for OCR decoding
+
+        Returns:
+            Dictionary with test-like word_acc, char_acc, psnr, ssim
+        """
+        if self.test_like_val_loader is None:
+            return {"test_like_word_acc": 0.0, "test_like_char_acc": 0.0}
+
+        if self.distributed and not self.is_main:
+            return {"test_like_word_acc": 0.0, "test_like_char_acc": 0.0}
+
+        gen_unwrapped = self._unwrap_model(self.generator)
+        gen_unwrapped.eval()
+        self.ocr.eval()
+
+        word_correct = 0
+        char_correct = 0
+        total_chars = 0
+        total_samples = 0
+        total_psnr = 0.0
+
+        with torch.no_grad():
+            for batch in self.test_like_val_loader:
+                lr_images = batch["lr"].to(self.device)
+                hr_images = batch["hr"].to(self.device)
+                gt_texts = batch["plate_text"]
+
+                # SR forward pass
+                sr_images = gen_unwrapped(lr_images)
+
+                # OCR predictions
+                ocr_unwrapped = self._unwrap_model(self.ocr)
+                pred_texts = ocr_unwrapped.predict(sr_images, beam_width=beam_width)
+
+                # PSNR
+                mse_per_img = torch.mean((sr_images - hr_images) ** 2, dim=(1, 2, 3))
+                psnr_per_img = 20 * torch.log10(2.0 / torch.sqrt(mse_per_img + 1e-10))
+                total_psnr += psnr_per_img.sum().item()
+
+                # Accuracy
+                for pred, gt in zip(pred_texts, gt_texts):
+                    total_samples += 1
+                    if pred == gt:
+                        word_correct += 1
+
+                    max_len = max(len(pred), len(gt))
+                    for i in range(max_len):
+                        p_char = pred[i] if i < len(pred) else ''
+                        g_char = gt[i] if i < len(gt) else ''
+                        if p_char == g_char:
+                            char_correct += 1
+                        total_chars += 1
+
+        # Restore training mode
+        gen_unwrapped.train()
+        self.ocr.train()
+
+        word_acc = word_correct / total_samples if total_samples > 0 else 0
+        char_acc = char_correct / total_chars if total_chars > 0 else 0
+        avg_psnr = total_psnr / total_samples if total_samples > 0 else 0
+
+        return {
+            "test_like_word_acc": word_acc,
+            "test_like_char_acc": char_acc,
+            "test_like_psnr": avg_psnr,
+        }
+
     def save_ocr_checkpoint(self, epoch: int, stage: TrainingStage):
         """Save OCR model checkpoint (main process only for DDP)."""
         if self.distributed and not self.is_main:
@@ -1474,6 +1559,7 @@ class ProgressiveTrainer:
         train_metrics: Dict,
         val_metrics: Dict,
         epoch: int,
+        test_like_metrics: Optional[Dict] = None,
     ):
         """Log metrics to TensorBoard with stage-prefixed names."""
         if not self.logger:
@@ -1498,6 +1584,13 @@ class ProgressiveTrainer:
         for key, value in val_metrics.items():
             if isinstance(value, (int, float)):
                 self.logger.log_scalar(f"{stage_prefix}/val_{key}", value, epoch)
+
+        # Log test-like validation metrics (simulated test distribution)
+        # These provide a realistic estimate of test accuracy during training
+        if test_like_metrics:
+            for key, value in test_like_metrics.items():
+                if isinstance(value, (int, float)):
+                    self.logger.log_scalar(f"{stage_prefix}/{key}", value, epoch)
 
         # Log learning rate
         if hasattr(self, 'optimizer') and self.optimizer:
@@ -1661,11 +1754,16 @@ class ProgressiveTrainer:
                     self.confusion_tracker.update(val_metrics["pred_texts"], val_metrics["gt_texts"])
                     self.lcofl_loss.update_weights(self.confusion_tracker.confusion_matrix)
 
-                # Log to TensorBoard
-                self.log_to_tensorboard(train_metrics, val_metrics, epoch)
+                # Run test-like validation (simulates test distribution)
+                # This provides a realistic accuracy estimate vs misleading train-distribution val
+                test_like_metrics = self.validate_test_like(beam_width=val_beam_width)
+
+                # Log to TensorBoard (both regular and test-like metrics)
+                self.log_to_tensorboard(train_metrics, val_metrics, epoch, test_like_metrics=test_like_metrics)
             else:
                 # Skip validation - provide minimal metrics for early stopping
                 val_metrics = {"word_acc": 0.0, "char_acc": 0.0, "psnr": 0.0, "ssim": 0.0, "pred_texts": [], "gt_texts": []}
+                test_like_metrics = {"test_like_word_acc": 0.0, "test_like_char_acc": 0.0}
 
             # DDP sync: ALL ranks must synchronize AFTER validation (before early stopping check)
             # Use longer timeout since validation can take 15+ minutes
@@ -1716,6 +1814,14 @@ class ProgressiveTrainer:
                         },
                         lr=current_lr,
                         is_best=is_best
+                    )
+
+                # Log test-like metrics (realistic test accuracy estimate)
+                if self.is_main and test_like_metrics.get('test_like_word_acc', 0) > 0:
+                    self._log(
+                        f"  Test-like val: word_acc={test_like_metrics['test_like_word_acc']:.4f}, "
+                        f"char_acc={test_like_metrics['test_like_char_acc']:.4f}, "
+                        f"psnr={test_like_metrics.get('test_like_psnr', 0):.2f}"
                     )
 
             # Learning rate scheduling
