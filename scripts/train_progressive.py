@@ -315,7 +315,8 @@ def train_ddp(rank, world_size, args, config):
         print("\nLoading data...")
 
     from src.data.lp_dataset import create_dataloaders
-    train_loader, val_loader, train_sampler = create_dataloaders(
+    test_like_val = config.get("training", {}).get("test_like_val", False)
+    dataloader_result = create_dataloaders(
         root_dir=args.data_root,
         batch_size=config["data"].get("batch_size", 16),
         num_workers=config["data"].get("num_workers", 4),
@@ -328,7 +329,18 @@ def train_ddp(rank, world_size, args, config):
         test_aspect_range=tuple(config["data"].get("test_aspect_range", [0.29, 0.40])),
         test_resolution_augment=config["data"].get("test_resolution_augment", False),
         test_resolution_prob=config["data"].get("test_resolution_prob", 0.5),
+        jpeg_augment=config["data"].get("jpeg_augment", False),
+        jpeg_quality_range=tuple(config["data"].get("jpeg_quality_range", [60, 95])),
+        no_crop_prob=config["data"].get("no_crop_prob", 0.0),
+        test_like_val=test_like_val,
+        test_like_val_fraction=config.get("training", {}).get("test_like_val_fraction", 0.1),
     )
+    # Unpack: 4-tuple when test_like_val=True, 3-tuple otherwise
+    test_like_val_loader = None
+    if test_like_val and len(dataloader_result) == 4:
+        train_loader, val_loader, train_sampler, test_like_val_loader = dataloader_result
+    else:
+        train_loader, val_loader, train_sampler = dataloader_result
 
     if is_main:
         print(f"Train samples: {len(train_loader.dataset)}")
@@ -432,6 +444,7 @@ def train_ddp(rank, world_size, args, config):
         rank=rank,
         world_size=world_size,
         train_sampler=train_sampler,
+        test_like_val_loader=test_like_val_loader,
     )
     if is_main:
         trainer.set_text_logger(text_logger)
@@ -572,7 +585,8 @@ def main():
 
         # Create data loaders
         print("\nLoading data...")
-        train_loader, val_loader, _ = create_dataloaders(
+        test_like_val = config.get("training", {}).get("test_like_val", False)
+        dataloader_result = create_dataloaders(
             root_dir=args.data_root,
             batch_size=config["data"].get("batch_size", 16),
             num_workers=config["data"].get("num_workers", 4),
@@ -581,7 +595,20 @@ def main():
             ocr_pretrain_mode=config["data"].get("ocr_pretrain_augmentation", False),
             aspect_ratio_augment=config["data"].get("aspect_ratio_augment", False),
             test_aspect_range=tuple(config["data"].get("test_aspect_range", [0.29, 0.40])),
+            test_resolution_augment=config["data"].get("test_resolution_augment", False),
+            test_resolution_prob=config["data"].get("test_resolution_prob", 0.5),
+            jpeg_augment=config["data"].get("jpeg_augment", False),
+            jpeg_quality_range=tuple(config["data"].get("jpeg_quality_range", [60, 95])),
+            no_crop_prob=config["data"].get("no_crop_prob", 0.0),
+            test_like_val=test_like_val,
+            test_like_val_fraction=config.get("training", {}).get("test_like_val_fraction", 0.1),
         )
+        # Unpack: 4-tuple when test_like_val=True, 3-tuple otherwise
+        test_like_val_loader = None
+        if test_like_val and len(dataloader_result) == 4:
+            train_loader, val_loader, _, test_like_val_loader = dataloader_result
+        else:
+            train_loader, val_loader, _ = dataloader_result
 
         print(f"Train samples: {len(train_loader.dataset)}")
         print(f"Val samples: {len(val_loader.dataset)}")
@@ -646,6 +673,7 @@ def main():
             config=config,
             logger=logger,
             device=device,
+            test_like_val_loader=test_like_val_loader,
         )
         trainer.set_text_logger(text_logger)
 
