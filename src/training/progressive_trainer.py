@@ -348,6 +348,42 @@ class ProgressiveTrainer:
             return model.module
         return model
 
+    def _simulate_test_pipeline(self, hr_images: torch.Tensor, lr_images: torch.Tensor,
+                                  degrade_ratio: float = 0.4) -> torch.Tensor:
+        """
+        Simulate the test-time pipeline for a fraction of samples.
+
+        For `degrade_ratio` of the batch, replace the HR image with a
+        bicubic-upscaled version of the LR image. This teaches PARSeq to
+        recognize text from blurry, low-resolution, JPEG-compressed inputs —
+        the same quality it will see at test time after SR.
+
+        Args:
+            hr_images: Clean HR images (B, C, H, W)
+            lr_images: Degraded LR images (B, C, h, w)
+            degrade_ratio: Fraction of samples to replace with upscaled LR
+
+        Returns:
+            Mixed batch — some HR, some upscaled-LR
+        """
+        import random
+        import torch.nn.functional as F
+
+        B = hr_images.shape[0]
+        result = hr_images.clone()
+        hr_h, hr_w = hr_images.shape[2], hr_images.shape[3]
+
+        for i in range(B):
+            if random.random() < degrade_ratio:
+                # Upscale LR to HR size via bicubic (simulates SR output quality)
+                upscaled = F.interpolate(
+                    lr_images[i:i+1], size=(hr_h, hr_w),
+                    mode='bicubic', align_corners=False
+                ).clamp(-1.0, 1.0)
+                result[i:i+1] = upscaled
+
+        return result
+
     def _apply_ocr_augmentation(self, images: torch.Tensor) -> torch.Tensor:
         """
         Apply aggressive data augmentation for OCR pretraining.
@@ -1053,10 +1089,16 @@ class ProgressiveTrainer:
                        disable=not self.is_main)
             for batch in pbar:
                 hr_images = batch["hr"].to(self.device)
+                lr_images = batch["lr"].to(self.device)
                 gt_texts = batch["plate_text"]
 
                 # Apply data augmentation for OCR pretraining (prevents overfitting)
                 if self.ocr.training:
+                    # Mix in upscaled-LR images to simulate test pipeline
+                    # This teaches PARSeq to read degraded/SR-quality inputs
+                    hr_images = self._simulate_test_pipeline(
+                        hr_images, lr_images, degrade_ratio=0.4
+                    )
                     hr_images = self._apply_ocr_augmentation(hr_images)
 
                 # Compute loss — different paths for PARSeq vs SimpleCRNN
