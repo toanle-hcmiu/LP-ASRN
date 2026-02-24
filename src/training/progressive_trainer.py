@@ -1979,7 +1979,7 @@ class ProgressiveTrainer:
             "global_epoch": self.global_epoch,
             "epochs_without_improvement": self.epochs_without_improvement,
             "confusion_matrix": self.confusion_tracker.confusion_matrix.cpu() if hasattr(self, 'confusion_tracker') else None,
-            "lcofl_weights": self.lcofl_loss.weights.cpu() if hasattr(self, 'lcofl_loss') and self.lcofl_loss is not None else None,
+            "lcofl_weights": self.lcofl_loss.classification_loss.weights.cpu() if hasattr(self, 'lcofl_loss') and self.lcofl_loss is not None and hasattr(self.lcofl_loss, 'classification_loss') else None,
             "best_balanced_score": self.best_balanced_score,
             "last_val_psnr": self.last_val_psnr,
             "_lcofl_scale": self._lcofl_scale,
@@ -2155,9 +2155,9 @@ class ProgressiveTrainer:
 
         if 'lcofl_weights' in self._checkpoint_state and self._checkpoint_state['lcofl_weights'] is not None:
             try:
-                self.lcofl_loss.weights = self._checkpoint_state['lcofl_weights'].to(self.device)
+                self.lcofl_loss.classification_loss.weights = self._checkpoint_state['lcofl_weights'].to(self.device)
                 if self.is_main:
-                    self._log(f"LCOFL character weights restored from checkpoint (max={self.lcofl_loss.weights.max():.3f})")
+                    self._log(f"LCOFL character weights restored from checkpoint (max={self.lcofl_loss.classification_loss.weights.max():.3f})")
             except Exception as e:
                 if self.is_main:
                     self._log(f"WARNING: Could not load LCOFL weights: {e}")
