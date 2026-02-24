@@ -44,8 +44,10 @@ checkpoints/
 # Data
 data/train/*/
 data/test-public/*/
+data/test-blind/*/
 !data/train/.gitkeep
 !data/test-public/.gitkeep
+!data/test-blind/.gitkeep
 
 # Results
 results/
