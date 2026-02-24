@@ -59,6 +59,7 @@ class StageConfig:
     freeze_ocr: bool
     update_confusion: bool = False
     aspect_ratio_range: tuple = (0.25, 0.45)  # Stage-specific aspect ratio range
+    psnr_floor: float = 0.0  # Quality guardrail: dynamically scale down LCOFL if PSNR drops below this
 
 
 class ProgressiveTrainer:
@@ -214,10 +215,11 @@ class ProgressiveTrainer:
                 name="lcofl",
                 epochs=self.progressive_config.get("stage2", {}).get("epochs", 50),
                 lr=self.progressive_config.get("stage2", {}).get("lr", 1e-4),
-                loss_components=["l1", "lcofl"],
+                loss_components=self.progressive_config.get("stage2", {}).get("loss_components", ["l1", "lcofl"]),
                 freeze_ocr=True,
                 update_confusion=True,
                 aspect_ratio_range=tuple(self.progressive_config.get("stage2", {}).get("aspect_ratio_range", [0.25, 0.45])),
+                psnr_floor=self.progressive_config.get("stage2", {}).get("psnr_floor", 0.0),
             ),
             TrainingStage.FINETUNE: StageConfig(
                 name="finetune",
@@ -244,6 +246,9 @@ class ProgressiveTrainer:
         self.global_epoch = 0
         self.global_step = 0
         self.best_word_acc = 0.0
+        self.best_balanced_score = 0.0  # word_acc * min(psnr/13.0, 1.0) — prevents saving quality-collapsed models
+        self.last_val_psnr = 15.0  # Track latest validation PSNR for quality guardrail
+        self._lcofl_scale = 1.0  # Dynamic LCOFL weight scale (reduced when PSNR drops below floor)
         self.epochs_without_improvement = 0
 
         # Confusion tracking
@@ -619,7 +624,10 @@ class ProgressiveTrainer:
                     sr_images, hr_images, pred_logits, gt_texts, pred_texts
                 )
                 lambda_lcofl = self.config.get("loss", {}).get("lambda_lcofl", 1.0)
-                loss = loss + lambda_lcofl * lcofl
+                # Quality guardrail: dynamically scale down LCOFL when PSNR is below floor
+                # This prevents the generator from sacrificing image quality for OCR-adversarial patterns
+                effective_lcofl_weight = lambda_lcofl * self._lcofl_scale
+                loss = loss + effective_lcofl_weight * lcofl
                 total_lcofl += lcofl.item()
 
                 # VGG perceptual loss (sharper textures)
@@ -629,6 +637,15 @@ class ProgressiveTrainer:
 
                 pred_texts_all.extend(pred_texts)
                 gt_texts_all.extend(gt_texts)
+
+            # Standalone SSIM loss — prevents visual quality collapse during LCOFL
+            # This is separate from the SSIM inside LCOFL (which is weighted by lambda_ssim within LCOFL)
+            if "ssim" in stage_config.loss_components:
+                from src.losses.lcofl import ssim as compute_ssim
+                ssim_val = compute_ssim(sr_images, hr_images)
+                ssim_loss = 1.0 - ssim_val  # SSIM is similarity, we want to minimize dissimilarity
+                lambda_ssim_standalone = self.config.get("loss", {}).get("lambda_ssim", 0.2)
+                loss = loss + lambda_ssim_standalone * ssim_loss
 
             # Additional losses: Gradient, Frequency, Edge
             # These help with edge sharpness and high-frequency detail
@@ -1328,7 +1345,8 @@ class ProgressiveTrainer:
                     sr_images, hr_images, pred_logits, gt_texts, pred_texts
                 )
                 lambda_lcofl = self.config.get("loss", {}).get("lambda_lcofl", 1.0)
-                loss = loss + lambda_lcofl * lcofl
+                effective_lcofl_weight = lambda_lcofl * self._lcofl_scale
+                loss = loss + effective_lcofl_weight * lcofl
                 total_lcofl += lcofl.item()
 
                 # Compute embedding loss if enabled
@@ -1845,6 +1863,32 @@ class ProgressiveTrainer:
                 else:
                     self.epochs_without_improvement += 1
 
+                # --- PSNR guardrail: dynamically scale LCOFL if quality drops ---
+                val_psnr = val_metrics.get('psnr', 15.0)
+                self.last_val_psnr = val_psnr
+                if config.psnr_floor > 0 and val_psnr < config.psnr_floor:
+                    self._lcofl_scale = max(0.1, val_psnr / config.psnr_floor)
+                    if self.is_main:
+                        self._log(
+                            f"  [PSNR Guardrail] PSNR {val_psnr:.2f} < floor {config.psnr_floor:.1f} "
+                            f"=> LCOFL scale reduced to {self._lcofl_scale:.3f}"
+                        )
+                else:
+                    self._lcofl_scale = 1.0
+
+                # --- Balanced checkpoint: word_acc weighted by visual quality ---
+                balanced_score = val_metrics['word_acc'] * min(val_psnr / 13.0, 1.0)
+                if balanced_score > self.best_balanced_score:
+                    self.best_balanced_score = balanced_score
+                    balanced_path = str(self.save_dir / "best_balanced.pth")
+                    self.save_checkpoint(epoch, stage, save_path=balanced_path)
+                    if self.is_main:
+                        self._log(
+                            f"  [Balanced] New best: {balanced_score:.4f} "
+                            f"(word_acc={val_metrics['word_acc']:.4f}, psnr={val_psnr:.2f}) "
+                            f"=> {balanced_path}"
+                        )
+
                 # Log epoch metrics to text file
                 if self.text_logger and self.is_main:
                     current_lr = self.optimizer.param_groups[0]['lr']
@@ -1912,7 +1956,7 @@ class ProgressiveTrainer:
 
         return self.best_word_acc
 
-    def save_checkpoint(self, epoch: int, stage: TrainingStage, emergency: bool = False, is_best: bool = True):
+    def save_checkpoint(self, epoch: int, stage: TrainingStage, emergency: bool = False, is_best: bool = True, save_path: str = None):
         """Save a checkpoint (main process only for DDP).
 
         Args:
@@ -1920,6 +1964,7 @@ class ProgressiveTrainer:
             stage: Current training stage
             emergency: If True, save as emergency checkpoint with timestamp
             is_best: If True, also save as best.pth. Set False for periodic saves.
+            save_path: If provided, save directly to this path (e.g. for balanced checkpoint).
         """
         if self.distributed and not self.is_main:
             return
@@ -1935,11 +1980,19 @@ class ProgressiveTrainer:
             "epochs_without_improvement": self.epochs_without_improvement,
             "confusion_matrix": self.confusion_tracker.confusion_matrix.cpu() if hasattr(self, 'confusion_tracker') else None,
             "lcofl_weights": self.lcofl_loss.weights.cpu() if hasattr(self, 'lcofl_loss') and self.lcofl_loss is not None else None,
+            "best_balanced_score": self.best_balanced_score,
+            "last_val_psnr": self.last_val_psnr,
+            "_lcofl_scale": self._lcofl_scale,
         }
 
         # Always save OCR state_dict (even when frozen) for proper resume
         # The trained OCR from stage0/pretraining is critical for validation
         checkpoint["ocr_state_dict"] = self.ocr.state_dict()
+
+        # Direct save_path override (e.g., for balanced checkpoint)
+        if save_path is not None:
+            torch.save(checkpoint, save_path)
+            return
 
         if emergency:
             # Emergency checkpoint - add timestamp and save to special location
@@ -2114,6 +2167,16 @@ class ProgressiveTrainer:
             self.epochs_without_improvement = self._checkpoint_state['epochs_without_improvement']
             if self.is_main:
                 self._log(f"Epochs without improvement: {self.epochs_without_improvement}")
+
+        # Restore PSNR guardrail and balanced checkpoint tracking
+        if 'best_balanced_score' in self._checkpoint_state:
+            self.best_balanced_score = self._checkpoint_state['best_balanced_score']
+        if 'last_val_psnr' in self._checkpoint_state:
+            self.last_val_psnr = self._checkpoint_state['last_val_psnr']
+        if '_lcofl_scale' in self._checkpoint_state:
+            self._lcofl_scale = self._checkpoint_state['_lcofl_scale']
+        if self.is_main and (self.best_balanced_score > 0 or self._lcofl_scale < 1.0):
+            self._log(f"Balanced score: {self.best_balanced_score:.4f}, LCOFL scale: {self._lcofl_scale:.3f}, last PSNR: {self.last_val_psnr:.2f}")
 
     def train_full_progressive(self) -> Dict[str, Any]:
         """Train all stages sequentially."""

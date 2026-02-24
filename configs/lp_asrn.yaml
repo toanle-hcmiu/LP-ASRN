@@ -24,7 +24,7 @@ data:
   - 62
   batch_size: 64
   num_workers: 4
-  val_split: 0.05
+  val_split: 0.10
   ocr_pretrain_augmentation: true
   aspect_ratio_augment: true
   test_aspect_range:
@@ -61,7 +61,7 @@ training:
   test_like_val: true
   test_like_val_fraction: 0.1  # Use 10% of val set for test-like evaluation
 loss:
-  lambda_lcofl: 1.5  # Increased for better character accuracy
+  lambda_lcofl: 0.5  # Reduced from 1.5 — was causing PSNR collapse (13.8→12.0) and poor generalization
   lambda_ocr: 0.1
   lambda_layout: 0.5
   lambda_ssim: 0.2
@@ -125,8 +125,10 @@ progressive_training:
     loss_components:
     - l1
     - lcofl
+    - ssim  # Standalone SSIM loss to prevent visual quality collapse during LCOFL
     freeze_ocr: true
     update_confusion: true
+    psnr_floor: 12.5  # Quality guardrail: scale down LCOFL weight if PSNR drops below this
     aspect_ratio_range:
     - 0.2
     - 0.55

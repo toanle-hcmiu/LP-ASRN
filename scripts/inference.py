@@ -255,7 +255,7 @@ def load_models(args, config, device):
         # Load with strict=True to catch any mismatch
         try:
             generator.load_state_dict(gen_state, strict=True)
-            print(f"  ✓ Generator loaded (strict=True, all weights matched)")
+            print(f"  [OK] Generator loaded (strict=True, all weights matched)")
         except RuntimeError as e:
             print(f"  ⚠ Strict loading failed: {e}")
             print(f"  Falling back to strict=False...")
@@ -304,7 +304,7 @@ def load_models(args, config, device):
     if ocr_state is not None and has_parseq:
         try:
             ocr.load_state_dict(ocr_state, strict=True)
-            print(f"  ✓ OCR loaded (strict=True) from {ocr_source}")
+            print(f"  [OK] OCR loaded (strict=True) from {ocr_source}")
         except RuntimeError as e:
             print(f"  ⚠ OCR strict loading failed: {e}")
             print(f"  Falling back to strict=False...")
@@ -1046,7 +1046,7 @@ def run_diagnose(args):
             # Pipeline is OK if inference acc >= checkpoint acc (tested on full data including train split)
             # or within 10% tolerance (val split may differ)
             pipeline_ok = word_acc >= ckpt_word_acc * 0.9
-            print(f"    Pipeline: {'OK ✓ (accuracy matches or exceeds checkpoint)' if pipeline_ok else 'POSSIBLE BUG ✗ — accuracy much lower than checkpoint!'}")
+            print(f"    Pipeline: {'OK (accuracy matches or exceeds checkpoint)' if pipeline_ok else 'POSSIBLE BUG - accuracy much lower than checkpoint!'}")
             if word_acc > ckpt_word_acc:
                 print(f"    Note: Higher accuracy is expected since diagnose-val includes training data")
 

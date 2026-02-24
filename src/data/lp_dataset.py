@@ -186,13 +186,19 @@ class LicensePlateDataset(Dataset):
                         if plate_layout not in self.layouts:
                             continue
 
-                        # Load all 5 image pairs
+                        # Load all 5 image pairs (support both PNG and JPG)
                         for i in range(1, 6):
-                            lr_name = f"lr-{i:03d}.png"
-                            hr_name = f"hr-{i:03d}.png"
+                            # Try PNG first (Scenario-A), then JPG (Scenario-B)
+                            lr_path = track_dir / f"lr-{i:03d}.png"
+                            hr_path = track_dir / f"hr-{i:03d}.png"
 
-                            lr_path = track_dir / lr_name
-                            hr_path = track_dir / hr_name
+                            if not lr_path.exists():
+                                lr_path = track_dir / f"lr-{i:03d}.jpg"
+                            if not hr_path.exists():
+                                hr_path = track_dir / f"hr-{i:03d}.jpg"
+
+                            lr_name = lr_path.name
+                            hr_name = hr_path.name
 
                             if not (lr_path.exists() and hr_path.exists()):
                                 continue
