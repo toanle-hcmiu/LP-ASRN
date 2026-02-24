@@ -1260,18 +1260,30 @@ class ProgressiveTrainer:
             gamma=self.config.get("training", {}).get("lr_gamma", 0.9),
         )
 
+        # Load optimizer/scheduler/confusion state if resuming from checkpoint
+        self._load_optimizer_state()
+
         # Get validation config
         val_interval = self.config.get("training", {}).get("val_interval", 10)
         val_beam_width = self.config.get("training", {}).get("val_beam_width", 5)
 
         best_word_acc = 0.0
-        self.epochs_without_improvement = 0
+
+        # Calculate starting epoch for resume
+        stage_start_epoch = 0
+        if hasattr(self, '_checkpoint_state') and 'stage' in self._checkpoint_state:
+            checkpoint_stage = self._checkpoint_state.get('stage', '')
+            if checkpoint_stage == TrainingStage.HARD_MINING.value:
+                checkpoint_epoch = self._checkpoint_state.get('epoch', 0)
+                stage_start_epoch = checkpoint_epoch + 1
+                if self.is_main:
+                    self._log(f"Resuming hard mining from epoch {stage_start_epoch}")
 
         # Track batch indices for hard example mining
         # In practice, you'd need to modify the dataset to provide indices
         batch_indices = torch.arange(len(self.train_loader.dataset))
 
-        for epoch in range(stage_config.epochs):
+        for epoch in range(stage_start_epoch, stage_config.epochs):
             # Set epoch for proper shuffling in DDP
             if self.train_sampler is not None:
                 self.train_sampler.set_epoch(epoch)
@@ -1917,8 +1929,12 @@ class ProgressiveTrainer:
             "stage": stage.value,
             "generator_state_dict": self.generator.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
+            "scheduler_state_dict": self.scheduler.state_dict() if hasattr(self, 'scheduler') and self.scheduler is not None else None,
             "best_word_acc": self.best_word_acc,
             "global_epoch": self.global_epoch,
+            "epochs_without_improvement": self.epochs_without_improvement,
+            "confusion_matrix": self.confusion_tracker.confusion_matrix.cpu() if hasattr(self, 'confusion_tracker') else None,
+            "lcofl_weights": self.lcofl_loss.weights.cpu() if hasattr(self, 'lcofl_loss') and self.lcofl_loss is not None else None,
         }
 
         # Always save OCR state_dict (even when frozen) for proper resume
@@ -2040,8 +2056,20 @@ class ProgressiveTrainer:
         # Note: No barrier here - the caller (train_progressive.py) handles synchronization
 
     def _load_optimizer_state(self):
-        """Load optimizer state from checkpoint (must be called after optimizer is created)."""
-        if hasattr(self, '_checkpoint_state') and 'optimizer_state_dict' in self._checkpoint_state:
+        """Load optimizer and scheduler state from checkpoint (must be called after optimizer/scheduler are created)."""
+        if not hasattr(self, '_checkpoint_state'):
+            return
+
+        # Only restore optimizer/scheduler if resuming the SAME stage
+        checkpoint_stage = self._checkpoint_state.get('stage', '')
+        current_stage_name = self.current_stage.value if hasattr(self, 'current_stage') else ''
+        if checkpoint_stage != current_stage_name:
+            if self.is_main:
+                self._log(f"Switching stages ({checkpoint_stage} -> {current_stage_name}), using fresh optimizer/scheduler")
+            return
+
+        # Restore optimizer state (Adam running averages, momentum)
+        if 'optimizer_state_dict' in self._checkpoint_state:
             try:
                 self.optimizer.load_state_dict(self._checkpoint_state['optimizer_state_dict'])
                 if self.is_main:
@@ -2049,7 +2077,43 @@ class ProgressiveTrainer:
             except (ValueError, RuntimeError) as e:
                 if self.is_main:
                     self._log(f"WARNING: Could not load optimizer state: {e}")
-                    self._log("Starting with fresh optimizer state (normal when switching stages or after architecture changes)")
+                    self._log("Starting with fresh optimizer state")
+
+        # Restore scheduler state (critical: prevents LR from resetting to initial value)
+        if 'scheduler_state_dict' in self._checkpoint_state and self._checkpoint_state['scheduler_state_dict'] is not None:
+            try:
+                self.scheduler.load_state_dict(self._checkpoint_state['scheduler_state_dict'])
+                if self.is_main:
+                    current_lr = self.optimizer.param_groups[0]['lr']
+                    self._log(f"Scheduler state loaded from checkpoint (LR={current_lr:.6f})")
+            except (ValueError, RuntimeError) as e:
+                if self.is_main:
+                    self._log(f"WARNING: Could not load scheduler state: {e}")
+
+        # Restore confusion matrix and LCOFL weights (prevents character weights from resetting)
+        if 'confusion_matrix' in self._checkpoint_state and self._checkpoint_state['confusion_matrix'] is not None:
+            try:
+                self.confusion_tracker.confusion_matrix = self._checkpoint_state['confusion_matrix'].to(self.device)
+                if self.is_main:
+                    self._log("Confusion matrix restored from checkpoint")
+            except Exception as e:
+                if self.is_main:
+                    self._log(f"WARNING: Could not load confusion matrix: {e}")
+
+        if 'lcofl_weights' in self._checkpoint_state and self._checkpoint_state['lcofl_weights'] is not None:
+            try:
+                self.lcofl_loss.weights = self._checkpoint_state['lcofl_weights'].to(self.device)
+                if self.is_main:
+                    self._log(f"LCOFL character weights restored from checkpoint (max={self.lcofl_loss.weights.max():.3f})")
+            except Exception as e:
+                if self.is_main:
+                    self._log(f"WARNING: Could not load LCOFL weights: {e}")
+
+        # Restore epochs_without_improvement (for early stopping continuity)
+        if 'epochs_without_improvement' in self._checkpoint_state:
+            self.epochs_without_improvement = self._checkpoint_state['epochs_without_improvement']
+            if self.is_main:
+                self._log(f"Epochs without improvement: {self.epochs_without_improvement}")
 
     def train_full_progressive(self) -> Dict[str, Any]:
         """Train all stages sequentially."""
