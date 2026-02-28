@@ -18,17 +18,21 @@ from torchvision import transforms
 
 
 class AddGaussianNoise:
-    """Add Gaussian noise to tensor for low-light simulation."""
+    """Add Gaussian noise for low-light simulation. PIL-in/PIL-out."""
 
     def __init__(self, mean=0.0, std=0.05):
         self.mean = mean
         self.std = std
 
     def __call__(self, img):
-        if isinstance(img, Image.Image):
+        was_pil = isinstance(img, Image.Image)
+        if was_pil:
             img = transforms.ToTensor()(img)
         noise = torch.randn_like(img) * self.std + self.mean
-        return torch.clamp(img + noise, 0, 1)
+        out = torch.clamp(img + noise, 0, 1)
+        if was_pil:
+            out = transforms.ToPILImage()(out)
+        return out
 
 
 class JPEGCompression:
@@ -562,9 +566,12 @@ class LicensePlateDataset(Dataset):
             # For older Pillow versions
             return image.resize((target_w, target_h), Image.BICUBIC)
 
-    def _to_tensor(self, image: Image.Image) -> torch.Tensor:
-        """Convert PIL Image to tensor."""
-        tensor = transforms.ToTensor()(image)
+    def _to_tensor(self, image) -> torch.Tensor:
+        """Convert PIL Image (or tensor) to normalized tensor."""
+        if isinstance(image, torch.Tensor):
+            tensor = image
+        else:
+            tensor = transforms.ToTensor()(image)
 
         if self.normalize:
             # Normalize to [-1, 1]
