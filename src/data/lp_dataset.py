@@ -127,7 +127,7 @@ class LicensePlateDataset(Dataset):
         self.layouts = layouts or ["Brazilian", "Mercosur"]
         self.image_size = image_size
         self.crop_to_corners = crop_to_corners
-        self.augment = augment
+        self._augment = augment
         self.normalize = normalize
         self.ocr_pretrain_mode = ocr_pretrain_mode
         self.aspect_ratio_augment = aspect_ratio_augment
@@ -137,6 +137,11 @@ class LicensePlateDataset(Dataset):
         self.jpeg_augment = jpeg_augment
         self.jpeg_quality_range = jpeg_quality_range
         self.no_crop_prob = no_crop_prob
+
+        # Training indices guard: only these indices receive augmentation.
+        # Set via set_training_indices() after train/val split to prevent
+        # augmentation leaking to validation through the shared dataset.
+        self._training_indices: Optional[set] = None
 
         # Load all samples
         self.samples = self._load_samples()
@@ -149,6 +154,24 @@ class LicensePlateDataset(Dataset):
         else:
             self.geometric_transform = None
             self.photometric_degradation = None
+
+    @property
+    def augment(self):
+        return self._augment
+
+    @augment.setter
+    def augment(self, value: bool):
+        """Lazy augmentation init: create transforms when augment is flipped to True."""
+        self._augment = value
+        if value and self.geometric_transform is None:
+            self.geometric_transform = self._get_geometric_transform(self.ocr_pretrain_mode)
+            self.photometric_degradation = self._get_photometric_degradation(self.ocr_pretrain_mode)
+
+    def set_training_indices(self, indices):
+        """Set which sample indices belong to the training split.
+        Augmentation (crop-skip, test-resolution, multi-scale, geometric/photometric)
+        is only applied to these indices, preventing val contamination."""
+        self._training_indices = set(indices)
 
     def _load_samples(self) -> List[Dict[str, Any]]:
         """Load all valid samples from the dataset directory."""
@@ -612,10 +635,18 @@ class LicensePlateDataset(Dataset):
         lr_image = self._load_image(sample["lr_path"])
         hr_image = self._load_image(sample["hr_path"])
 
+        # Determine whether this sample should receive training augmentation.
+        # If _training_indices is set, only those indices get augmented.
+        # This prevents augmentation leaking to the validation split through
+        # the shared full_dataset instance.
+        is_train_sample = self.augment and (
+            self._training_indices is None or idx in self._training_indices
+        )
+
         # Crop using corner coordinates
         # With no_crop_prob, randomly skip cropping to simulate test conditions
         # (test images have no corner annotations — plate boundaries unknown)
-        skip_crop = self.augment and self.no_crop_prob > 0 and random.random() < self.no_crop_prob
+        skip_crop = is_train_sample and self.no_crop_prob > 0 and random.random() < self.no_crop_prob
         if not skip_crop:
             lr_image = self._crop_with_corners(lr_image, sample["lr_corners"])
             hr_image = self._crop_with_corners(hr_image, sample["hr_corners"])
@@ -623,7 +654,7 @@ class LicensePlateDataset(Dataset):
         # Test-resolution augmentation: downsample LR to match test distribution
         # Applied BEFORE aspect ratio augmentation so both work correctly
         # Only applied to LR (HR stays high-res as the target)
-        if self.augment and self.test_resolution_augment:
+        if is_train_sample and self.test_resolution_augment:
             lr_image = self._apply_test_resolution(lr_image)
             # HR is not downsampled - it's the high-quality target
 
@@ -645,7 +676,7 @@ class LicensePlateDataset(Dataset):
 
         # Multi-scale training: randomly resize to smaller scales (30% chance)
         # This helps the model handle test images which are often smaller than training
-        if self.augment and self.image_size is not None and random.random() < 0.3:
+        if is_train_sample and self.image_size is not None and random.random() < 0.3:
             scale = random.choice([0.7, 0.8, 0.9])
             scaled_h = int(self.image_size[0] * scale)
             scaled_w = int(self.image_size[1] * scale)
@@ -662,8 +693,9 @@ class LicensePlateDataset(Dataset):
         lr_tensor = self._to_tensor(lr_image)
         hr_tensor = self._to_tensor(hr_image)
 
-        # Apply augmentation
-        lr_tensor, hr_tensor = self._apply_augmentation(lr_tensor, hr_tensor)
+        # Apply geometric/photometric augmentation (only for training samples)
+        if is_train_sample:
+            lr_tensor, hr_tensor = self._apply_augmentation(lr_tensor, hr_tensor)
 
         return {
             "lr": lr_tensor,
@@ -672,6 +704,7 @@ class LicensePlateDataset(Dataset):
             "plate_layout": sample["plate_layout"],
             "lr_path": sample["lr_path"],
             "hr_path": sample["hr_path"],
+            "idx": idx,
         }
 
     def set_aspect_ratio_range(self, aspect_ratio_range: Tuple[float, float]):
@@ -889,8 +922,11 @@ def create_dataloaders(
 
     # Enable augmentation for training set
     if augment_train:
-        # We need to wrap the train subset to enable augmentation
+        # We need to wrap the train subset to enable augmentation.
+        # The augment setter lazily creates geometric/photometric transforms.
         train_dataset.dataset.augment = True
+        # Register training indices so augmentation doesn't leak to validation
+        train_dataset.dataset.set_training_indices(train_dataset.indices)
 
     # Create test-like validation dataset (simulates test distribution)
     test_like_val_loader = None

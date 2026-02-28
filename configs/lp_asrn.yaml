@@ -155,15 +155,19 @@ progressive_training:
     loss_components:
     - l1
     - lcofl
+    - ssim
     freeze_ocr: true
     update_confusion: true
+    psnr_floor: 12.5  # Quality guardrail: match Stage 2
     aspect_ratio_range:
-    - 0.2
+    - 0.25
     - 0.45
     hard_mining:
       difficulty_alpha: 2.0
       reweight_interval: 5
-      min_samples_seen: 100
+      min_samples_seen: 3  # Reduced from 100 so miner activates within 50 epochs
+      initial_p_hard: 0.1
+      final_p_hard: 0.8
 tensorboard:
   enabled: true
   log_dir: logs

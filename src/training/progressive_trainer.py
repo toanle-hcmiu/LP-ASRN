@@ -238,6 +238,7 @@ class ProgressiveTrainer:
                 freeze_ocr=self.progressive_config.get("stage4", {}).get("freeze_ocr", True),
                 update_confusion=self.progressive_config.get("stage4", {}).get("update_confusion", True),
                 aspect_ratio_range=tuple(self.progressive_config.get("stage4", {}).get("aspect_ratio_range", [0.25, 0.40])),
+                psnr_floor=self.progressive_config.get("stage4", {}).get("psnr_floor", 12.5),
             ),
         }
 
@@ -681,6 +682,17 @@ class ProgressiveTrainer:
                     torch.nn.utils.clip_grad_norm_(self.ocr.parameters(), max_norm=max_norm)
 
             self.optimizer.step()
+
+            # --- Hard Mining: update per-sample difficulty tracking ---
+            if self.hard_example_miner is not None and "idx" in batch:
+                with torch.no_grad():
+                    # Get predictions if not already computed (e.g. lcofl not in loss_components)
+                    if "lcofl" not in stage_config.loss_components and "ocr" not in stage_config.loss_components:
+                        ocr_unwrapped = self._unwrap_model(self.ocr)
+                        pred_texts = ocr_unwrapped.predict(sr_images)
+                    char_accs = self._compute_char_accuracy(pred_texts, gt_texts)
+                    sample_indices = batch["idx"]  # Actual dataset indices
+                    self.hard_example_miner.update(sample_indices, char_accs)
 
             # Update progress
             if self.logger and self.global_step % 10 == 0:
@@ -1727,17 +1739,12 @@ class ProgressiveTrainer:
         self.set_stage(stage)
         config = self.stage_configs[stage]
 
-        # Handle Stage 4 (Hard Mining) separately
-        if stage == TrainingStage.HARD_MINING:
-            return self.train_hard_mining_stage(config)
-
         # Create optimizer for this stage
-        if stage == TrainingStage.FINETUNE:
-            # Train both generator and OCR
+        # Only include OCR params when OCR is NOT frozen
+        if not config.freeze_ocr:
             params = list(self.generator.parameters()) + list(self.ocr.parameters())
         else:
-            # Train only generator
-            params = self.generator.parameters()
+            params = list(self.generator.parameters())
 
         self.optimizer = optim.Adam(params, lr=config.lr)
         self.scheduler = StepLR(
@@ -1755,6 +1762,7 @@ class ProgressiveTrainer:
                 TrainingStage.WARMUP: "Stabilize network with L1 loss only",
                 TrainingStage.LCOFL: "Character-driven training with frozen OCR",
                 TrainingStage.FINETUNE: "Joint optimization with unfrozen OCR",
+                TrainingStage.HARD_MINING: "Hard example mining with weighted sampling",
             }
             self.text_logger.log_stage_start(
                 stage_name=stage.value,
@@ -1796,10 +1804,68 @@ class ProgressiveTrainer:
         if self.is_main:
             self._log(f"Starting from epoch {stage_start_epoch}, running to epoch {config.epochs}")
 
+        # --- Hard Mining: initialize miner + curriculum sampler ---
+        if stage == TrainingStage.HARD_MINING:
+            from src.training.hard_example_miner import HardExampleMiner, CurriculumSampler
+
+            stage4_config = self.config.get("progressive_training", {}).get("stage4", {})
+            hm_config = stage4_config.get("hard_mining", {})
+
+            # Dataset size = underlying full dataset size (Subset wraps it)
+            ds = self.train_loader.dataset
+            ds_size = len(ds.dataset) if hasattr(ds, 'dataset') else len(ds)
+
+            self.hard_example_miner = HardExampleMiner(
+                dataset_size=ds_size,
+                alpha=hm_config.get("difficulty_alpha", 2.0),
+                min_samples_seen=hm_config.get("min_samples_seen", 3),
+            )
+            self.curriculum_sampler = CurriculumSampler(
+                hard_example_miner=self.hard_example_miner,
+                total_epochs=config.epochs,
+                initial_p_hard=hm_config.get("initial_p_hard", 0.1),
+                final_p_hard=hm_config.get("final_p_hard", 0.8),
+            )
+            # Store original loader settings for rebuilding
+            self._hm_batch_size = self.train_loader.batch_size
+            self._hm_num_workers = self.train_loader.num_workers
+            self._hm_pin_memory = self.train_loader.pin_memory
+            self._hm_original_dataset = self.train_loader.dataset
+            self._hm_reweight_interval = hm_config.get("reweight_interval", 5)
+
+            if self.is_main:
+                self._log(f"[Hard Mining] initialized: dataset_size={ds_size}, "
+                          f"alpha={self.hard_example_miner.alpha}, "
+                          f"min_samples_seen={self.hard_example_miner.min_samples_seen}, "
+                          f"reweight_interval={self._hm_reweight_interval}")
+        else:
+            self.hard_example_miner = None
+            self.curriculum_sampler = None
+
         for epoch in range(stage_start_epoch, config.epochs):
             # epoch is stage-specific (0 to config.epochs-1)
             # Update global_epoch after each epoch for tracking
             self.global_epoch = epoch + 1
+
+            # --- Hard Mining: rebuild DataLoader with weighted sampling ---
+            if (self.hard_example_miner is not None
+                    and epoch > 0
+                    and epoch % self._hm_reweight_interval == 0):
+                from torch.utils.data import DataLoader as DL, WeightedRandomSampler
+                sampler = self.curriculum_sampler.create_sampler(
+                    epoch, batch_size=self._hm_batch_size
+                )
+                self.train_loader = DL(
+                    self._hm_original_dataset,
+                    batch_size=self._hm_batch_size,
+                    sampler=sampler,
+                    num_workers=self._hm_num_workers,
+                    pin_memory=self._hm_pin_memory,
+                    drop_last=True,
+                )
+                if self.is_main:
+                    p_hard = self.curriculum_sampler.get_p_hard(epoch)
+                    self._log(f"[Hard Mining] rebuilt DataLoader: epoch={epoch}, p_hard={p_hard:.3f}")
 
             # Log epoch start (for timing)
             if self.text_logger and self.is_main:
