@@ -4,18 +4,15 @@
 torch>=2.0.0
 torchvision>=0.15.0
 
-# OCR and Text Recognition
+# OCR (PARSeq transitive dependency via torch.hub)
 timm>=0.9.0
-torchmetrics>=1.0.0
 
 # Image Processing
 Pillow>=10.0.0
-opencv-python>=4.8.0
-imgaug>=0.4.0
 
 # Data Science
 numpy>=1.24.0
-pandas>=2.0.0
+scipy>=1.10.0
 
 # Configuration and Utilities
 PyYAML>=6.0
@@ -25,10 +22,3 @@ tensorboard>=2.13.0
 # Visualization
 matplotlib>=3.7.0
 seaborn>=0.12.0
-
-# Evaluation
-scikit-learn>=1.3.0
-scikit-image>=0.21.0
-
-# Deformable Convolution
-opencv-python>=4.8.0  # For grid_sample in deformable conv

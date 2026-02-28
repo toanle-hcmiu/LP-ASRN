@@ -2,16 +2,17 @@
 """
 Progressive Training Script for LP-ASRN
 
-Implements four-stage progressive training with automatic TensorBoard startup.
+Implements five-stage progressive training with automatic TensorBoard startup.
 
 Usage:
     python scripts/train_progressive.py --stage all --config configs/lp_asrn.yaml
 
 Stages:
-    Stage 0 (pretrain): OCR pretraining on HR images, 150 epochs
-    Stage 1 (warmup): L1 loss only, 30 epochs
-    Stage 2 (lcofl): Full LCOFL training, 300 epochs
-    Stage 3 (finetune): Joint OCR optimization, 150 epochs
+    Stage 0 (pretrain): OCR pretraining on HR images, 50 epochs
+    Stage 1 (warmup): L1 loss only, 80 epochs
+    Stage 2 (lcofl): Full LCOFL training, 200 epochs
+    Stage 3 (finetune): Extended multi-loss optimization, 200 epochs
+    Stage 4 (hard_mining): Hard example mining with weighted sampling, 50 epochs
 """
 
 import argparse
@@ -119,7 +120,7 @@ def parse_args():
     parser.add_argument(
         "--stage",
         type=str,
-        choices=["0", "1", "2", "3", "all", "pretrain", "warmup", "lcofl", "finetune"],
+        choices=["0", "1", "2", "3", "4", "all", "pretrain", "warmup", "lcofl", "finetune", "hard_mining"],
         default="all",
         help="Training stage to run",
     )
@@ -129,6 +130,7 @@ def parse_args():
     parser.add_argument("--warmup-epochs", type=int, default=None)
     parser.add_argument("--lcofl-epochs", type=int, default=None)
     parser.add_argument("--finetune-epochs", type=int, default=None)
+    parser.add_argument("--hard-mining-epochs", type=int, default=None)
 
     # TensorBoard
     parser.add_argument(
@@ -179,6 +181,7 @@ def load_config(config_path: str, args) -> dict:
             "stage1": {"epochs": 30, "lr": 1e-4},
             "stage2": {"epochs": 300, "lr": 1e-4},
             "stage3": {"epochs": 150, "lr": 1e-5},
+            "stage4": {"epochs": 50, "lr": 5e-6},
         }
 
     # Apply epoch overrides
@@ -190,6 +193,8 @@ def load_config(config_path: str, args) -> dict:
         config["progressive_training"]["stage2"]["epochs"] = args.lcofl_epochs
     if args.finetune_epochs:
         config["progressive_training"]["stage3"]["epochs"] = args.finetune_epochs
+    if args.hard_mining_epochs:
+        config["progressive_training"]["stage4"]["epochs"] = args.hard_mining_epochs
 
     # Configure single output directory with timestamped run folder
     # All outputs (checkpoints, logs, etc.) go into one folder
@@ -219,6 +224,7 @@ def load_config(config_path: str, args) -> dict:
         config["progressive_training"]["stage1"]["epochs"] = 1
         config["progressive_training"]["stage2"]["epochs"] = 1
         config["progressive_training"]["stage3"]["epochs"] = 1
+        config["progressive_training"]["stage4"]["epochs"] = 1
         config["data"]["num_workers"] = 0
 
     return config
@@ -235,6 +241,8 @@ def map_stage_name(stage: str) -> TrainingStage:
         "lcofl": TrainingStage.LCOFL,
         "3": TrainingStage.FINETUNE,
         "finetune": TrainingStage.FINETUNE,
+        "4": TrainingStage.HARD_MINING,
+        "hard_mining": TrainingStage.HARD_MINING,
         "all": None,
     }
     return stage_map.get(stage.lower())
