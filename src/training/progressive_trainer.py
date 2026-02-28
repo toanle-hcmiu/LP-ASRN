@@ -234,9 +234,9 @@ class ProgressiveTrainer:
                 name="hard_mining",
                 epochs=self.progressive_config.get("stage4", {}).get("epochs", 20),
                 lr=self.progressive_config.get("stage4", {}).get("lr", 5e-6),
-                loss_components=["l1", "lcofl", "embedding"],
-                freeze_ocr=True,
-                update_confusion=True,
+                loss_components=self.progressive_config.get("stage4", {}).get("loss_components", ["l1", "lcofl"]),
+                freeze_ocr=self.progressive_config.get("stage4", {}).get("freeze_ocr", True),
+                update_confusion=self.progressive_config.get("stage4", {}).get("update_confusion", True),
                 aspect_ratio_range=tuple(self.progressive_config.get("stage4", {}).get("aspect_ratio_range", [0.25, 0.40])),
             ),
         }
@@ -1350,7 +1350,8 @@ class ProgressiveTrainer:
                 total_lcofl += lcofl.item()
 
                 # Compute embedding loss if enabled
-                if "embedding" in stage_config.loss_components:
+                if "embedding" in stage_config.loss_components and self.lcofl_loss.embedder is not None:
+                    self.lcofl_loss.embedder.to(self.device)
                     sr_emb, hr_emb = self.lcofl_loss.get_embeddings(sr_images, hr_images)
                     if sr_emb is not None and hr_emb is not None:
                         embed_loss, _ = self.lcofl_loss.embedding_loss_fn(sr_emb, hr_emb)
