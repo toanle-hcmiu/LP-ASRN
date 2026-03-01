@@ -1811,12 +1811,16 @@ class ProgressiveTrainer:
             stage4_config = self.config.get("progressive_training", {}).get("stage4", {})
             hm_config = stage4_config.get("hard_mining", {})
 
-            # Dataset size = underlying full dataset size (Subset wraps it)
+            # The DataLoader wraps a Subset of the full dataset.
+            # batch["idx"] returns full-dataset indices (from __getitem__),
+            # so the miner must be sized to the full dataset for tracking.
+            # For the sampler, we extract weights only for the Subset positions.
             ds = self.train_loader.dataset
-            ds_size = len(ds.dataset) if hasattr(ds, 'dataset') else len(ds)
+            full_ds_size = len(ds.dataset) if hasattr(ds, 'dataset') else len(ds)
+            subset_size = len(ds)
 
             self.hard_example_miner = HardExampleMiner(
-                dataset_size=ds_size,
+                dataset_size=full_ds_size,
                 alpha=hm_config.get("difficulty_alpha", 2.0),
                 min_samples_seen=hm_config.get("min_samples_seen", 3),
             )
@@ -1832,9 +1836,12 @@ class ProgressiveTrainer:
             self._hm_pin_memory = self.train_loader.pin_memory
             self._hm_original_dataset = self.train_loader.dataset
             self._hm_reweight_interval = hm_config.get("reweight_interval", 5)
+            # Store Subset indices (full-dataset indices for each Subset position)
+            # so we can map miner's full-dataset weights → Subset-position weights
+            self._hm_subset_indices = ds.indices if hasattr(ds, 'indices') else list(range(subset_size))
 
             if self.is_main:
-                self._log(f"[Hard Mining] initialized: dataset_size={ds_size}, "
+                self._log(f"[Hard Mining] initialized: full_ds={full_ds_size}, subset={subset_size}, "
                           f"alpha={self.hard_example_miner.alpha}, "
                           f"min_samples_seen={self.hard_example_miner.min_samples_seen}, "
                           f"reweight_interval={self._hm_reweight_interval}")
@@ -1852,8 +1859,20 @@ class ProgressiveTrainer:
                     and epoch > 0
                     and epoch % self._hm_reweight_interval == 0):
                 from torch.utils.data import DataLoader as DL, WeightedRandomSampler
-                sampler = self.curriculum_sampler.create_sampler(
-                    epoch, batch_size=self._hm_batch_size
+
+                # Get full-dataset weights from miner, then pick only the Subset positions
+                full_weights = self.hard_example_miner.get_sample_weights()
+                p_hard = self.curriculum_sampler.get_p_hard(epoch)
+                subset_weights = full_weights[self._hm_subset_indices]
+                # Blend with uniform based on curriculum
+                uniform = torch.ones_like(subset_weights) / len(subset_weights)
+                blended = p_hard * subset_weights + (1 - p_hard) * uniform
+                blended = blended / blended.sum()
+
+                sampler = WeightedRandomSampler(
+                    weights=blended,
+                    num_samples=len(self._hm_subset_indices),
+                    replacement=True,
                 )
                 self.train_loader = DL(
                     self._hm_original_dataset,
