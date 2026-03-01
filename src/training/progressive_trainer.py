@@ -60,6 +60,7 @@ class StageConfig:
     update_confusion: bool = False
     aspect_ratio_range: tuple = (0.25, 0.45)  # Stage-specific aspect ratio range
     psnr_floor: float = 0.0  # Quality guardrail: dynamically scale down LCOFL if PSNR drops below this
+    enable_geometric_augment: bool = True  # Whether to apply geometric/photometric transforms
 
 
 class ProgressiveTrainer:
@@ -239,6 +240,7 @@ class ProgressiveTrainer:
                 update_confusion=self.progressive_config.get("stage4", {}).get("update_confusion", True),
                 aspect_ratio_range=tuple(self.progressive_config.get("stage4", {}).get("aspect_ratio_range", [0.25, 0.40])),
                 psnr_floor=self.progressive_config.get("stage4", {}).get("psnr_floor", 12.5),
+                enable_geometric_augment=self.progressive_config.get("stage4", {}).get("enable_geometric_augment", False),
             ),
         }
 
@@ -486,6 +488,25 @@ class ProgressiveTrainer:
             self.train_loader.dataset.set_aspect_ratio_range(config.aspect_ratio_range)
             if self.is_main:
                 self._log(f"Updated aspect ratio range to {config.aspect_ratio_range} for stage {stage}")
+
+        # Enable/disable geometric+photometric augmentation per stage.
+        # Models trained without these transforms (pre-fix) should NOT have them
+        # suddenly enabled at fine-tuning LR — it causes distribution shift.
+        underlying_ds = self.train_loader.dataset
+        if hasattr(underlying_ds, 'dataset'):  # Subset wrapper
+            underlying_ds = underlying_ds.dataset
+        if hasattr(underlying_ds, 'geometric_transform'):
+            if not config.enable_geometric_augment:
+                underlying_ds.geometric_transform = None
+                underlying_ds.photometric_degradation = None
+                if self.is_main:
+                    self._log(f"Geometric/photometric augmentation DISABLED for stage {stage}")
+            elif underlying_ds.geometric_transform is None and underlying_ds.augment:
+                # Re-enable if needed for a later stage
+                underlying_ds.geometric_transform = underlying_ds._get_geometric_transform(underlying_ds.ocr_pretrain_mode)
+                underlying_ds.photometric_degradation = underlying_ds._get_photometric_degradation(underlying_ds.ocr_pretrain_mode)
+                if self.is_main:
+                    self._log(f"Geometric/photometric augmentation ENABLED for stage {stage}")
 
     def set_text_logger(self, text_logger):
         """Set the text logger for file logging."""

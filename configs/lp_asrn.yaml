@@ -159,6 +159,7 @@ progressive_training:
     freeze_ocr: true
     update_confusion: true
     psnr_floor: 12.5  # Quality guardrail: match Stage 2
+    enable_geometric_augment: false  # Model wasn't trained with geometric/photometric transforms
     aspect_ratio_range:
     - 0.25
     - 0.45
