@@ -453,14 +453,11 @@ For license plates, this means prioritizing information that allows an OCR syste
 ### License Plate Super-Resolution
 
 Nascimento, V., Laroca, R., et al.
-
 *Enhancing License Plate Super-Resolution: A Layout-Aware and Character-Driven Approach.*
-
 arXiv:2408.15103, 2024.
 
 ### PARSeq
 
 *Scene Text Recognition with Permuted Autoregressive Sequence Models.*
-
 2022.
 
